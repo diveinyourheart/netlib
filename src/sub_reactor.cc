@@ -137,7 +137,8 @@ class SubReactor::Connection {
  public:
   Connection(UniqueFd socket, std::unique_ptr<Channel> channel,
              std::unique_ptr<ProtocolCodec> codec, ConnectionHandle handle,
-             std::shared_ptr<std::atomic<bool>> alive);
+             std::shared_ptr<std::atomic<bool>> alive,
+             std::size_t max_output_buffer_size);
 
   int fd() const;
   std::uint64_t connection_id() const;
@@ -186,15 +187,16 @@ SubReactor::Connection::Connection(UniqueFd socket,
                                    std::unique_ptr<Channel> channel,
                                    std::unique_ptr<ProtocolCodec> codec,
                                    ConnectionHandle handle,
-                                   std::shared_ptr<std::atomic<bool>> alive)
+                                   std::shared_ptr<std::atomic<bool>> alive,
+                                   std::size_t max_output_buffer_size)
     : socket_(std::move(socket)),
       channel_(std::move(channel)),
       codec_(std::move(codec)),
       handle_(std::move(handle)),
       connection_id_(handle_.id()),
       alive_(std::move(alive)),
-      max_read_buffer_size_(codec_->max_buffer_size()),
-      max_output_buffer_size_(codec_->max_buffer_size()) {}
+      max_read_buffer_size_(codec_->MaxDecodeBufferSize()),
+      max_output_buffer_size_(max_output_buffer_size) {}
 
 int SubReactor::Connection::fd() const { return socket_.get(); }
 
@@ -273,6 +275,10 @@ void SubReactor::Connection::MakeWritable(std::size_t min_bytes) {
 bool SubReactor::Connection::AppendResponse(std::span<const char> payload,
                                             bool close_after_write) {
   CompactOutput();
+  if (output_buffer_.size() >= max_output_buffer_size_ ||
+      payload.size() > max_output_buffer_size_ - output_buffer_.size()) {
+    return false;
+  }
   std::size_t old_size = output_buffer_.size();
   if (!codec_->Encode(payload, &output_buffer_)) {
     return false;
@@ -339,19 +345,41 @@ void SubReactor::Connection::CompactOutput() {
 std::unique_ptr<SubReactor> SubReactor::Create(
     std::size_t max_pending_connections, ThreadPool& worker_pool,
     ConnectionCallbacks callbacks, log::Logger* logger) {
-  return Create(
-      max_pending_connections, worker_pool, std::move(callbacks),
-      [] { return CreateLengthPrefixedCodec(); }, logger);
+  SubReactorOptions options;
+  options.max_pending_connections = max_pending_connections;
+  options.max_pending_responses = max_pending_connections;
+  return Create(options, worker_pool, std::move(callbacks), logger);
 }
 
 std::unique_ptr<SubReactor> SubReactor::Create(
     std::size_t max_pending_connections, ThreadPool& worker_pool,
     ConnectionCallbacks callbacks, ProtocolCodecFactory codec_factory,
     log::Logger* logger) {
-  if (max_pending_connections == 0) {
+  SubReactorOptions options;
+  options.max_pending_connections = max_pending_connections;
+  options.max_pending_responses = max_pending_connections;
+  return Create(options, worker_pool, std::move(callbacks),
+                std::move(codec_factory), logger);
+}
+
+std::unique_ptr<SubReactor> SubReactor::Create(SubReactorOptions options,
+                                               ThreadPool& worker_pool,
+                                               ConnectionCallbacks callbacks,
+                                               log::Logger* logger) {
+  return Create(
+      options, worker_pool, std::move(callbacks),
+      [] { return CreateLengthPrefixedCodec(); }, logger);
+}
+
+std::unique_ptr<SubReactor> SubReactor::Create(
+    SubReactorOptions options, ThreadPool& worker_pool,
+    ConnectionCallbacks callbacks, ProtocolCodecFactory codec_factory,
+    log::Logger* logger) {
+  if (options.max_pending_connections == 0 ||
+      options.max_pending_responses == 0 ||
+      options.max_pending_output_bytes == 0) {
     if (logger != nullptr) {
-      NETLIB_LOG_ERROR(*logger,
-                       "SubReactor pending connection capacity is zero");
+      NETLIB_LOG_ERROR(*logger, "SubReactor option capacity is zero");
     }
     return nullptr;
   }
@@ -362,7 +390,7 @@ std::unique_ptr<SubReactor> SubReactor::Create(
     return nullptr;
   }
   std::unique_ptr<ProtocolCodec> codec_probe = codec_factory();
-  if (!codec_probe || codec_probe->max_buffer_size() == 0) {
+  if (!codec_probe || codec_probe->MaxDecodeBufferSize() == 0) {
     if (logger != nullptr) {
       NETLIB_LOG_ERROR(
           *logger, "SubReactor ProtocolCodec factory returned invalid codec");
@@ -386,8 +414,8 @@ std::unique_ptr<SubReactor> SubReactor::Create(
   }
 
   auto reactor = std::unique_ptr<SubReactor>(new SubReactor(
-      std::move(event_loop), std::move(wake_fd), max_pending_connections,
-      worker_pool, std::move(codec_factory), std::move(callbacks), logger));
+      std::move(event_loop), std::move(wake_fd), options, worker_pool,
+      std::move(codec_factory), std::move(callbacks), logger));
   SubReactor* reactor_pointer = reactor.get();
   ChannelCallbacks wake_callbacks{
       [reactor_pointer] { reactor_pointer->HandleWake(); },
@@ -401,16 +429,19 @@ std::unique_ptr<SubReactor> SubReactor::Create(
     return nullptr;
   }
   if (logger != nullptr) {
-    NETLIB_LOG_INFO(*logger, "SubReactor created with pending capacity={}",
-                    max_pending_connections);
+    NETLIB_LOG_INFO(*logger,
+                    "SubReactor created with connection capacity={}, "
+                    "response capacity={}, output bytes={}",
+                    options.max_pending_connections,
+                    options.max_pending_responses,
+                    options.max_pending_output_bytes);
   }
   return reactor;
 }
 
 SubReactor::SubReactor(std::unique_ptr<EventLoop> event_loop,
                        std::shared_ptr<UniqueFd> wake_fd,
-                       std::size_t max_pending_connections,
-                       ThreadPool& worker_pool,
+                       SubReactorOptions options, ThreadPool& worker_pool,
                        ProtocolCodecFactory codec_factory,
                        ConnectionCallbacks callbacks, log::Logger* logger)
     : event_loop_(std::move(event_loop)),
@@ -418,9 +449,9 @@ SubReactor::SubReactor(std::unique_ptr<EventLoop> event_loop,
       codec_factory_(std::move(codec_factory)),
       callbacks_(std::move(callbacks)),
       wake_fd_(std::move(wake_fd)),
-      response_queue_(
-          std::make_shared<ResponseQueue>(max_pending_connections, wake_fd_)),
-      max_pending_connections_(max_pending_connections),
+      response_queue_(std::make_shared<ResponseQueue>(
+          options.max_pending_responses, wake_fd_)),
+      options_(options),
       logger_(logger) {}
 
 SubReactor::~SubReactor() { response_queue_->Shutdown(); }
@@ -432,7 +463,7 @@ bool SubReactor::AdoptConnection(UniqueFd& connection) {
 
   std::lock_guard<std::mutex> lock(pending_mutex_);
   if (stopping_.load() ||
-      pending_connections_.size() >= max_pending_connections_) {
+      pending_connections_.size() >= options_.max_pending_connections) {
     return false;
   }
   pending_connections_.push_back(std::move(connection));
@@ -547,7 +578,7 @@ void SubReactor::RegisterConnection(UniqueFd connection) {
   }
 
   std::unique_ptr<ProtocolCodec> codec = codec_factory_();
-  if (!codec || codec->max_buffer_size() == 0) {
+  if (!codec || codec->MaxDecodeBufferSize() == 0) {
     if (logger_ != nullptr) {
       NETLIB_LOG_ERROR(*logger_, "ProtocolCodec factory failed for fd={}", fd);
     }
@@ -560,11 +591,8 @@ void SubReactor::RegisterConnection(UniqueFd connection) {
   std::weak_ptr<ResponseQueue> weak_response_queue = response_queue_;
   ConnectionHandle handle(
       connection_id, alive,
-      [weak_response_queue, alive](std::uint64_t id, std::vector<char> payload,
-                                   bool close_after_write) {
-        if (!alive->load(std::memory_order_acquire)) {
-          return false;
-        }
+      [weak_response_queue](std::uint64_t id, std::vector<char> payload,
+                            bool close_after_write) {
         std::shared_ptr<ResponseQueue> response_queue =
             weak_response_queue.lock();
         if (!response_queue) {
@@ -591,7 +619,7 @@ void SubReactor::RegisterConnection(UniqueFd connection) {
 
   std::unique_ptr<Connection> state = std::make_unique<Connection>(
       std::move(connection), std::move(channel), std::move(codec),
-      std::move(handle), std::move(alive));
+      std::move(handle), std::move(alive), options_.max_pending_output_bytes);
   auto inserted = connections_.emplace(connection_id, std::move(state));
   if (!inserted.second) {
     if (logger_ != nullptr) {
@@ -667,14 +695,6 @@ bool SubReactor::ProcessFrames(Connection& connection) {
     std::span<const char> readable = connection.ReadableBytes();
     DecodeResult decode_result = connection.codec().Decode(readable);
     if (decode_result.status == DecodeStatus::kNeedMore) {
-      if (readable.size() >= connection.codec().max_buffer_size()) {
-        if (logger_ != nullptr) {
-          NETLIB_LOG_WARN(*logger_,
-                          "codec exceeded buffer for connection id={}",
-                          connection.connection_id());
-        }
-        return false;
-      }
       return true;
     }
     if (decode_result.status == DecodeStatus::kProtocolError ||

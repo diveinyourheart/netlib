@@ -19,6 +19,16 @@
 
 namespace netlib {
 
+struct SubReactorOptions {
+  // Maximum accepted descriptors waiting for registration.
+  std::size_t max_pending_connections = 1024;
+  // Maximum worker responses waiting for SubReactor processing.
+  std::size_t max_pending_responses = 4096;
+  // Maximum encoded bytes buffered for one slow connection.
+  std::size_t max_pending_output_bytes =
+      kFrameLengthPrefixSize + kMaxFramePayloadSize;
+};
+
 // Owns accepted connections, protocol codecs, and nonblocking read/write state.
 class SubReactor {
  public:
@@ -27,13 +37,22 @@ class SubReactor {
     std::function<void(int)> on_closed;
   };
 
-  // Pending connections and responses each use this bounded capacity. The
-  // ThreadPool and optional logger must outlive this SubReactor.
+  // Compatibility overload with the same capacity for connections and
+  // responses. The ThreadPool and optional logger must outlive SubReactor.
   static std::unique_ptr<SubReactor> Create(std::size_t max_pending_connections,
                                             ThreadPool& worker_pool,
                                             ConnectionCallbacks callbacks,
                                             log::Logger* logger = nullptr);
   static std::unique_ptr<SubReactor> Create(std::size_t max_pending_connections,
+                                            ThreadPool& worker_pool,
+                                            ConnectionCallbacks callbacks,
+                                            ProtocolCodecFactory codec_factory,
+                                            log::Logger* logger = nullptr);
+  static std::unique_ptr<SubReactor> Create(SubReactorOptions options,
+                                            ThreadPool& worker_pool,
+                                            ConnectionCallbacks callbacks,
+                                            log::Logger* logger = nullptr);
+  static std::unique_ptr<SubReactor> Create(SubReactorOptions options,
                                             ThreadPool& worker_pool,
                                             ConnectionCallbacks callbacks,
                                             ProtocolCodecFactory codec_factory,
@@ -57,10 +76,9 @@ class SubReactor {
   class ResponseQueue;
 
   SubReactor(std::unique_ptr<EventLoop> event_loop,
-             std::shared_ptr<UniqueFd> wake_fd,
-             std::size_t max_pending_connections, ThreadPool& worker_pool,
-             ProtocolCodecFactory codec_factory, ConnectionCallbacks callbacks,
-             log::Logger* logger);
+             std::shared_ptr<UniqueFd> wake_fd, SubReactorOptions options,
+             ThreadPool& worker_pool, ProtocolCodecFactory codec_factory,
+             ConnectionCallbacks callbacks, log::Logger* logger);
 
   void HandleWake();
   bool DrainWake();
@@ -80,7 +98,7 @@ class SubReactor {
   std::shared_ptr<UniqueFd> wake_fd_;
   std::unique_ptr<Channel> wake_channel_;
   std::shared_ptr<ResponseQueue> response_queue_;
-  const std::size_t max_pending_connections_;
+  const SubReactorOptions options_;
   std::mutex pending_mutex_;
   std::deque<UniqueFd> pending_connections_;
   std::atomic<bool> stopping_{false};

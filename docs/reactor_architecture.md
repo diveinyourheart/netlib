@@ -94,6 +94,11 @@ size. SubReactor consumes only the declared bytes and immediately decodes any
 remaining coalesced frame. A custom HTTP codec can therefore own its own
 request parsing state.
 
+`MaxDecodeBufferSize()` bounds incomplete input assembly. `Encode()` enforces
+the codec's own response-payload limit. Output backlog uses the separate
+`SubReactorOptions::max_pending_output_bytes` policy because multiple encoded
+responses may be waiting for a slow client.
+
 `recv()` writes directly into the connection buffer. A complete payload is
 copied once into an owned `FrameMessage` and submitted to the ThreadPool.
 Reusable input capacity remains attached to the connection and is compacted

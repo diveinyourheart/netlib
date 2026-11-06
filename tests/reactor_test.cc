@@ -542,9 +542,15 @@ int RunReactorTest() {
     ReportFailure("failed to create Reactor ThreadPool");
     return 1;
   }
+  netlib::SubReactorOptions first_sub_options{
+      .max_pending_connections = 16,
+      .max_pending_responses = 32,
+      .max_pending_output_bytes = 9 * 1024 * 1024,
+  };
   std::unique_ptr<netlib::SubReactor> first_sub_reactor =
       netlib::SubReactor::Create(
-          16, *worker_pool, MakeConnectionCallbacks(first_observation),
+          first_sub_options, *worker_pool,
+          MakeConnectionCallbacks(first_observation),
           [] { return netlib::CreateLengthPrefixedCodec(); }, logger.get());
   std::unique_ptr<netlib::SubReactor> second_sub_reactor =
       netlib::SubReactor::Create(

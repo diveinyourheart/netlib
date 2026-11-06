@@ -59,7 +59,7 @@ class LengthPrefixedCodec final : public ProtocolCodec {
     return true;
   }
 
-  std::size_t max_buffer_size() const override {
+  std::size_t MaxDecodeBufferSize() const override {
     return kFrameLengthPrefixSize + max_payload_size_;
   }
 

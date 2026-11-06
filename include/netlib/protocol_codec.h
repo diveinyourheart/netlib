@@ -28,7 +28,7 @@ struct DecodeResult {
 // One instance is owned by each connection. Decode() receives the unconsumed
 // input buffer. When a frame is ready, the caller consumes consumed_bytes and
 // may call Decode() again with the remaining bytes. Encode() appends bytes to
-// the output vector and must reject payloads larger than its configured limit.
+// the output vector.
 class ProtocolCodec {
  public:
   ProtocolCodec() = default;
@@ -41,7 +41,8 @@ class ProtocolCodec {
   virtual DecodeResult Decode(std::span<const char> input) = 0;
   virtual bool Encode(std::span<const char> payload,
                       std::vector<char>* output) = 0;
-  virtual std::size_t max_buffer_size() const = 0;
+  // Maximum unconsumed bytes allowed while assembling one decoded frame.
+  virtual std::size_t MaxDecodeBufferSize() const = 0;
 };
 
 using ProtocolCodecFactory = std::function<std::unique_ptr<ProtocolCodec>()>;

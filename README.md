@@ -60,8 +60,14 @@ auto workers = netlib::ThreadPool::Create(
       message.connection.Respond(std::move(response));
     });
 
+netlib::SubReactorOptions sub_options{
+    .max_pending_connections = 1024,
+    .max_pending_responses = 4096,
+    .max_pending_output_bytes = 16 * 1024 * 1024,
+};
+
 auto sub = netlib::SubReactor::Create(
-    1024, *workers, connection_callbacks);
+    sub_options, *workers, connection_callbacks);
 
 auto main = netlib::MainReactor::Create(
     8080, {sub.get()});
@@ -72,7 +78,11 @@ Sub 的生产者，再调用 `ThreadPool::Stop()` 排空消息并 join Worker。
 
 `ConnectionHandle::Respond()` 是线程安全的。连接已经关闭时返回 false，不会使用
 可能已经复用的 fd。响应队列满时同样返回 false，由业务层选择丢弃、关闭连接或
-施加更上层的背压。响应队列容量当前与 `max_pending_connections` 相同。
+施加更上层的背压。
+
+`SubReactorOptions` 分别控制待注册连接数、待处理响应数和单连接输出积压字节数。
+Codec 通过 `MaxDecodeBufferSize()` 描述输入分帧缓冲上限，单次响应 payload
+限制由 `Encode()` 自己执行。输出积压策略不再隐式绑定到 Codec 的输入缓冲上限。
 
 默认 SubReactor 使用 `CreateLengthPrefixedCodec()`。自定义协议可以实现
 `ProtocolCodec` 并通过带 `ProtocolCodecFactory` 的 `SubReactor::Create`
