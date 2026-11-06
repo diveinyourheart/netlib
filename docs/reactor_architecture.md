@@ -126,3 +126,12 @@ descriptors and EventLoop are valid.
 Business decoding and execution occur in the ThreadPool handler.
 `FrameMessage::payload` is a complete transport payload, not a decoded protobuf,
 JSON, or application request.
+
+## Logging
+
+Reactor and ThreadPool factories accept an optional non-owning `log::Logger*`.
+The orchestrator must keep the Logger alive until MainReactor, every
+SubReactor, and the ThreadPool have stopped. Logs cover lifecycle transitions,
+epoll registration failures, accept/recv errors, dispatch failures, oversized
+frames, and worker-queue backpressure. Individual epoll events and successful
+reads stay out of INFO logging to protect the I/O hot path.

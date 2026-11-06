@@ -6,6 +6,7 @@
 #include <memory>
 
 #include "netlib/frame_message.h"
+#include "netlib/log/logger_fwd.h"
 
 namespace netlib {
 
@@ -15,9 +16,11 @@ class ThreadPool {
  public:
   using Handler = std::function<void(FrameMessage)>;
 
+  // logger is optional and must outlive the ThreadPool when non-null.
   static std::unique_ptr<ThreadPool> Create(std::size_t worker_count,
                                             std::size_t max_pending_messages,
-                                            Handler handler);
+                                            Handler handler,
+                                            log::Logger* logger = nullptr);
 
   ThreadPool(const ThreadPool&) = delete;
   ThreadPool& operator=(const ThreadPool&) = delete;

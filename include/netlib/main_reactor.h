@@ -8,6 +8,7 @@
 
 #include "netlib/channel.h"
 #include "netlib/event_loop.h"
+#include "netlib/log/logger_fwd.h"
 #include "netlib/sub_reactor.h"
 #include "netlib/unique_fd.h"
 
@@ -20,8 +21,10 @@ class MainReactor {
   using SubReactorList = std::vector<SubReactor*>;
 
   // A requested_port of zero asks the kernel to choose an available port.
+  // logger is optional and must outlive the MainReactor when non-null.
   static std::unique_ptr<MainReactor> Create(uint16_t requested_port,
-                                             SubReactorList sub_reactors);
+                                             SubReactorList sub_reactors,
+                                             log::Logger* logger = nullptr);
 
   MainReactor(const MainReactor&) = delete;
   MainReactor& operator=(const MainReactor&) = delete;
@@ -35,7 +38,8 @@ class MainReactor {
 
  private:
   MainReactor(std::unique_ptr<EventLoop> event_loop, uint16_t port,
-              UniqueFd listen_fd, SubReactorList sub_reactors);
+              UniqueFd listen_fd, SubReactorList sub_reactors,
+              log::Logger* logger);
 
   void DispatchConnection(UniqueFd& connection);
   void HandleReadable();
@@ -46,6 +50,7 @@ class MainReactor {
   std::size_t next_sub_reactor_ = 0;
   UniqueFd listen_fd_;
   std::unique_ptr<Channel> listener_channel_;
+  log::Logger* logger_;
 };
 
 }  // namespace netlib

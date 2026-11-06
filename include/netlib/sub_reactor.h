@@ -11,6 +11,7 @@
 
 #include "netlib/channel.h"
 #include "netlib/event_loop.h"
+#include "netlib/log/logger_fwd.h"
 #include "netlib/thread_pool.h"
 #include "netlib/unique_fd.h"
 
@@ -25,10 +26,11 @@ class SubReactor {
   };
 
   // Pending connections are bounded; a capacity of zero is invalid. The
-  // ThreadPool must outlive this SubReactor.
+  // ThreadPool and optional logger must outlive this SubReactor.
   static std::unique_ptr<SubReactor> Create(std::size_t max_pending_connections,
                                             ThreadPool& worker_pool,
-                                            ConnectionCallbacks callbacks);
+                                            ConnectionCallbacks callbacks,
+                                            log::Logger* logger = nullptr);
 
   SubReactor(const SubReactor&) = delete;
   SubReactor& operator=(const SubReactor&) = delete;
@@ -48,7 +50,7 @@ class SubReactor {
 
   SubReactor(std::unique_ptr<EventLoop> event_loop, UniqueFd wake_fd,
              std::size_t max_pending_connections, ThreadPool& worker_pool,
-             ConnectionCallbacks callbacks);
+             ConnectionCallbacks callbacks, log::Logger* logger);
 
   void HandleWake();
   bool DrainWake();
@@ -68,6 +70,7 @@ class SubReactor {
   std::mutex pending_mutex_;
   std::deque<UniqueFd> pending_connections_;
   std::atomic<bool> stopping_{false};
+  log::Logger* logger_;
 };
 
 }  // namespace netlib

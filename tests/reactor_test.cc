@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "netlib/frame_protocol.h"
+#include "netlib/log/logging.h"
 #include "netlib/main_reactor.h"
 #include "netlib/sub_reactor.h"
 #include "netlib/thread_pool.h"
@@ -34,6 +35,22 @@ struct Observation {
   std::size_t frame_count = 0;
   bool connected = false;
   bool closed = false;
+};
+
+class CountingSink final : public netlib::log::LogSink {
+ public:
+  void Write(const netlib::log::LogRecord&) override {
+    record_count_.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  void Flush() override {}
+
+  std::size_t record_count() const {
+    return record_count_.load(std::memory_order_relaxed);
+  }
+
+ private:
+  std::atomic<std::size_t> record_count_{0};
 };
 
 void ReportFailure(const char* message) {
@@ -321,6 +338,21 @@ int RunOversizedFrameTest() {
 int RunReactorTest() {
   Observation first_observation;
   Observation second_observation;
+  std::unique_ptr<CountingSink> log_sink = std::make_unique<CountingSink>();
+  CountingSink* log_sink_pointer = log_sink.get();
+  netlib::log::LoggerOptions logger_options{
+      .name = "netlib.reactor.test",
+      .minimum_level = netlib::log::LogLevel::kDebug,
+      .queue_capacity = 256,
+      .color_mode = netlib::log::ColorMode::kNever,
+      .flush_each_record = false,
+  };
+  std::unique_ptr<netlib::log::Logger> logger = netlib::log::Logger::Create(
+      std::move(logger_options), std::move(log_sink));
+  if (!logger) {
+    ReportFailure("failed to create Reactor logger");
+    return 1;
+  }
   netlib::ThreadPool::Handler frame_handler =
       [&first_observation, &second_observation](netlib::FrameMessage message) {
         Observation* observation = nullptr;
@@ -340,17 +372,19 @@ int RunReactorTest() {
         observation->condition.notify_all();
       };
   std::unique_ptr<netlib::ThreadPool> worker_pool =
-      netlib::ThreadPool::Create(2, 32, std::move(frame_handler));
+      netlib::ThreadPool::Create(2, 32, std::move(frame_handler), logger.get());
   if (!worker_pool) {
     ReportFailure("failed to create Reactor ThreadPool");
     return 1;
   }
   std::unique_ptr<netlib::SubReactor> first_sub_reactor =
       netlib::SubReactor::Create(16, *worker_pool,
-                                 MakeConnectionCallbacks(first_observation));
+                                 MakeConnectionCallbacks(first_observation),
+                                 logger.get());
   std::unique_ptr<netlib::SubReactor> second_sub_reactor =
       netlib::SubReactor::Create(16, *worker_pool,
-                                 MakeConnectionCallbacks(second_observation));
+                                 MakeConnectionCallbacks(second_observation),
+                                 logger.get());
   if (!first_sub_reactor || !second_sub_reactor) {
     ReportFailure("failed to create SubReactors");
     return 1;
@@ -358,7 +392,7 @@ int RunReactorTest() {
 
   std::unique_ptr<netlib::MainReactor> main_reactor =
       netlib::MainReactor::Create(
-          0, {first_sub_reactor.get(), second_sub_reactor.get()});
+          0, {first_sub_reactor.get(), second_sub_reactor.get()}, logger.get());
   if (!main_reactor) {
     ReportFailure("failed to create MainReactor");
     return 1;
@@ -431,6 +465,12 @@ int RunReactorTest() {
   first_sub_thread.join();
   second_sub_thread.join();
   worker_pool->Stop();
+  logger->Flush();
+  if (log_sink_pointer->record_count() == 0) {
+    ReportFailure("Reactor lifecycle did not emit logs");
+    success = false;
+  }
+  logger->Stop();
   return success ? 0 : 1;
 }
 

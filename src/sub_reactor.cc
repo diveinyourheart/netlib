@@ -15,6 +15,7 @@
 #include <deque>
 #include <memory>
 #include <span>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -22,6 +23,7 @@
 #include "netlib/event_loop.h"
 #include "netlib/frame_message.h"
 #include "netlib/frame_protocol.h"
+#include "netlib/log/logging.h"
 #include "netlib/thread_pool.h"
 #include "netlib/unique_fd.h"
 
@@ -178,24 +180,32 @@ void SubReactor::Connection::MakeWritable(std::size_t min_bytes) {
 
 std::unique_ptr<SubReactor> SubReactor::Create(
     std::size_t max_pending_connections, ThreadPool& worker_pool,
-    ConnectionCallbacks callbacks) {
+    ConnectionCallbacks callbacks, log::Logger* logger) {
   if (max_pending_connections == 0) {
+    if (logger != nullptr) {
+      NETLIB_LOG_ERROR(*logger,
+                       "SubReactor pending connection capacity is zero");
+    }
     return nullptr;
   }
 
-  std::unique_ptr<EventLoop> event_loop = EventLoop::Create();
+  std::unique_ptr<EventLoop> event_loop = EventLoop::Create(logger);
   if (!event_loop) {
     return nullptr;
   }
 
   UniqueFd wake_fd(eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC));
   if (!wake_fd) {
+    if (logger != nullptr) {
+      NETLIB_LOG_ERROR(*logger, std::string("SubReactor eventfd failed: ") +
+                                    std::strerror(errno));
+    }
     return nullptr;
   }
 
   auto reactor = std::unique_ptr<SubReactor>(new SubReactor(
       std::move(event_loop), std::move(wake_fd), max_pending_connections,
-      worker_pool, std::move(callbacks)));
+      worker_pool, std::move(callbacks), logger));
   SubReactor* reactor_pointer = reactor.get();
   ChannelCallbacks wake_callbacks{
       [reactor_pointer] { reactor_pointer->HandleWake(); },
@@ -208,17 +218,23 @@ std::unique_ptr<SubReactor> SubReactor::Create(
   if (!reactor->wake_channel_) {
     return nullptr;
   }
+  if (logger != nullptr) {
+    NETLIB_LOG_INFO(*logger, "SubReactor created with pending capacity=" +
+                                 std::to_string(max_pending_connections));
+  }
   return reactor;
 }
 
 SubReactor::SubReactor(std::unique_ptr<EventLoop> event_loop, UniqueFd wake_fd,
                        std::size_t max_pending_connections,
-                       ThreadPool& worker_pool, ConnectionCallbacks callbacks)
+                       ThreadPool& worker_pool, ConnectionCallbacks callbacks,
+                       log::Logger* logger)
     : event_loop_(std::move(event_loop)),
       worker_pool_(worker_pool),
       callbacks_(std::move(callbacks)),
       wake_fd_(std::move(wake_fd)),
-      max_pending_connections_(max_pending_connections) {}
+      max_pending_connections_(max_pending_connections),
+      logger_(logger) {}
 
 SubReactor::~SubReactor() = default;
 
@@ -244,6 +260,9 @@ bool SubReactor::AdoptConnection(UniqueFd& connection) {
 void SubReactor::Run() { event_loop_->Run(); }
 
 void SubReactor::Stop() {
+  if (logger_ != nullptr) {
+    NETLIB_LOG_INFO(*logger_, "SubReactor stopping");
+  }
   {
     std::lock_guard<std::mutex> lock(pending_mutex_);
     stopping_.store(true);
@@ -253,6 +272,9 @@ void SubReactor::Stop() {
 
 void SubReactor::HandleWake() {
   if (!DrainWake()) {
+    if (logger_ != nullptr) {
+      NETLIB_LOG_ERROR(*logger_, "SubReactor wake eventfd drain failed");
+    }
     Stop();
     return;
   }
@@ -282,6 +304,11 @@ bool SubReactor::DrainWake() {
     if (result < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
       return true;
     }
+    if (logger_ != nullptr) {
+      NETLIB_LOG_ERROR(*logger_,
+                       std::string("SubReactor eventfd read failed: ") +
+                           std::strerror(errno));
+    }
     return false;
   }
 }
@@ -299,13 +326,31 @@ bool SubReactor::Wake() {
     if (result < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
       return true;
     }
+    if (logger_ != nullptr) {
+      NETLIB_LOG_ERROR(*logger_,
+                       std::string("SubReactor eventfd write failed: ") +
+                           std::strerror(errno));
+    }
     return false;
   }
 }
 
 void SubReactor::RegisterConnection(UniqueFd connection) {
   int fd = connection.get();
-  if (!SetNonBlocking(fd) || !SetCloseOnExec(fd)) {
+  if (!SetNonBlocking(fd)) {
+    if (logger_ != nullptr) {
+      NETLIB_LOG_ERROR(*logger_,
+                       "failed to set O_NONBLOCK for fd=" + std::to_string(fd) +
+                           ": " + std::strerror(errno));
+    }
+    return;
+  }
+  if (!SetCloseOnExec(fd)) {
+    if (logger_ != nullptr) {
+      NETLIB_LOG_ERROR(*logger_,
+                       "failed to set FD_CLOEXEC for fd=" + std::to_string(fd) +
+                           ": " + std::strerror(errno));
+    }
     return;
   }
 
@@ -325,7 +370,16 @@ void SubReactor::RegisterConnection(UniqueFd connection) {
       std::make_unique<Connection>(std::move(connection), std::move(channel));
   auto inserted = connections_.emplace(fd, std::move(state));
   if (!inserted.second) {
+    if (logger_ != nullptr) {
+      NETLIB_LOG_ERROR(
+          *logger_, "duplicate connection state for fd=" + std::to_string(fd));
+    }
     return;
+  }
+  if (logger_ != nullptr) {
+    NETLIB_LOG_DEBUG(
+        *logger_, "registered connection fd=" + std::to_string(fd) + " id=" +
+                      std::to_string(inserted.first->second->connection_id()));
   }
   if (callbacks_.on_connected) {
     callbacks_.on_connected(fd);
@@ -351,6 +405,9 @@ void SubReactor::HandleReadable(int fd) {
       continue;
     }
     if (result == 0) {
+      if (logger_ != nullptr) {
+        NETLIB_LOG_DEBUG(*logger_, "peer closed fd=" + std::to_string(fd));
+      }
       CloseConnection(fd);
       return;
     }
@@ -359,6 +416,10 @@ void SubReactor::HandleReadable(int fd) {
     }
     if (errno == EAGAIN || errno == EWOULDBLOCK) {
       return;
+    }
+    if (logger_ != nullptr) {
+      NETLIB_LOG_WARN(*logger_, "recv failed for fd=" + std::to_string(fd) +
+                                    ": " + std::strerror(errno));
     }
     CloseConnection(fd);
     return;
@@ -377,6 +438,13 @@ bool SubReactor::ProcessFrames(Connection& connection) {
       std::uint32_t payload_size =
           DecodePayloadSize(readable.first(kFrameLengthPrefixSize));
       if (payload_size > kMaxFramePayloadSize) {
+        if (logger_ != nullptr) {
+          NETLIB_LOG_WARN(*logger_,
+                          "frame too large for connection id=" +
+                              std::to_string(connection.connection_id()) +
+                              " payload=" + std::to_string(payload_size) +
+                              " max=" + std::to_string(kMaxFramePayloadSize));
+        }
         return false;
       }
       expected_size =
@@ -398,6 +466,11 @@ bool SubReactor::ProcessFrames(Connection& connection) {
         .payload = std::vector<char>(payload.begin(), payload.end()),
     };
     if (!worker_pool_.Submit(std::move(message))) {
+      if (logger_ != nullptr) {
+        NETLIB_LOG_WARN(*logger_, "worker queue full for connection id=" +
+                                      std::to_string(connection_id) +
+                                      " sequence=" + std::to_string(sequence));
+      }
       return false;
     }
     connection.Consume(expected_size);
@@ -409,6 +482,11 @@ void SubReactor::CloseConnection(int fd) {
   auto connection = connections_.find(fd);
   if (connection == connections_.end()) {
     return;
+  }
+  if (logger_ != nullptr) {
+    NETLIB_LOG_DEBUG(*logger_,
+                     "closing connection fd=" + std::to_string(fd) + " id=" +
+                         std::to_string(connection->second->connection_id()));
   }
   if (callbacks_.on_closed) {
     callbacks_.on_closed(fd);

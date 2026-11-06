@@ -4,11 +4,13 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <thread>
 #include <utility>
 #include <vector>
 
 #include "blockingconcurrentqueue.h"
+#include "netlib/log/logging.h"
 
 namespace netlib {
 namespace {
@@ -28,7 +30,7 @@ struct WorkItem {
 class ThreadPool::Impl {
  public:
   Impl(std::size_t worker_count, std::size_t max_pending_messages,
-       Handler handler);
+       Handler handler, log::Logger* logger);
   ~Impl();
 
   Impl(const Impl&) = delete;
@@ -51,13 +53,16 @@ class ThreadPool::Impl {
   std::atomic<bool> stopping_{false};
   std::vector<std::unique_ptr<moodycamel::ConsumerToken>> consumer_tokens_;
   std::vector<std::thread> workers_;
+  log::Logger* logger_;
 };
 
 ThreadPool::Impl::Impl(std::size_t worker_count,
-                       std::size_t max_pending_messages, Handler handler)
+                       std::size_t max_pending_messages, Handler handler,
+                       log::Logger* logger)
     : max_pending_messages_(max_pending_messages),
       handler_(std::move(handler)),
-      queue_(max_pending_messages) {
+      queue_(max_pending_messages),
+      logger_(logger) {
   consumer_tokens_.reserve(worker_count);
   workers_.reserve(worker_count);
   for (std::size_t i = 0; i < worker_count; ++i) {
@@ -67,6 +72,12 @@ ThreadPool::Impl::Impl(std::size_t worker_count,
     consumer_tokens_.push_back(std::move(consumer_token));
     workers_.emplace_back(
         [this, token_pointer] { WorkerLoop(*token_pointer); });
+  }
+  if (logger_ != nullptr) {
+    NETLIB_LOG_INFO(*logger_, "ThreadPool started with " +
+                                  std::to_string(worker_count) +
+                                  " workers and queue capacity " +
+                                  std::to_string(max_pending_messages));
   }
 }
 
@@ -96,6 +107,9 @@ void ThreadPool::Impl::Stop() {
   if (stopping_.exchange(true, std::memory_order_acq_rel)) {
     return;
   }
+  if (logger_ != nullptr) {
+    NETLIB_LOG_INFO(*logger_, "ThreadPool stopping");
+  }
 
   for (std::size_t i = 0; i < workers_.size(); ++i) {
     queue_.enqueue(
@@ -103,6 +117,9 @@ void ThreadPool::Impl::Stop() {
   }
   for (std::thread& worker : workers_) {
     worker.join();
+  }
+  if (logger_ != nullptr) {
+    NETLIB_LOG_INFO(*logger_, "ThreadPool stopped");
   }
 }
 
@@ -136,13 +153,17 @@ void ThreadPool::Impl::WorkerLoop(moodycamel::ConsumerToken& consumer_token) {
 
 std::unique_ptr<ThreadPool> ThreadPool::Create(std::size_t worker_count,
                                                std::size_t max_pending_messages,
-                                               Handler handler) {
+                                               Handler handler,
+                                               log::Logger* logger) {
   if (worker_count == 0 || max_pending_messages == 0 || !handler) {
+    if (logger != nullptr) {
+      NETLIB_LOG_ERROR(*logger, "invalid ThreadPool configuration");
+    }
     return nullptr;
   }
 
   std::unique_ptr<Impl> impl = std::make_unique<Impl>(
-      worker_count, max_pending_messages, std::move(handler));
+      worker_count, max_pending_messages, std::move(handler), logger);
   return std::unique_ptr<ThreadPool>(new ThreadPool(std::move(impl)));
 }
 

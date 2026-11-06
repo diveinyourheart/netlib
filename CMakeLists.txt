@@ -55,6 +55,8 @@ target_include_directories(
     $<INSTALL_INTERFACE:include>)
 target_link_libraries(netlib_log PUBLIC Threads::Threads)
 
+target_link_libraries(netlib PUBLIC netlib_log)
+
 add_executable(netlib_log_example examples/log_example.cc)
 target_link_libraries(netlib_log_example PRIVATE netlib::log)
 

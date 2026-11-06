@@ -6,6 +6,7 @@
 #include <memory>
 #include <unordered_map>
 
+#include "netlib/log/logger_fwd.h"
 #include "netlib/unique_fd.h"
 
 namespace netlib {
@@ -16,7 +17,8 @@ class Channel;
 // Stop() is thread-safe.
 class EventLoop {
  public:
-  static std::unique_ptr<EventLoop> Create();
+  // logger is optional and must outlive the EventLoop when non-null.
+  static std::unique_ptr<EventLoop> Create(log::Logger* logger = nullptr);
 
   EventLoop(const EventLoop&) = delete;
   EventLoop& operator=(const EventLoop&) = delete;
@@ -30,7 +32,7 @@ class EventLoop {
  private:
   friend class Channel;
 
-  EventLoop(UniqueFd epoll_fd, UniqueFd stop_event_fd);
+  EventLoop(UniqueFd epoll_fd, UniqueFd stop_event_fd, log::Logger* logger);
 
   bool AddChannel(Channel& channel);
   void RemoveChannel(Channel& channel);
@@ -44,6 +46,7 @@ class EventLoop {
   std::unique_ptr<Channel> stop_channel_;
   std::unordered_map<int, Channel*> channels_;
   std::atomic<bool> stopping_{false};
+  log::Logger* logger_;
 };
 
 }  // namespace netlib

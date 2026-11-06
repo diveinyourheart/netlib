@@ -62,6 +62,12 @@ auto main = netlib::MainReactor::Create(
 `ThreadPool` 必须比引用它的 `SubReactor` 活得久。正常关闭时先停止 Main 和
 Sub 的生产者，再调用 `ThreadPool::Stop()` 排空消息并 join Worker。
 
+Reactor 和 ThreadPool 的工厂函数支持可选的 `Logger*` 参数。建议由服务编排层
+创建 Logger，并作为最后一个非拥有参数传给三者。当前会记录 EventLoop 启动和
+停止、监听地址、连接派发、Channel 注册失败、accept/recv 错误、超大帧、
+Worker 队列背压及 Reactor 关闭等事件；逐 epoll 事件和每次成功 `recv` 不记录
+INFO 日志，避免热路径产生日志风暴。
+
 EventLoop 的 stop eventfd 也作为普通 Channel 注册。跨线程 `Stop()` 会先设置
 停止状态，再写入 stop eventfd 唤醒阻塞的 `epoll_wait()`；当前 ready batch
 处理完后，`Run()` 检查停止状态并返回，随后由调用方 join 事件循环线程。
