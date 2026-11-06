@@ -3,32 +3,60 @@
 
 #include <atomic>
 #include <cstddef>
+#include <cstdint>
 #include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
-#include <string_view>
 #include <unordered_map>
 
 #include "netlib/channel.h"
 #include "netlib/event_loop.h"
+#include "netlib/log/logger_fwd.h"
+#include "netlib/protocol_codec.h"
+#include "netlib/thread_pool.h"
 #include "netlib/unique_fd.h"
 
 namespace netlib {
 
-// Owns accepted connections and all subsequent nonblocking reads.
+struct SubReactorOptions {
+  // Maximum accepted descriptors waiting for registration.
+  std::size_t max_pending_connections = 1024;
+  // Maximum worker responses waiting for SubReactor processing.
+  std::size_t max_pending_responses = 4096;
+  // Maximum encoded bytes buffered for one slow connection.
+  std::size_t max_pending_output_bytes =
+      kFrameLengthPrefixSize + kMaxFramePayloadSize;
+};
+
+// Owns accepted connections, protocol codecs, and nonblocking read/write state.
 class SubReactor {
  public:
-  // The data view is valid only for the duration of on_data.
   struct ConnectionCallbacks {
     std::function<void(int)> on_connected;
-    std::function<void(int, std::string_view)> on_data;
     std::function<void(int)> on_closed;
   };
 
-  // Pending connections are bounded; a capacity of zero is invalid.
+  // Compatibility overload with the same capacity for connections and
+  // responses. The ThreadPool and optional logger must outlive SubReactor.
   static std::unique_ptr<SubReactor> Create(std::size_t max_pending_connections,
-                                            ConnectionCallbacks callbacks);
+                                            ThreadPool& worker_pool,
+                                            ConnectionCallbacks callbacks,
+                                            log::Logger* logger = nullptr);
+  static std::unique_ptr<SubReactor> Create(std::size_t max_pending_connections,
+                                            ThreadPool& worker_pool,
+                                            ConnectionCallbacks callbacks,
+                                            ProtocolCodecFactory codec_factory,
+                                            log::Logger* logger = nullptr);
+  static std::unique_ptr<SubReactor> Create(SubReactorOptions options,
+                                            ThreadPool& worker_pool,
+                                            ConnectionCallbacks callbacks,
+                                            log::Logger* logger = nullptr);
+  static std::unique_ptr<SubReactor> Create(SubReactorOptions options,
+                                            ThreadPool& worker_pool,
+                                            ConnectionCallbacks callbacks,
+                                            ProtocolCodecFactory codec_factory,
+                                            log::Logger* logger = nullptr);
 
   SubReactor(const SubReactor&) = delete;
   SubReactor& operator=(const SubReactor&) = delete;
@@ -36,39 +64,45 @@ class SubReactor {
   SubReactor& operator=(SubReactor&&) = delete;
   ~SubReactor();
 
-  // Thread-safe. The descriptor must otherwise be exclusively owned by the
-  // caller. False means it was not queued and will be closed on return.
-  bool AdoptConnection(UniqueFd connection);
+  // Thread-safe. Ownership moves only when true is returned. On false, the
+  // caller retains the descriptor and may try another SubReactor.
+  bool AdoptConnection(UniqueFd& connection);
 
   void Run();
   void Stop();
 
  private:
-  struct Connection {
-    UniqueFd socket;
-    std::unique_ptr<Channel> channel;
-  };
+  class Connection;
+  class ResponseQueue;
 
-  SubReactor(std::unique_ptr<EventLoop> event_loop, UniqueFd wake_fd,
-             std::size_t max_pending_connections,
-             ConnectionCallbacks callbacks);
+  SubReactor(std::unique_ptr<EventLoop> event_loop,
+             std::shared_ptr<UniqueFd> wake_fd, SubReactorOptions options,
+             ThreadPool& worker_pool, ProtocolCodecFactory codec_factory,
+             ConnectionCallbacks callbacks, log::Logger* logger);
 
   void HandleWake();
   bool DrainWake();
   bool Wake();
   void RegisterConnection(UniqueFd connection);
-  void HandleReadable(int fd);
-  void CloseConnection(int fd);
+  void HandleReadable(std::uint64_t connection_id);
+  void HandleWritable(std::uint64_t connection_id);
+  bool ProcessFrames(Connection& connection);
+  void FlushConnection(std::uint64_t connection_id);
+  void CloseConnection(std::uint64_t connection_id);
 
   std::unique_ptr<EventLoop> event_loop_;
+  ThreadPool& worker_pool_;
+  ProtocolCodecFactory codec_factory_;
   ConnectionCallbacks callbacks_;
-  std::unordered_map<int, Connection> connections_;
-  UniqueFd wake_fd_;
+  std::unordered_map<std::uint64_t, std::unique_ptr<Connection>> connections_;
+  std::shared_ptr<UniqueFd> wake_fd_;
   std::unique_ptr<Channel> wake_channel_;
-  const std::size_t max_pending_connections_;
+  std::shared_ptr<ResponseQueue> response_queue_;
+  const SubReactorOptions options_;
   std::mutex pending_mutex_;
   std::deque<UniqueFd> pending_connections_;
   std::atomic<bool> stopping_{false};
+  log::Logger* logger_;
 };
 
 }  // namespace netlib
