@@ -1,0 +1,43 @@
+#ifndef NETLIB_INCLUDE_NETLIB_CONNECTION_HANDLE_H_
+#define NETLIB_INCLUDE_NETLIB_CONNECTION_HANDLE_H_
+
+#include <atomic>
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <vector>
+
+namespace netlib {
+
+// A weak, thread-safe handle for routing responses back to a live connection.
+// Respond() is safe to call concurrently; false means the connection closed or
+// its response queue is full.
+class ConnectionHandle {
+ public:
+  ConnectionHandle() = default;
+  ConnectionHandle(const ConnectionHandle&) = default;
+  ConnectionHandle& operator=(const ConnectionHandle&) = default;
+  ConnectionHandle(ConnectionHandle&&) noexcept = default;
+  ConnectionHandle& operator=(ConnectionHandle&&) noexcept = default;
+  ~ConnectionHandle() = default;
+
+  std::uint64_t id() const;
+  bool valid() const;
+  bool Respond(std::vector<char> payload, bool close_after_write = false) const;
+
+ private:
+  class State;
+  friend class SubReactor;
+
+  using Responder = std::function<bool(std::uint64_t, std::vector<char>, bool)>;
+
+  ConnectionHandle(std::uint64_t id,
+                   std::shared_ptr<const std::atomic<bool>> alive,
+                   Responder responder);
+
+  std::shared_ptr<const State> state_;
+};
+
+}  // namespace netlib
+
+#endif  // NETLIB_INCLUDE_NETLIB_CONNECTION_HANDLE_H_

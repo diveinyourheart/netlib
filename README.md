@@ -10,7 +10,9 @@
 - `Channel`：把一个 fd 上的读写、错误回调注册到 `EventLoop`。
 - `UniqueFd`：表达 fd 的唯一所有权，支持跨线程移动。
 - `MainReactor`：监听 IPv4 端口，循环 `accept4`，轮询分发给多个 `SubReactor`。
-- `SubReactor`：通过有界队列和 eventfd 接收连接，维护每连接接收缓冲区并组装完整帧。
+- `SubReactor`：管理每连接 Codec、读写缓冲、响应队列和 ET 事件。
+- `ProtocolCodec`：负责字节流分帧和响应编码，默认实现为 4 字节长度前缀。
+- `ConnectionHandle`：Worker 回写响应的安全弱连接句柄。
 - `frame_protocol.h`：定义 4 字节大端 payload 长度和 16 MiB payload 上限。
 - `ThreadPool`：使用 moodycamel MPMC 队列消费拥有数据的 `FrameMessage`。
 - `netlib::log`：异步彩色标准输出日志，提供可扩展的 Sink 接口。
@@ -25,8 +27,8 @@
 - 性能测试：`benchmarks/`
 - 设计记录：`docs/`
 
-当前只实现了 Linux epoll 后端。传输帧分帧和 Worker 线程池已经加入；写缓冲尚未加入。
-架构和生命周期约定见
+当前只实现了 Linux epoll 后端。传输帧分帧、Worker 线程池以及非阻塞响应写回已经
+加入。架构和生命周期约定见
 [`docs/reactor_architecture.md`](docs/reactor_architecture.md)。
 
 ## 数据流程
@@ -38,6 +40,10 @@ TCP bytes
   -> moodycamel BlockingConcurrentQueue
   -> ThreadPool Worker
   -> 业务 Handler
+  -> ConnectionHandle::Respond
+  -> SubReactor response queue + eventfd
+  -> ProtocolCodec::Encode
+  -> nonblocking send / EPOLLOUT
 ```
 
 长度字段为 4 字节网络字节序，只计算 payload，不包含长度头。payload 最大
@@ -50,6 +56,8 @@ TCP bytes
 auto workers = netlib::ThreadPool::Create(
     4, 4096, [](netlib::FrameMessage message) {
       // 解码并处理完整 payload。
+      std::vector<char> response = BuildResponse(message.payload);
+      message.connection.Respond(std::move(response));
     });
 
 auto sub = netlib::SubReactor::Create(
@@ -61,6 +69,18 @@ auto main = netlib::MainReactor::Create(
 
 `ThreadPool` 必须比引用它的 `SubReactor` 活得久。正常关闭时先停止 Main 和
 Sub 的生产者，再调用 `ThreadPool::Stop()` 排空消息并 join Worker。
+
+`ConnectionHandle::Respond()` 是线程安全的。连接已经关闭时返回 false，不会使用
+可能已经复用的 fd。响应队列满时同样返回 false，由业务层选择丢弃、关闭连接或
+施加更上层的背压。响应队列容量当前与 `max_pending_connections` 相同。
+
+默认 SubReactor 使用 `CreateLengthPrefixedCodec()`。自定义协议可以实现
+`ProtocolCodec` 并通过带 `ProtocolCodecFactory` 的 `SubReactor::Create`
+重载传入。每个连接拥有独立的 Codec 实例，因此可以维护自定义解析状态。
+
+发送采用循环 `send(..., MSG_NOSIGNAL)` 直到缓冲区为空或 `EAGAIN`。仅在存在
+输出积压且遇到 `EAGAIN` 时注册 `EPOLLOUT`，写空后立即恢复为只关注读取，
+避免可写 socket 持续触发 epoll。
 
 Reactor 和 ThreadPool 的工厂函数支持可选的 `Logger*` 参数。建议由服务编排层
 创建 Logger，并作为最后一个非拥有参数传给三者。当前会记录 EventLoop 启动和

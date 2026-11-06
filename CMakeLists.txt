@@ -17,7 +17,9 @@ add_library(
   netlib
   STATIC
     src/channel.cc
+    src/connection_handle.cc
     src/event_loop.cc
+    src/length_prefixed_codec.cc
     src/main_reactor.cc
     src/sub_reactor.cc
     src/thread_pool.cc
@@ -76,4 +78,8 @@ if(BUILD_TESTING)
   add_executable(netlib_log_test tests/log_test.cc)
   target_link_libraries(netlib_log_test PRIVATE netlib::log)
   add_test(NAME netlib_log_test COMMAND netlib_log_test)
+
+  add_executable(netlib_codec_test tests/codec_test.cc)
+  target_link_libraries(netlib_codec_test PRIVATE netlib::netlib)
+  add_test(NAME netlib_codec_test COMMAND netlib_codec_test)
 endif()

@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <cstddef>
+#include <cstdint>
 #include <deque>
 #include <functional>
 #include <memory>
@@ -12,12 +13,13 @@
 #include "netlib/channel.h"
 #include "netlib/event_loop.h"
 #include "netlib/log/logger_fwd.h"
+#include "netlib/protocol_codec.h"
 #include "netlib/thread_pool.h"
 #include "netlib/unique_fd.h"
 
 namespace netlib {
 
-// Owns accepted connections and all subsequent nonblocking reads.
+// Owns accepted connections, protocol codecs, and nonblocking read/write state.
 class SubReactor {
  public:
   struct ConnectionCallbacks {
@@ -25,11 +27,16 @@ class SubReactor {
     std::function<void(int)> on_closed;
   };
 
-  // Pending connections are bounded; a capacity of zero is invalid. The
+  // Pending connections and responses each use this bounded capacity. The
   // ThreadPool and optional logger must outlive this SubReactor.
   static std::unique_ptr<SubReactor> Create(std::size_t max_pending_connections,
                                             ThreadPool& worker_pool,
                                             ConnectionCallbacks callbacks,
+                                            log::Logger* logger = nullptr);
+  static std::unique_ptr<SubReactor> Create(std::size_t max_pending_connections,
+                                            ThreadPool& worker_pool,
+                                            ConnectionCallbacks callbacks,
+                                            ProtocolCodecFactory codec_factory,
                                             log::Logger* logger = nullptr);
 
   SubReactor(const SubReactor&) = delete;
@@ -47,25 +54,32 @@ class SubReactor {
 
  private:
   class Connection;
+  class ResponseQueue;
 
-  SubReactor(std::unique_ptr<EventLoop> event_loop, UniqueFd wake_fd,
+  SubReactor(std::unique_ptr<EventLoop> event_loop,
+             std::shared_ptr<UniqueFd> wake_fd,
              std::size_t max_pending_connections, ThreadPool& worker_pool,
-             ConnectionCallbacks callbacks, log::Logger* logger);
+             ProtocolCodecFactory codec_factory, ConnectionCallbacks callbacks,
+             log::Logger* logger);
 
   void HandleWake();
   bool DrainWake();
   bool Wake();
   void RegisterConnection(UniqueFd connection);
-  void HandleReadable(int fd);
+  void HandleReadable(std::uint64_t connection_id);
+  void HandleWritable(std::uint64_t connection_id);
   bool ProcessFrames(Connection& connection);
-  void CloseConnection(int fd);
+  void FlushConnection(std::uint64_t connection_id);
+  void CloseConnection(std::uint64_t connection_id);
 
   std::unique_ptr<EventLoop> event_loop_;
   ThreadPool& worker_pool_;
+  ProtocolCodecFactory codec_factory_;
   ConnectionCallbacks callbacks_;
-  std::unordered_map<int, std::unique_ptr<Connection>> connections_;
-  UniqueFd wake_fd_;
+  std::unordered_map<std::uint64_t, std::unique_ptr<Connection>> connections_;
+  std::shared_ptr<UniqueFd> wake_fd_;
   std::unique_ptr<Channel> wake_channel_;
+  std::shared_ptr<ResponseQueue> response_queue_;
   const std::size_t max_pending_connections_;
   std::mutex pending_mutex_;
   std::deque<UniqueFd> pending_connections_;

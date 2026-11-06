@@ -22,6 +22,13 @@ complete Frame
   -> FrameMessage (owned payload)
   -> moodycamel MPMC queue
   -> ThreadPool workers
+
+worker response
+  -> ConnectionHandle
+  -> SubReactor response queue
+  -> codec encode
+  -> output buffer
+  -> send until EAGAIN
 ```
 
 ## Ownership
@@ -53,6 +60,11 @@ The queue is bounded. `AdoptConnection` moves ownership only on success. On
 failure MainReactor keeps ownership and tries another SubReactor; if all are
 full, it closes the connection. This is the current explicit overload policy.
 
+The same eventfd also wakes the SubReactor for worker responses. Its wake
+callback drains the eventfd to `EAGAIN`, drains pending connections, then drains
+the MPMC response queue. One doorbell handles both control directions while
+the payloads remain in their independent bounded queues.
+
 ## Event processing
 
 All Channels are edge triggered. Readable callbacks drain accept or `recv`
@@ -64,8 +76,8 @@ leaving EventLoop with a dangling Channel pointer.
 
 ## Framing
 
-Each connection has one reusable input buffer and one expected frame size. The
-wire format is:
+Each connection owns a `ProtocolCodec` instance, one reusable input buffer, one
+output buffer, and one stable connection ID. The default codec wire format is:
 
 ```text
 +--------------------------+-------------------+
@@ -76,13 +88,16 @@ wire format is:
 The length excludes the four-byte prefix. A payload may be empty, but its
 length cannot exceed `kMaxFramePayloadSize`, currently 16 MiB.
 
-`recv()` writes directly into the connection buffer; the implementation does
-not copy bytes through a temporary stack array. The parser reads the length
-once, retains it in connection state, and waits until that many bytes are
-available. A complete payload is copied once into an owned `FrameMessage` and
-submitted to the ThreadPool. Reusable capacity remains attached to the
-connection and is compacted only when the unconsumed tail has insufficient
-writable space.
+`ProtocolCodec::Decode` returns `NeedMore`, `FrameReady`, or `ProtocolError`.
+For a complete frame it returns consumed bytes, payload offset, and payload
+size. SubReactor consumes only the declared bytes and immediately decodes any
+remaining coalesced frame. A custom HTTP codec can therefore own its own
+request parsing state.
+
+`recv()` writes directly into the connection buffer. A complete payload is
+copied once into an owned `FrameMessage` and submitted to the ThreadPool.
+Reusable input capacity remains attached to the connection and is compacted
+only when the unconsumed tail has insufficient writable space.
 
 ## Worker dispatch
 
@@ -101,6 +116,17 @@ also be in flight in Worker calls.
 Handlers run concurrently and have no global ordering guarantee. Ordering that
 matters to an application must use `connection_id` and `sequence`. Queue
 submission failure applies backpressure by closing that connection.
+
+`FrameMessage::connection` is a `ConnectionHandle`. Workers call `Respond()` to
+move an application payload into the bound response queue of the owning
+SubReactor. The handle is weak: responses for a closed connection fail instead
+of writing to an fd that may have been reused.
+
+SubReactor drains responses on its own thread, encodes them using the
+connection's `ProtocolCodec`, and appends them to the output buffer. It writes
+nonblocking until `EAGAIN`; only then does the Channel add `EPOLLOUT`. Once the
+buffer drains, write interest is removed. `close_after_write` closes the
+connection only after all queued output is flushed.
 
 Producers must stop before `ThreadPool::Stop()`. Stop enqueues one sentinel per
 Worker, waits for earlier messages to drain, and joins all Worker threads.

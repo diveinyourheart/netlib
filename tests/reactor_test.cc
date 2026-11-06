@@ -2,6 +2,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -67,6 +68,13 @@ bool ConnectTo(uint16_t port, netlib::UniqueFd* connection) {
   if (!*connection) {
     return false;
   }
+  timeval receive_timeout{};
+  receive_timeout.tv_sec = 2;
+  setsockopt(connection->get(), SOL_SOCKET, SO_RCVTIMEO, &receive_timeout,
+             sizeof(receive_timeout));
+  int receive_buffer_size = 8 * 1024;
+  setsockopt(connection->get(), SOL_SOCKET, SO_RCVBUF, &receive_buffer_size,
+             sizeof(receive_buffer_size));
   return connect(connection->get(), reinterpret_cast<const sockaddr*>(&address),
                  sizeof(address)) == 0;
 }
@@ -85,6 +93,43 @@ bool SendAll(int fd, std::string_view data) {
     return false;
   }
   return true;
+}
+
+bool ReceiveAll(int fd, char* data, std::size_t size) {
+  std::size_t received = 0;
+  while (received < size) {
+    ssize_t result = recv(fd, data + received, size - received, 0);
+    if (result > 0) {
+      received += static_cast<std::size_t>(result);
+      continue;
+    }
+    if (result < 0 && errno == EINTR) {
+      continue;
+    }
+    return false;
+  }
+  return true;
+}
+
+bool ReadFrame(int fd, std::string* payload) {
+  std::array<char, netlib::kFrameLengthPrefixSize> header{};
+  if (!ReceiveAll(fd, header.data(), header.size())) {
+    return false;
+  }
+  std::uint32_t payload_size =
+      (static_cast<std::uint32_t>(static_cast<unsigned char>(header[0]))
+       << 24U) |
+      (static_cast<std::uint32_t>(static_cast<unsigned char>(header[1]))
+       << 16U) |
+      (static_cast<std::uint32_t>(static_cast<unsigned char>(header[2]))
+       << 8U) |
+      static_cast<std::uint32_t>(static_cast<unsigned char>(header[3]));
+  if (payload_size > netlib::kMaxFramePayloadSize) {
+    return false;
+  }
+
+  payload->resize(payload_size);
+  return ReceiveAll(fd, payload->data(), payload->size());
 }
 
 std::string MakeLengthPrefix(std::uint32_t payload_size) {
@@ -335,6 +380,108 @@ int RunOversizedFrameTest() {
   return success ? 0 : 1;
 }
 
+int RunLateResponseTest() {
+  Observation observation;
+  std::mutex gate_mutex;
+  std::condition_variable gate_condition;
+  bool handler_started = false;
+  bool release_handler = false;
+  bool response_attempted = false;
+  bool response_accepted = true;
+
+  netlib::ThreadPool::Handler handler =
+      [&gate_mutex, &gate_condition, &handler_started, &release_handler,
+       &response_attempted, &response_accepted](netlib::FrameMessage message) {
+        {
+          std::unique_lock<std::mutex> lock(gate_mutex);
+          handler_started = true;
+          gate_condition.notify_all();
+          gate_condition.wait(lock,
+                              [&release_handler] { return release_handler; });
+        }
+
+        bool accepted = message.connection.Respond(std::vector<char>{'x'});
+        {
+          std::lock_guard<std::mutex> lock(gate_mutex);
+          response_attempted = true;
+          response_accepted = accepted;
+          gate_condition.notify_all();
+        }
+      };
+
+  std::unique_ptr<netlib::ThreadPool> worker_pool =
+      netlib::ThreadPool::Create(1, 8, std::move(handler));
+  if (!worker_pool) {
+    ReportFailure("failed to create late-response ThreadPool");
+    return 1;
+  }
+  std::unique_ptr<netlib::SubReactor> sub_reactor = netlib::SubReactor::Create(
+      8, *worker_pool, MakeConnectionCallbacks(observation));
+  if (!sub_reactor) {
+    ReportFailure("failed to create late-response SubReactor");
+    return 1;
+  }
+  std::unique_ptr<netlib::MainReactor> main_reactor =
+      netlib::MainReactor::Create(0, {sub_reactor.get()});
+  if (!main_reactor) {
+    ReportFailure("failed to create late-response MainReactor");
+    return 1;
+  }
+
+  std::thread sub_thread([&sub_reactor] { sub_reactor->Run(); });
+  std::thread main_thread([&main_reactor] { main_reactor->Run(); });
+
+  bool success = true;
+  netlib::UniqueFd client;
+  if (!ConnectTo(main_reactor->port(), &client) ||
+      !SendAll(client.get(), MakeFrame("late-response"))) {
+    ReportFailure("failed to send late-response request");
+    success = false;
+  }
+
+  {
+    std::unique_lock<std::mutex> lock(gate_mutex);
+    if (success && !gate_condition.wait_for(
+                       lock, kWaitTimeout,
+                       [&handler_started] { return handler_started; })) {
+      ReportFailure("Worker did not start late-response request");
+      success = false;
+    }
+  }
+
+  client.Reset();
+  if (success && !WaitForClosed(observation)) {
+    ReportFailure("connection did not close before late response");
+    success = false;
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(gate_mutex);
+    release_handler = true;
+    gate_condition.notify_all();
+  }
+  {
+    std::unique_lock<std::mutex> lock(gate_mutex);
+    if (success && !gate_condition.wait_for(
+                       lock, kWaitTimeout,
+                       [&response_attempted] { return response_attempted; })) {
+      ReportFailure("Worker did not attempt late response");
+      success = false;
+    }
+    if (success && response_accepted) {
+      ReportFailure("closed connection accepted a late response");
+      success = false;
+    }
+  }
+
+  main_reactor->Stop();
+  sub_reactor->Stop();
+  main_thread.join();
+  sub_thread.join();
+  worker_pool->Stop();
+  return success ? 0 : 1;
+}
+
 int RunReactorTest() {
   Observation first_observation;
   Observation second_observation;
@@ -353,8 +500,10 @@ int RunReactorTest() {
     ReportFailure("failed to create Reactor logger");
     return 1;
   }
+  std::atomic<std::size_t> response_errors{0};
   netlib::ThreadPool::Handler frame_handler =
-      [&first_observation, &second_observation](netlib::FrameMessage message) {
+      [&first_observation, &second_observation,
+       &response_errors](netlib::FrameMessage message) {
         Observation* observation = nullptr;
         if (!message.payload.empty() && message.payload.front() == 'a') {
           observation = &first_observation;
@@ -365,11 +514,27 @@ int RunReactorTest() {
           return;
         }
 
-        std::lock_guard<std::mutex> lock(observation->mutex);
-        observation->data.append(message.payload.data(),
-                                 message.payload.size());
-        ++observation->frame_count;
-        observation->condition.notify_all();
+        {
+          std::lock_guard<std::mutex> lock(observation->mutex);
+          observation->data.append(message.payload.data(),
+                                   message.payload.size());
+          ++observation->frame_count;
+          observation->condition.notify_all();
+        }
+
+        std::vector<char> response;
+        if (message.payload.front() == 'a') {
+          response.assign(8 * 1024 * 1024, 'R');
+        } else {
+          std::string text =
+              message.payload.front() == 'b' ? "response-b" : "response-c";
+          response.assign(text.begin(), text.end());
+        }
+        bool close_after_write = message.payload.front() == 'a';
+        if (!message.connection.Respond(std::move(response),
+                                        close_after_write)) {
+          response_errors.fetch_add(1, std::memory_order_relaxed);
+        }
       };
   std::unique_ptr<netlib::ThreadPool> worker_pool =
       netlib::ThreadPool::Create(2, 32, std::move(frame_handler), logger.get());
@@ -378,13 +543,13 @@ int RunReactorTest() {
     return 1;
   }
   std::unique_ptr<netlib::SubReactor> first_sub_reactor =
-      netlib::SubReactor::Create(16, *worker_pool,
-                                 MakeConnectionCallbacks(first_observation),
-                                 logger.get());
+      netlib::SubReactor::Create(
+          16, *worker_pool, MakeConnectionCallbacks(first_observation),
+          [] { return netlib::CreateLengthPrefixedCodec(); }, logger.get());
   std::unique_ptr<netlib::SubReactor> second_sub_reactor =
-      netlib::SubReactor::Create(16, *worker_pool,
-                                 MakeConnectionCallbacks(second_observation),
-                                 logger.get());
+      netlib::SubReactor::Create(
+          16, *worker_pool, MakeConnectionCallbacks(second_observation),
+          [] { return netlib::CreateLengthPrefixedCodec(); }, logger.get());
   if (!first_sub_reactor || !second_sub_reactor) {
     ReportFailure("failed to create SubReactors");
     return 1;
@@ -444,6 +609,28 @@ int RunReactorTest() {
     success = false;
   }
 
+  std::string first_response;
+  std::string second_response_one;
+  std::string second_response_two;
+  if (success && (!ReadFrame(first_connection.get(), &first_response) ||
+                  !ReadFrame(second_connection.get(), &second_response_one) ||
+                  !ReadFrame(second_connection.get(), &second_response_two))) {
+    ReportFailure("failed to read worker responses");
+    success = false;
+  }
+  if (success) {
+    const std::string expected_first_response(8 * 1024 * 1024, 'R');
+    const bool second_replies = (second_response_one == "response-b" &&
+                                 second_response_two == "response-c") ||
+                                (second_response_one == "response-c" &&
+                                 second_response_two == "response-b");
+    if (first_response != expected_first_response || !second_replies ||
+        response_errors.load(std::memory_order_relaxed) != 0) {
+      ReportFailure("worker responses were lost or corrupted");
+      success = false;
+    }
+  }
+
   if (first_connection) {
     shutdown(first_connection.get(), SHUT_WR);
     first_connection.Reset();
@@ -492,6 +679,10 @@ int main() {
   int protocol_result = RunOversizedFrameTest();
   if (protocol_result != 0) {
     return protocol_result;
+  }
+  int late_response_result = RunLateResponseTest();
+  if (late_response_result != 0) {
+    return late_response_result;
   }
   return RunReactorTest();
 }
