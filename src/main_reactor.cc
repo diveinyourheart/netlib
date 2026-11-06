@@ -7,7 +7,6 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
-#include <string>
 #include <utility>
 
 #include "netlib/channel.h"
@@ -32,8 +31,8 @@ ListenSocket CreateListenSocket(uint16_t requested_port, log::Logger* logger) {
       socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0));
   if (!result.socket) {
     if (logger != nullptr) {
-      NETLIB_LOG_ERROR(*logger, std::string("listen socket creation failed: ") +
-                                    std::strerror(errno));
+      NETLIB_LOG_ERROR(*logger, "listen socket creation failed: {}",
+                       std::strerror(errno));
     }
     return result;
   }
@@ -42,8 +41,8 @@ ListenSocket CreateListenSocket(uint16_t requested_port, log::Logger* logger) {
   if (setsockopt(result.socket.get(), SOL_SOCKET, SO_REUSEADDR, &reuse_address,
                  sizeof(reuse_address)) != 0) {
     if (logger != nullptr) {
-      NETLIB_LOG_ERROR(
-          *logger, std::string("SO_REUSEADDR failed: ") + std::strerror(errno));
+      NETLIB_LOG_ERROR(*logger, "SO_REUSEADDR failed: {}",
+                       std::strerror(errno));
     }
     result.socket.Reset();
     return result;
@@ -56,17 +55,15 @@ ListenSocket CreateListenSocket(uint16_t requested_port, log::Logger* logger) {
   if (bind(result.socket.get(), reinterpret_cast<const sockaddr*>(&address),
            sizeof(address)) != 0) {
     if (logger != nullptr) {
-      NETLIB_LOG_ERROR(*logger, "listen socket bind failed for port=" +
-                                    std::to_string(requested_port) + ": " +
-                                    std::strerror(errno));
+      NETLIB_LOG_ERROR(*logger, "listen socket bind failed for port={}: {}",
+                       requested_port, std::strerror(errno));
     }
     result.socket.Reset();
     return result;
   }
   if (listen(result.socket.get(), kListenBacklog) != 0) {
     if (logger != nullptr) {
-      NETLIB_LOG_ERROR(*logger,
-                       std::string("listen failed: ") + std::strerror(errno));
+      NETLIB_LOG_ERROR(*logger, "listen failed: {}", std::strerror(errno));
     }
     result.socket.Reset();
     return result;
@@ -76,8 +73,7 @@ ListenSocket CreateListenSocket(uint16_t requested_port, log::Logger* logger) {
   if (getsockname(result.socket.get(), reinterpret_cast<sockaddr*>(&address),
                   &address_length) != 0) {
     if (logger != nullptr) {
-      NETLIB_LOG_ERROR(
-          *logger, std::string("getsockname failed: ") + std::strerror(errno));
+      NETLIB_LOG_ERROR(*logger, "getsockname failed: {}", std::strerror(errno));
     }
     result.socket.Reset();
     return result;
@@ -132,10 +128,9 @@ std::unique_ptr<MainReactor> MainReactor::Create(uint16_t requested_port,
     return nullptr;
   }
   if (logger != nullptr) {
-    NETLIB_LOG_INFO(*logger, "main reactor listening on port=" +
-                                 std::to_string(reactor->port_) + " with " +
-                                 std::to_string(reactor->sub_reactors_.size()) +
-                                 " SubReactors");
+    NETLIB_LOG_INFO(*logger,
+                    "main reactor listening on port={} with {} SubReactors",
+                    reactor->port_, reactor->sub_reactors_.size());
   }
   return reactor;
 }
@@ -169,16 +164,15 @@ void MainReactor::DispatchConnection(UniqueFd& connection) {
     next_sub_reactor_ = (next_sub_reactor_ + 1) % sub_reactors_.size();
     if (sub_reactors_[index]->AdoptConnection(connection)) {
       if (logger_ != nullptr) {
-        NETLIB_LOG_DEBUG(*logger_,
-                         "dispatched fd=" + std::to_string(fd) +
-                             " to SubReactor index=" + std::to_string(index));
+        NETLIB_LOG_DEBUG(*logger_, "dispatched fd={} to SubReactor index={}",
+                         fd, index);
       }
       return;
     }
   }
   if (logger_ != nullptr) {
-    NETLIB_LOG_WARN(*logger_, "all SubReactor queues are full; closing fd=" +
-                                  std::to_string(fd));
+    NETLIB_LOG_WARN(*logger_, "all SubReactor queues are full; closing fd={}",
+                    fd);
   }
 }
 
@@ -189,8 +183,7 @@ void MainReactor::HandleReadable() {
     if (connection_fd >= 0) {
       UniqueFd connection(connection_fd);
       if (logger_ != nullptr) {
-        NETLIB_LOG_DEBUG(*logger_,
-                         "accepted fd=" + std::to_string(connection_fd));
+        NETLIB_LOG_DEBUG(*logger_, "accepted fd={}", connection_fd);
       }
       DispatchConnection(connection);
       continue;
@@ -203,14 +196,14 @@ void MainReactor::HandleReadable() {
     }
     if (errno == ECONNABORTED || errno == EPROTO) {
       if (logger_ != nullptr) {
-        NETLIB_LOG_WARN(*logger_, std::string("transient accept error: ") +
-                                      std::strerror(errno));
+        NETLIB_LOG_WARN(*logger_, "transient accept error: {}",
+                        std::strerror(errno));
       }
       continue;
     }
     if (logger_ != nullptr) {
-      NETLIB_LOG_ERROR(
-          *logger_, std::string("fatal accept error: ") + std::strerror(errno));
+      NETLIB_LOG_ERROR(*logger_, "fatal accept error: {}",
+                       std::strerror(errno));
     }
     event_loop_->Stop();
     return;

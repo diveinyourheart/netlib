@@ -50,9 +50,15 @@ target_include_directories(
     "${CMAKE_CURRENT_SOURCE_DIR}/third_party/moodycamel")
 target_include_directories(
   netlib_log
+  SYSTEM
+  PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/fmt/include")
+target_include_directories(
+  netlib_log
   PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>)
+target_compile_definitions(netlib_log PUBLIC FMT_HEADER_ONLY=1)
 target_link_libraries(netlib_log PUBLIC Threads::Threads)
 
 target_link_libraries(netlib PUBLIC netlib_log)

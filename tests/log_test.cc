@@ -86,7 +86,8 @@ int RunStdoutFormatTest() {
     return 1;
   }
 
-  NETLIB_LOG_INFO(*colorless_logger, "hello\nworld");
+  NETLIB_LOG_INFO(*colorless_logger, "hello {}", "world\nnext");
+  NETLIB_LOG_INFO(*colorless_logger, "count={} name={}", 42, "worker");
   NETLIB_LOG_ERROR(*colorless_logger, "escape:\x1b[31mred");
   if (!colorless_logger->Flush()) {
     ReportFailure("failed to flush colorless logger");
@@ -101,7 +102,8 @@ int RunStdoutFormatTest() {
       colorless.find("tid=") == std::string::npos ||
       colorless.find("netlib.test") == std::string::npos ||
       colorless.find("log_test.cc") == std::string::npos ||
-      colorless.find("hello\n    | world") == std::string::npos ||
+      colorless.find("hello world\n    | next") == std::string::npos ||
+      colorless.find("count=42 name=worker") == std::string::npos ||
       colorless.find("\\x1B[31mred") == std::string::npos) {
     ReportFailure("stdout log format is incomplete or unsafe");
     return 1;
@@ -121,7 +123,7 @@ int RunStdoutFormatTest() {
     ReportFailure("failed to create colored logger");
     return 1;
   }
-  NETLIB_LOG_WARN(*colored_logger, "colored message");
+  NETLIB_LOG_WARN(*colored_logger, "colored {}", "message");
   if (!colored_logger->Flush()) {
     ReportFailure("failed to flush colored logger");
     return 1;
@@ -163,15 +165,18 @@ int RunConcurrentLoggerTest() {
   producers.reserve(kThreadCount);
   for (std::size_t thread_index = 0; thread_index < kThreadCount;
        ++thread_index) {
-    producers.emplace_back([logger_pointer = logger.get(), &enqueued] {
-      for (std::size_t message_index = 0; message_index < kMessagesPerThread;
-           ++message_index) {
-        if (logger_pointer->Log(netlib::log::LogLevel::kInfo,
-                                "concurrent message")) {
-          enqueued.fetch_add(1, std::memory_order_relaxed);
-        }
-      }
-    });
+    producers.emplace_back(
+        [logger_pointer = logger.get(), &enqueued, thread_index] {
+          for (std::size_t message_index = 0;
+               message_index < kMessagesPerThread; ++message_index) {
+            if (logger_pointer->Logf(netlib::log::LogLevel::kInfo,
+                                     std::source_location::current(),
+                                     "concurrent thread={} message={}",
+                                     thread_index, message_index)) {
+              enqueued.fetch_add(1, std::memory_order_relaxed);
+            }
+          }
+        });
   }
   for (std::thread& producer : producers) {
     producer.join();

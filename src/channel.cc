@@ -3,7 +3,6 @@
 #include <sys/epoll.h>
 
 #include <cstdint>
-#include <string>
 #include <utility>
 
 #include "netlib/event_loop.h"
@@ -17,8 +16,9 @@ std::unique_ptr<Channel> Channel::Create(EventLoop& loop, int fd,
   if (fd < 0 || (!interest.read && !interest.write)) {
     if (loop.logger_ != nullptr) {
       NETLIB_LOG_WARN(*loop.logger_,
-                      "channel creation rejected for fd=" + std::to_string(fd) +
-                          " without valid interest");
+                      "channel creation rejected for fd={} "
+                      "without valid interest",
+                      fd);
     }
     return nullptr;
   }
@@ -30,8 +30,7 @@ std::unique_ptr<Channel> Channel::Create(EventLoop& loop, int fd,
   }
   channel->registered_ = true;
   if (loop.logger_ != nullptr) {
-    NETLIB_LOG_DEBUG(*loop.logger_,
-                     "channel registered fd=" + std::to_string(fd));
+    NETLIB_LOG_DEBUG(*loop.logger_, "channel registered fd={}", fd);
   }
   return channel;
 }
@@ -52,8 +51,8 @@ Channel::~Channel() {
 bool Channel::SetInterest(ChannelInterest interest) {
   if (!interest.read && !interest.write) {
     if (loop_.logger_ != nullptr) {
-      NETLIB_LOG_WARN(*loop_.logger_, "channel interest rejected for fd=" +
-                                          std::to_string(fd_));
+      NETLIB_LOG_WARN(*loop_.logger_, "channel interest rejected for fd={}",
+                      fd_);
     }
     return false;
   }

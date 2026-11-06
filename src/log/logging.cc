@@ -243,6 +243,8 @@ class Logger::Impl {
   bool IsEnabled(LogLevel level) const;
   bool Log(LogLevel level, std::string_view message,
            std::source_location source);
+  bool LogOwned(LogLevel level, std::string message,
+                std::source_location source);
   bool Flush();
   void Stop();
   std::size_t queued_count() const;
@@ -294,6 +296,11 @@ bool Logger::Impl::IsEnabled(LogLevel level) const {
 
 bool Logger::Impl::Log(LogLevel level, std::string_view message,
                        std::source_location source) {
+  return LogOwned(level, std::string(message), source);
+}
+
+bool Logger::Impl::LogOwned(LogLevel level, std::string message,
+                            std::source_location source) {
   if (!IsEnabled(level) || stopping_.load(std::memory_order_acquire) ||
       !ReserveQueueSlot()) {
     return false;
@@ -309,7 +316,7 @@ bool Logger::Impl::Log(LogLevel level, std::string_view message,
       .dropped_messages = dropped_messages,
       .source = source,
       .logger_name = logger_name_,
-      .message = std::string(message),
+      .message = std::move(message),
   };
   WorkItem item{
       .kind = WorkItemKind::kMessage,
@@ -449,6 +456,11 @@ bool Logger::IsEnabled(LogLevel level) const { return impl_->IsEnabled(level); }
 bool Logger::Log(LogLevel level, std::string_view message,
                  std::source_location source) {
   return impl_->Log(level, message, source);
+}
+
+bool Logger::LogFormatted(LogLevel level, std::string message,
+                          std::source_location source) {
+  return impl_->LogOwned(level, std::move(message), source);
 }
 
 bool Logger::Flush() { return impl_->Flush(); }

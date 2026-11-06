@@ -8,7 +8,9 @@ ThreadPool implementation.
 ```text
 producer thread
   -> collect timestamp, Linux tid, sequence, source location
-  -> copy message into LogRecord
+  -> level short-circuit
+  -> compile-time checked fmt formatting
+  -> move formatted message into LogRecord
   -> bounded moodycamel BlockingConcurrentQueue
 
 Logger writer thread
@@ -20,6 +22,12 @@ Logger writer thread
 The producer never waits for terminal or network I/O. A full queue drops the new
 record, increments `dropped_count()`, and reports the pending drop count on the
 next successfully queued record.
+
+The macros use fmtlib 11.2.0 with compile-time format checking. Formatting is
+performed on the producer thread in one pass and the resulting string is moved
+into the queued `LogRecord`. Disabled levels skip formatting and message
+allocation. Dynamic format strings can use `Logger::Log()` with an already
+formatted `std::string_view`.
 
 ## Record fields
 

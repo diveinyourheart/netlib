@@ -4,7 +4,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
-#include <string>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -74,10 +73,9 @@ ThreadPool::Impl::Impl(std::size_t worker_count,
         [this, token_pointer] { WorkerLoop(*token_pointer); });
   }
   if (logger_ != nullptr) {
-    NETLIB_LOG_INFO(*logger_, "ThreadPool started with " +
-                                  std::to_string(worker_count) +
-                                  " workers and queue capacity " +
-                                  std::to_string(max_pending_messages));
+    NETLIB_LOG_INFO(*logger_,
+                    "ThreadPool started with {} workers and queue capacity {}",
+                    worker_count, max_pending_messages);
   }
 }
 

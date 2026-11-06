@@ -15,7 +15,6 @@
 #include <deque>
 #include <memory>
 #include <span>
-#include <string>
 #include <utility>
 #include <vector>
 
@@ -197,8 +196,8 @@ std::unique_ptr<SubReactor> SubReactor::Create(
   UniqueFd wake_fd(eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC));
   if (!wake_fd) {
     if (logger != nullptr) {
-      NETLIB_LOG_ERROR(*logger, std::string("SubReactor eventfd failed: ") +
-                                    std::strerror(errno));
+      NETLIB_LOG_ERROR(*logger, "SubReactor eventfd failed: {}",
+                       std::strerror(errno));
     }
     return nullptr;
   }
@@ -219,8 +218,8 @@ std::unique_ptr<SubReactor> SubReactor::Create(
     return nullptr;
   }
   if (logger != nullptr) {
-    NETLIB_LOG_INFO(*logger, "SubReactor created with pending capacity=" +
-                                 std::to_string(max_pending_connections));
+    NETLIB_LOG_INFO(*logger, "SubReactor created with pending capacity={}",
+                    max_pending_connections);
   }
   return reactor;
 }
@@ -305,9 +304,8 @@ bool SubReactor::DrainWake() {
       return true;
     }
     if (logger_ != nullptr) {
-      NETLIB_LOG_ERROR(*logger_,
-                       std::string("SubReactor eventfd read failed: ") +
-                           std::strerror(errno));
+      NETLIB_LOG_ERROR(*logger_, "SubReactor eventfd read failed: {}",
+                       std::strerror(errno));
     }
     return false;
   }
@@ -327,9 +325,8 @@ bool SubReactor::Wake() {
       return true;
     }
     if (logger_ != nullptr) {
-      NETLIB_LOG_ERROR(*logger_,
-                       std::string("SubReactor eventfd write failed: ") +
-                           std::strerror(errno));
+      NETLIB_LOG_ERROR(*logger_, "SubReactor eventfd write failed: {}",
+                       std::strerror(errno));
     }
     return false;
   }
@@ -339,17 +336,15 @@ void SubReactor::RegisterConnection(UniqueFd connection) {
   int fd = connection.get();
   if (!SetNonBlocking(fd)) {
     if (logger_ != nullptr) {
-      NETLIB_LOG_ERROR(*logger_,
-                       "failed to set O_NONBLOCK for fd=" + std::to_string(fd) +
-                           ": " + std::strerror(errno));
+      NETLIB_LOG_ERROR(*logger_, "failed to set O_NONBLOCK for fd={}: {}", fd,
+                       std::strerror(errno));
     }
     return;
   }
   if (!SetCloseOnExec(fd)) {
     if (logger_ != nullptr) {
-      NETLIB_LOG_ERROR(*logger_,
-                       "failed to set FD_CLOEXEC for fd=" + std::to_string(fd) +
-                           ": " + std::strerror(errno));
+      NETLIB_LOG_ERROR(*logger_, "failed to set FD_CLOEXEC for fd={}: {}", fd,
+                       std::strerror(errno));
     }
     return;
   }
@@ -371,15 +366,13 @@ void SubReactor::RegisterConnection(UniqueFd connection) {
   auto inserted = connections_.emplace(fd, std::move(state));
   if (!inserted.second) {
     if (logger_ != nullptr) {
-      NETLIB_LOG_ERROR(
-          *logger_, "duplicate connection state for fd=" + std::to_string(fd));
+      NETLIB_LOG_ERROR(*logger_, "duplicate connection state for fd={}", fd);
     }
     return;
   }
   if (logger_ != nullptr) {
-    NETLIB_LOG_DEBUG(
-        *logger_, "registered connection fd=" + std::to_string(fd) + " id=" +
-                      std::to_string(inserted.first->second->connection_id()));
+    NETLIB_LOG_DEBUG(*logger_, "registered connection fd={} id={}", fd,
+                     inserted.first->second->connection_id());
   }
   if (callbacks_.on_connected) {
     callbacks_.on_connected(fd);
@@ -406,7 +399,7 @@ void SubReactor::HandleReadable(int fd) {
     }
     if (result == 0) {
       if (logger_ != nullptr) {
-        NETLIB_LOG_DEBUG(*logger_, "peer closed fd=" + std::to_string(fd));
+        NETLIB_LOG_DEBUG(*logger_, "peer closed fd={}", fd);
       }
       CloseConnection(fd);
       return;
@@ -418,8 +411,8 @@ void SubReactor::HandleReadable(int fd) {
       return;
     }
     if (logger_ != nullptr) {
-      NETLIB_LOG_WARN(*logger_, "recv failed for fd=" + std::to_string(fd) +
-                                    ": " + std::strerror(errno));
+      NETLIB_LOG_WARN(*logger_, "recv failed for fd={}: {}", fd,
+                      std::strerror(errno));
     }
     CloseConnection(fd);
     return;
@@ -439,11 +432,10 @@ bool SubReactor::ProcessFrames(Connection& connection) {
           DecodePayloadSize(readable.first(kFrameLengthPrefixSize));
       if (payload_size > kMaxFramePayloadSize) {
         if (logger_ != nullptr) {
-          NETLIB_LOG_WARN(*logger_,
-                          "frame too large for connection id=" +
-                              std::to_string(connection.connection_id()) +
-                              " payload=" + std::to_string(payload_size) +
-                              " max=" + std::to_string(kMaxFramePayloadSize));
+          NETLIB_LOG_WARN(
+              *logger_,
+              "frame too large for connection id={} payload={} max={}",
+              connection.connection_id(), payload_size, kMaxFramePayloadSize);
         }
         return false;
       }
@@ -467,9 +459,9 @@ bool SubReactor::ProcessFrames(Connection& connection) {
     };
     if (!worker_pool_.Submit(std::move(message))) {
       if (logger_ != nullptr) {
-        NETLIB_LOG_WARN(*logger_, "worker queue full for connection id=" +
-                                      std::to_string(connection_id) +
-                                      " sequence=" + std::to_string(sequence));
+        NETLIB_LOG_WARN(*logger_,
+                        "worker queue full for connection id={} sequence={}",
+                        connection_id, sequence);
       }
       return false;
     }
@@ -484,9 +476,8 @@ void SubReactor::CloseConnection(int fd) {
     return;
   }
   if (logger_ != nullptr) {
-    NETLIB_LOG_DEBUG(*logger_,
-                     "closing connection fd=" + std::to_string(fd) + " id=" +
-                         std::to_string(connection->second->connection_id()));
+    NETLIB_LOG_DEBUG(*logger_, "closing connection fd={} id={}", fd,
+                     connection->second->connection_id());
   }
   if (callbacks_.on_closed) {
     callbacks_.on_closed(fd);

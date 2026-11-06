@@ -90,7 +90,7 @@ netlib::log::LoggerOptions options{
 };
 
 auto logger = netlib::log::Logger::CreateStdout(std::move(options));
-NETLIB_LOG_INFO(*logger, "server started");
+NETLIB_LOG_INFO(*logger, "server started on port={} workers={}", 8080, 4);
 ```
 
 标准输出示例（实际输出为单行）：
@@ -108,6 +108,19 @@ NETLIB_LOG_INFO(*logger, "server started");
 Flush 和 Stop 控制消息共用一个显式 moodycamel producer token，保证并发 Flush
 时控制消息按 FIFO 处理。Flush 是队列屏障；Flush 期间由其他线程继续写入的日志
 可能排在该屏障之后。
+
+日志宏使用固定版本 fmtlib 11.2.0，格式串在编译期检查，例如：
+
+```cpp
+NETLIB_LOG_WARN(*logger, "fd={} errno={} reason={}",
+                client_fd, error_number, reason);
+```
+
+日志级别检查发生在参数格式化之前，因此关闭某个级别时只承担一次原子读取和
+分支判断，不执行格式化和消息分配。启用日志时，fmt 在调用线程完成一次格式化，
+消息 move 到异步队列；Writer 线程只负责格式前缀、Sink 写入和 Flush。相比
+多段 `std::string + std::to_string` 拼接，这避免了多个临时字符串和重复分配，
+同时保留异步 I/O 的非阻塞特性。
 
 自定义 `LogSink` 可供后续文件、网络或共享内存 Sink 扩展。设计细节见
 [`docs/logging.md`](docs/logging.md)。

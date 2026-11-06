@@ -9,7 +9,6 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
-#include <string>
 
 #include "netlib/channel.h"
 #include "netlib/log/logging.h"
@@ -37,9 +36,8 @@ std::unique_ptr<EventLoop> EventLoop::Create(log::Logger* logger) {
   UniqueFd epoll_fd(epoll_create1(EPOLL_CLOEXEC));
   if (!epoll_fd) {
     if (logger != nullptr) {
-      NETLIB_LOG_ERROR(*logger,
-                       std::string("event loop epoll_create1 failed: ") +
-                           std::strerror(errno));
+      NETLIB_LOG_ERROR(*logger, "event loop epoll_create1 failed: {}",
+                       std::strerror(errno));
     }
     return nullptr;
   }
@@ -47,8 +45,8 @@ std::unique_ptr<EventLoop> EventLoop::Create(log::Logger* logger) {
   UniqueFd stop_event_fd(eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC));
   if (!stop_event_fd) {
     if (logger != nullptr) {
-      NETLIB_LOG_ERROR(*logger, std::string("event loop eventfd failed: ") +
-                                    std::strerror(errno));
+      NETLIB_LOG_ERROR(*logger, "event loop eventfd failed: {}",
+                       std::strerror(errno));
     }
     return nullptr;
   }
@@ -66,10 +64,9 @@ std::unique_ptr<EventLoop> EventLoop::Create(log::Logger* logger) {
                       ChannelInterest{.read = true}, std::move(stop_callbacks));
   if (!loop->stop_channel_) {
     if (logger != nullptr) {
-      NETLIB_LOG_ERROR(
-          *logger,
-          std::string("event loop stop Channel registration failed: ") +
-              std::strerror(errno));
+      NETLIB_LOG_ERROR(*logger,
+                       "event loop stop Channel registration failed: {}",
+                       std::strerror(errno));
     }
     return nullptr;
   }
@@ -100,8 +97,8 @@ void EventLoop::Run() {
         continue;
       }
       if (logger_ != nullptr) {
-        NETLIB_LOG_ERROR(*logger_, std::string("epoll_wait failed: ") +
-                                       std::strerror(errno));
+        NETLIB_LOG_ERROR(*logger_, "epoll_wait failed: {}",
+                         std::strerror(errno));
       }
       break;
     }
@@ -130,9 +127,8 @@ bool EventLoop::AddChannel(Channel& channel) {
   event.data.fd = channel.fd_;
   if (epoll_ctl(epoll_fd_.get(), EPOLL_CTL_ADD, channel.fd_, &event) != 0) {
     if (logger_ != nullptr) {
-      NETLIB_LOG_ERROR(*logger_, "epoll_ctl ADD failed for fd=" +
-                                     std::to_string(channel.fd_) + ": " +
-                                     std::strerror(errno));
+      NETLIB_LOG_ERROR(*logger_, "epoll_ctl ADD failed for fd={}: {}",
+                       channel.fd_, std::strerror(errno));
     }
     return false;
   }
@@ -145,9 +141,8 @@ void EventLoop::RemoveChannel(Channel& channel) {
   channels_.erase(channel.fd_);
   if (epoll_ctl(epoll_fd_.get(), EPOLL_CTL_DEL, channel.fd_, nullptr) != 0 &&
       errno != ENOENT && errno != EBADF && logger_ != nullptr) {
-    NETLIB_LOG_ERROR(
-        *logger_, "epoll_ctl DEL failed for fd=" + std::to_string(channel.fd_) +
-                      ": " + std::strerror(errno));
+    NETLIB_LOG_ERROR(*logger_, "epoll_ctl DEL failed for fd={}: {}",
+                     channel.fd_, std::strerror(errno));
   }
 }
 
@@ -157,9 +152,8 @@ bool EventLoop::ModifyChannel(Channel& channel) {
   event.data.fd = channel.fd_;
   if (epoll_ctl(epoll_fd_.get(), EPOLL_CTL_MOD, channel.fd_, &event) != 0) {
     if (logger_ != nullptr) {
-      NETLIB_LOG_ERROR(*logger_, "epoll_ctl MOD failed for fd=" +
-                                     std::to_string(channel.fd_) + ": " +
-                                     std::strerror(errno));
+      NETLIB_LOG_ERROR(*logger_, "epoll_ctl MOD failed for fd={}: {}",
+                       channel.fd_, std::strerror(errno));
     }
     return false;
   }
@@ -187,8 +181,8 @@ void EventLoop::DrainStopEvent() {
       return;
     }
     if (logger_ != nullptr) {
-      NETLIB_LOG_ERROR(*logger_, std::string("stop eventfd read failed: ") +
-                                     std::strerror(errno));
+      NETLIB_LOG_ERROR(*logger_, "stop eventfd read failed: {}",
+                       std::strerror(errno));
     }
     return;
   }
@@ -201,8 +195,8 @@ void EventLoop::WakeForStop() {
       continue;
     }
     if (logger_ != nullptr) {
-      NETLIB_LOG_ERROR(*logger_, std::string("stop eventfd write failed: ") +
-                                     std::strerror(errno));
+      NETLIB_LOG_ERROR(*logger_, "stop eventfd write failed: {}",
+                       std::strerror(errno));
     }
     break;
   }

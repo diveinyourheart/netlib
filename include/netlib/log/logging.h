@@ -1,6 +1,8 @@
 #ifndef NETLIB_INCLUDE_NETLIB_LOG_LOGGING_H_
 #define NETLIB_INCLUDE_NETLIB_LOG_LOGGING_H_
 
+#include <fmt/format.h>
+
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -9,6 +11,7 @@
 #include <source_location>
 #include <string>
 #include <string_view>
+#include <utility>
 
 namespace netlib::log {
 
@@ -77,6 +80,15 @@ class Logger {
   bool IsEnabled(LogLevel level) const;
   bool Log(LogLevel level, std::string_view message,
            std::source_location source = std::source_location::current());
+  template <typename... Args>
+  bool Logf(LogLevel level, std::source_location source,
+            fmt::format_string<Args...> format_string, Args&&... args) {
+    if (!IsEnabled(level)) {
+      return false;
+    }
+    return LogFormatted(
+        level, fmt::format(format_string, std::forward<Args>(args)...), source);
+  }
   bool Flush();
   void Stop();
   std::size_t queued_count() const;
@@ -86,30 +98,33 @@ class Logger {
   class Impl;
 
   explicit Logger(std::unique_ptr<Impl> impl);
+  bool LogFormatted(LogLevel level, std::string message,
+                    std::source_location source);
 
   std::unique_ptr<Impl> impl_;
 };
 
 }  // namespace netlib::log
 
-#define NETLIB_LOG(logger, level, message)                               \
-  do {                                                                   \
-    if ((logger).IsEnabled(level)) {                                     \
-      (logger).Log(level, (message), ::std::source_location::current()); \
-    }                                                                    \
+#define NETLIB_LOG(logger, level, format, ...)                \
+  do {                                                        \
+    if ((logger).IsEnabled(level)) {                          \
+      (logger).Logf(level, ::std::source_location::current(), \
+                    format __VA_OPT__(, __VA_ARGS__));        \
+    }                                                         \
   } while (false)
 
-#define NETLIB_LOG_TRACE(logger, message) \
-  NETLIB_LOG(logger, ::netlib::log::LogLevel::kTrace, message)
-#define NETLIB_LOG_DEBUG(logger, message) \
-  NETLIB_LOG(logger, ::netlib::log::LogLevel::kDebug, message)
-#define NETLIB_LOG_INFO(logger, message) \
-  NETLIB_LOG(logger, ::netlib::log::LogLevel::kInfo, message)
-#define NETLIB_LOG_WARN(logger, message) \
-  NETLIB_LOG(logger, ::netlib::log::LogLevel::kWarn, message)
-#define NETLIB_LOG_ERROR(logger, message) \
-  NETLIB_LOG(logger, ::netlib::log::LogLevel::kError, message)
-#define NETLIB_LOG_FATAL(logger, message) \
-  NETLIB_LOG(logger, ::netlib::log::LogLevel::kFatal, message)
+#define NETLIB_LOG_TRACE(logger, ...) \
+  NETLIB_LOG(logger, ::netlib::log::LogLevel::kTrace, __VA_ARGS__)
+#define NETLIB_LOG_DEBUG(logger, ...) \
+  NETLIB_LOG(logger, ::netlib::log::LogLevel::kDebug, __VA_ARGS__)
+#define NETLIB_LOG_INFO(logger, ...) \
+  NETLIB_LOG(logger, ::netlib::log::LogLevel::kInfo, __VA_ARGS__)
+#define NETLIB_LOG_WARN(logger, ...) \
+  NETLIB_LOG(logger, ::netlib::log::LogLevel::kWarn, __VA_ARGS__)
+#define NETLIB_LOG_ERROR(logger, ...) \
+  NETLIB_LOG(logger, ::netlib::log::LogLevel::kError, __VA_ARGS__)
+#define NETLIB_LOG_FATAL(logger, ...) \
+  NETLIB_LOG(logger, ::netlib::log::LogLevel::kFatal, __VA_ARGS__)
 
 #endif  // NETLIB_INCLUDE_NETLIB_LOG_LOGGING_H_
