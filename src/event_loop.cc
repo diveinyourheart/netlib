@@ -1,0 +1,148 @@
+#include "netlib/event_loop.h"
+
+#include <sys/epoll.h>
+#include <sys/eventfd.h>
+#include <unistd.h>
+
+#include <array>
+#include <cerrno>
+#include <cstdint>
+#include <memory>
+
+#include "netlib/channel.h"
+#include "netlib/unique_fd.h"
+
+namespace netlib {
+namespace {
+
+constexpr int kMaxEvents = 64;
+
+uint32_t ToEpollEvents(ChannelInterest interest) {
+  uint32_t events = EPOLLET;
+  if (interest.read) {
+    events |= EPOLLIN | EPOLLRDHUP;
+  }
+  if (interest.write) {
+    events |= EPOLLOUT;
+  }
+  return events;
+}
+
+}  // namespace
+
+std::unique_ptr<EventLoop> EventLoop::Create() {
+  UniqueFd epoll_fd(epoll_create1(EPOLL_CLOEXEC));
+  if (!epoll_fd) {
+    return nullptr;
+  }
+
+  UniqueFd wake_fd(eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC));
+  if (!wake_fd) {
+    return nullptr;
+  }
+
+  epoll_event wake_event{};
+  wake_event.events = EPOLLIN | EPOLLET;
+  wake_event.data.fd = wake_fd.get();
+  if (epoll_ctl(epoll_fd.get(), EPOLL_CTL_ADD, wake_fd.get(), &wake_event) !=
+      0) {
+    return nullptr;
+  }
+
+  return std::unique_ptr<EventLoop>(
+      new EventLoop(std::move(epoll_fd), std::move(wake_fd)));
+}
+
+EventLoop::EventLoop(UniqueFd epoll_fd, UniqueFd wake_fd)
+    : epoll_fd_(std::move(epoll_fd)), wake_fd_(std::move(wake_fd)) {}
+
+EventLoop::~EventLoop() = default;
+
+void EventLoop::Run() {
+  std::array<epoll_event, kMaxEvents> events{};
+  while (!stopping_.load()) {
+    int ready_count =
+        epoll_wait(epoll_fd_.get(), events.data(), kMaxEvents, -1);
+    if (ready_count < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      break;
+    }
+
+    for (int i = 0; i < ready_count && !stopping_.load(); ++i) {
+      Dispatch(events[i].data.fd, events[i].events);
+    }
+  }
+}
+
+void EventLoop::Stop() {
+  if (!stopping_.exchange(true)) {
+    Wake();
+  }
+}
+
+bool EventLoop::AddChannel(Channel& channel) {
+  epoll_event event{};
+  event.events = ToEpollEvents(channel.interest_);
+  event.data.fd = channel.fd_;
+  if (epoll_ctl(epoll_fd_.get(), EPOLL_CTL_ADD, channel.fd_, &event) != 0) {
+    return false;
+  }
+
+  channels_.emplace(channel.fd_, &channel);
+  return true;
+}
+
+void EventLoop::RemoveChannel(Channel& channel) {
+  channels_.erase(channel.fd_);
+  epoll_ctl(epoll_fd_.get(), EPOLL_CTL_DEL, channel.fd_, nullptr);
+}
+
+bool EventLoop::ModifyChannel(Channel& channel) {
+  epoll_event event{};
+  event.events = ToEpollEvents(channel.interest_);
+  event.data.fd = channel.fd_;
+  return epoll_ctl(epoll_fd_.get(), EPOLL_CTL_MOD, channel.fd_, &event) == 0;
+}
+
+void EventLoop::Dispatch(int fd, uint32_t events) {
+  if (fd == wake_fd_.get()) {
+    DrainWake();
+    return;
+  }
+
+  auto channel = channels_.find(fd);
+  if (channel != channels_.end()) {
+    channel->second->Dispatch(events);
+  }
+}
+
+void EventLoop::DrainWake() {
+  uint64_t value = 0;
+  while (true) {
+    ssize_t result = read(wake_fd_.get(), &value, sizeof(value));
+    if (result == sizeof(value)) {
+      continue;
+    }
+    if (result < 0 && errno == EINTR) {
+      continue;
+    }
+    if (result < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+      return;
+    }
+    return;
+  }
+}
+
+void EventLoop::Wake() {
+  uint64_t one = 1;
+  while (write(wake_fd_.get(), &one, sizeof(one)) < 0) {
+    if (errno == EINTR) {
+      continue;
+    }
+    break;
+  }
+}
+
+}  // namespace netlib
