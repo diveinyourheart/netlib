@@ -6,13 +6,14 @@
 
 当前具备第一层 Reactor 抽象：
 
-- `EventLoop`：封装 epoll 事件循环和线程安全的停止通知。
+- `EventLoop`：封装 epoll 事件循环，通过内部 stop Channel 优雅唤醒退出。
 - `Channel`：把一个 fd 上的读写、错误回调注册到 `EventLoop`。
 - `UniqueFd`：表达 fd 的唯一所有权，支持跨线程移动。
 - `MainReactor`：监听 IPv4 端口，循环 `accept4`，轮询分发给多个 `SubReactor`。
 - `SubReactor`：通过有界队列和 eventfd 接收连接，维护每连接接收缓冲区并组装完整帧。
 - `frame_protocol.h`：定义 4 字节大端 payload 长度和 16 MiB payload 上限。
 - `ThreadPool`：使用 moodycamel MPMC 队列消费拥有数据的 `FrameMessage`。
+- `netlib::log`：异步彩色标准输出日志，提供可扩展的 Sink 接口。
 
 - 语言标准：C++20
 - 构建系统：CMake
@@ -60,6 +61,57 @@ auto main = netlib::MainReactor::Create(
 
 `ThreadPool` 必须比引用它的 `SubReactor` 活得久。正常关闭时先停止 Main 和
 Sub 的生产者，再调用 `ThreadPool::Stop()` 排空消息并 join Worker。
+
+EventLoop 的 stop eventfd 也作为普通 Channel 注册。跨线程 `Stop()` 会先设置
+停止状态，再写入 stop eventfd 唤醒阻塞的 `epoll_wait()`；当前 ready batch
+处理完后，`Run()` 检查停止状态并返回，随后由调用方 join 事件循环线程。
+
+## 日志
+
+日志库使用独立静态库 `netlib::log`。调用线程只采集时间、线程号、序号和消息，
+实际格式化及终端写入由单个 Writer 线程批量完成。队列有界，满时默认丢弃新日志
+并记录丢弃数量，不会阻塞网络线程。
+
+```cpp
+#include "netlib/log/logging.h"
+
+netlib::log::LoggerOptions options{
+    .name = "netlib.server",
+    .minimum_level = netlib::log::LogLevel::kInfo,
+    .queue_capacity = 8192,
+    .color_mode = netlib::log::ColorMode::kAuto,
+    .flush_each_record = false,
+};
+
+auto logger = netlib::log::Logger::CreateStdout(std::move(options));
+NETLIB_LOG_INFO(*logger, "server started");
+```
+
+标准输出示例（实际输出为单行）：
+
+```text
+2026-11-06 16:20:31.427 | INFO  | seq=42 | tid=12831 | netlib.server | logging.cc:120 Run | server started
+```
+
+每行包含毫秒时间、级别、全局序号、操作系统线程号、logger 名称、源码文件、
+行号、函数名及消息。TTY 输出自动启用 ANSI 颜色，重定向时可使用
+`ColorMode::kNever`。消息中的终端控制字符会被转义。
+
+`Flush()` 使用单调递增的票据号和 Writer 完成水位：每个 Flush 控制消息携带
+一个 ticket，Writer 执行 Sink Flush 后推进 completed watermark 并唤醒等待者。
+Flush 和 Stop 控制消息共用一个显式 moodycamel producer token，保证并发 Flush
+时控制消息按 FIFO 处理。Flush 是队列屏障；Flush 期间由其他线程继续写入的日志
+可能排在该屏障之后。
+
+自定义 `LogSink` 可供后续文件、网络或共享内存 Sink 扩展。设计细节见
+[`docs/logging.md`](docs/logging.md)。
+
+运行示例：
+
+```bash
+cmake --build --preset debug --target netlib_log_example
+./build/debug/netlib_log_example
+```
 
 ## 构建
 

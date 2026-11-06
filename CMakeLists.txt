@@ -38,10 +38,34 @@ target_include_directories(
     $<INSTALL_INTERFACE:include>)
 target_link_libraries(netlib PUBLIC Threads::Threads)
 
+add_library(netlib_log STATIC src/log/logging.cc)
+add_library(netlib::log ALIAS netlib_log)
+
+target_compile_features(netlib_log PUBLIC cxx_std_20)
+target_compile_options(netlib_log PRIVATE -Wall -Wextra -Wpedantic)
+target_include_directories(
+  netlib_log
+  SYSTEM
+  PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/moodycamel")
+target_include_directories(
+  netlib_log
+  PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>)
+target_link_libraries(netlib_log PUBLIC Threads::Threads)
+
+add_executable(netlib_log_example examples/log_example.cc)
+target_link_libraries(netlib_log_example PRIVATE netlib::log)
+
 include(CTest)
 
 if(BUILD_TESTING)
   add_executable(netlib_reactor_test tests/reactor_test.cc)
   target_link_libraries(netlib_reactor_test PRIVATE netlib::netlib)
   add_test(NAME netlib_reactor_test COMMAND netlib_reactor_test)
+
+  add_executable(netlib_log_test tests/log_test.cc)
+  target_link_libraries(netlib_log_test PRIVATE netlib::log)
+  add_test(NAME netlib_log_test COMMAND netlib_log_test)
 endif()

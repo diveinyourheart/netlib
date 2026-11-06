@@ -36,25 +36,31 @@ std::unique_ptr<EventLoop> EventLoop::Create() {
     return nullptr;
   }
 
-  UniqueFd wake_fd(eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC));
-  if (!wake_fd) {
+  UniqueFd stop_event_fd(eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC));
+  if (!stop_event_fd) {
     return nullptr;
   }
 
-  epoll_event wake_event{};
-  wake_event.events = EPOLLIN | EPOLLET;
-  wake_event.data.fd = wake_fd.get();
-  if (epoll_ctl(epoll_fd.get(), EPOLL_CTL_ADD, wake_fd.get(), &wake_event) !=
-      0) {
+  std::unique_ptr<EventLoop> loop = std::unique_ptr<EventLoop>(
+      new EventLoop(std::move(epoll_fd), std::move(stop_event_fd)));
+  EventLoop* loop_pointer = loop.get();
+  ChannelCallbacks stop_callbacks{
+      [loop_pointer] { loop_pointer->DrainStopEvent(); },
+      {},
+      [loop_pointer] { loop_pointer->Stop(); },
+  };
+  loop->stop_channel_ =
+      Channel::Create(*loop, loop->stop_event_fd_.get(),
+                      ChannelInterest{.read = true}, std::move(stop_callbacks));
+  if (!loop->stop_channel_) {
     return nullptr;
   }
-
-  return std::unique_ptr<EventLoop>(
-      new EventLoop(std::move(epoll_fd), std::move(wake_fd)));
+  return loop;
 }
 
-EventLoop::EventLoop(UniqueFd epoll_fd, UniqueFd wake_fd)
-    : epoll_fd_(std::move(epoll_fd)), wake_fd_(std::move(wake_fd)) {}
+EventLoop::EventLoop(UniqueFd epoll_fd, UniqueFd stop_event_fd)
+    : epoll_fd_(std::move(epoll_fd)),
+      stop_event_fd_(std::move(stop_event_fd)) {}
 
 EventLoop::~EventLoop() = default;
 
@@ -70,7 +76,7 @@ void EventLoop::Run() {
       break;
     }
 
-    for (int i = 0; i < ready_count && !stopping_.load(); ++i) {
+    for (int i = 0; i < ready_count; ++i) {
       Dispatch(events[i].data.fd, events[i].events);
     }
   }
@@ -78,7 +84,7 @@ void EventLoop::Run() {
 
 void EventLoop::Stop() {
   if (!stopping_.exchange(true)) {
-    Wake();
+    WakeForStop();
   }
 }
 
@@ -107,21 +113,16 @@ bool EventLoop::ModifyChannel(Channel& channel) {
 }
 
 void EventLoop::Dispatch(int fd, uint32_t events) {
-  if (fd == wake_fd_.get()) {
-    DrainWake();
-    return;
-  }
-
   auto channel = channels_.find(fd);
   if (channel != channels_.end()) {
     channel->second->Dispatch(events);
   }
 }
 
-void EventLoop::DrainWake() {
+void EventLoop::DrainStopEvent() {
   uint64_t value = 0;
   while (true) {
-    ssize_t result = read(wake_fd_.get(), &value, sizeof(value));
+    ssize_t result = read(stop_event_fd_.get(), &value, sizeof(value));
     if (result == sizeof(value)) {
       continue;
     }
@@ -135,9 +136,9 @@ void EventLoop::DrainWake() {
   }
 }
 
-void EventLoop::Wake() {
+void EventLoop::WakeForStop() {
   uint64_t one = 1;
-  while (write(wake_fd_.get(), &one, sizeof(one)) < 0) {
+  while (write(stop_event_fd_.get(), &one, sizeof(one)) < 0) {
     if (errno == EINTR) {
       continue;
     }

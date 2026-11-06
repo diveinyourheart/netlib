@@ -30,17 +30,18 @@ class EventLoop {
  private:
   friend class Channel;
 
-  EventLoop(UniqueFd epoll_fd, UniqueFd wake_fd);
+  EventLoop(UniqueFd epoll_fd, UniqueFd stop_event_fd);
 
   bool AddChannel(Channel& channel);
   void RemoveChannel(Channel& channel);
   bool ModifyChannel(Channel& channel);
   void Dispatch(int fd, uint32_t events);
-  void DrainWake();
-  void Wake();
+  void DrainStopEvent();
+  void WakeForStop();
 
   UniqueFd epoll_fd_;
-  UniqueFd wake_fd_;
+  UniqueFd stop_event_fd_;
+  std::unique_ptr<Channel> stop_channel_;
   std::unordered_map<int, Channel*> channels_;
   std::atomic<bool> stopping_{false};
 };
