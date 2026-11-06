@@ -20,11 +20,17 @@ add_library(
     src/event_loop.cc
     src/main_reactor.cc
     src/sub_reactor.cc
+    src/thread_pool.cc
     src/unique_fd.cc)
 add_library(netlib::netlib ALIAS netlib)
 
 target_compile_features(netlib PUBLIC cxx_std_20)
 target_compile_options(netlib PRIVATE -Wall -Wextra -Wpedantic)
+target_include_directories(
+  netlib
+  SYSTEM
+  PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/moodycamel")
 target_include_directories(
   netlib
   PUBLIC

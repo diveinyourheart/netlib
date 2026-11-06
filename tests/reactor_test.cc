@@ -1,12 +1,13 @@
 #include <arpa/inet.h>
-#include <fcntl.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <memory>
 #include <mutex>
@@ -14,9 +15,12 @@
 #include <string_view>
 #include <thread>
 #include <utility>
+#include <vector>
 
+#include "netlib/frame_protocol.h"
 #include "netlib/main_reactor.h"
 #include "netlib/sub_reactor.h"
+#include "netlib/thread_pool.h"
 #include "netlib/unique_fd.h"
 
 namespace {
@@ -27,6 +31,7 @@ struct Observation {
   std::mutex mutex;
   std::condition_variable condition;
   std::string data;
+  std::size_t frame_count = 0;
   bool connected = false;
   bool closed = false;
 };
@@ -65,40 +70,29 @@ bool SendAll(int fd, std::string_view data) {
   return true;
 }
 
-int RunPendingCapacityTest() {
-  std::unique_ptr<netlib::SubReactor> sub_reactor =
-      netlib::SubReactor::Create(1, {});
-  if (!sub_reactor) {
-    ReportFailure("failed to create bounded SubReactor");
-    return 1;
-  }
-
-  netlib::UniqueFd first(dup(STDIN_FILENO));
-  netlib::UniqueFd second(dup(STDIN_FILENO));
-  int second_fd = second.get();
-  if (!first || !second || !sub_reactor->AdoptConnection(std::move(first)) ||
-      sub_reactor->AdoptConnection(std::move(second))) {
-    ReportFailure("pending queue capacity was not enforced");
-    return 1;
-  }
-  if (fcntl(second_fd, F_GETFD, 0) != -1 || errno != EBADF) {
-    ReportFailure("rejected connection was not closed");
-    return 1;
-  }
-  return 0;
+std::string MakeLengthPrefix(std::uint32_t payload_size) {
+  std::string prefix;
+  prefix.reserve(netlib::kFrameLengthPrefixSize);
+  prefix.push_back(static_cast<char>((payload_size >> 24U) & 0xFFU));
+  prefix.push_back(static_cast<char>((payload_size >> 16U) & 0xFFU));
+  prefix.push_back(static_cast<char>((payload_size >> 8U) & 0xFFU));
+  prefix.push_back(static_cast<char>(payload_size & 0xFFU));
+  return prefix;
 }
 
-int RunReactorTest() {
-  Observation observation;
+std::string MakeFrame(std::string_view payload) {
+  std::string frame =
+      MakeLengthPrefix(static_cast<std::uint32_t>(payload.size()));
+  frame.append(payload);
+  return frame;
+}
+
+netlib::SubReactor::ConnectionCallbacks MakeConnectionCallbacks(
+    Observation& observation) {
   netlib::SubReactor::ConnectionCallbacks callbacks;
   callbacks.on_connected = [&observation](int) {
     std::lock_guard<std::mutex> lock(observation.mutex);
     observation.connected = true;
-    observation.condition.notify_all();
-  };
-  callbacks.on_data = [&observation](int, std::string_view data) {
-    std::lock_guard<std::mutex> lock(observation.mutex);
-    observation.data.append(data);
     observation.condition.notify_all();
   };
   callbacks.on_closed = [&observation](int) {
@@ -106,22 +100,188 @@ int RunReactorTest() {
     observation.closed = true;
     observation.condition.notify_all();
   };
+  return callbacks;
+}
 
+std::unique_ptr<netlib::ThreadPool> CreateDroppingThreadPool(
+    std::size_t max_pending_messages = 64) {
+  return netlib::ThreadPool::Create(1, max_pending_messages,
+                                    [](netlib::FrameMessage) {});
+}
+
+bool WaitForConnected(Observation& observation) {
+  std::unique_lock<std::mutex> lock(observation.mutex);
+  return observation.condition.wait_for(
+      lock, kWaitTimeout, [&observation] { return observation.connected; });
+}
+
+bool WaitForData(Observation& observation, std::string_view expected,
+                 std::size_t expected_frame_count) {
+  std::unique_lock<std::mutex> lock(observation.mutex);
+  return observation.condition.wait_for(
+      lock, kWaitTimeout, [&observation, expected, expected_frame_count] {
+        return observation.data.size() == expected.size() &&
+               observation.data == expected &&
+               observation.frame_count == expected_frame_count;
+      });
+}
+
+bool WaitForClosed(Observation& observation) {
+  std::unique_lock<std::mutex> lock(observation.mutex);
+  return observation.condition.wait_for(
+      lock, kWaitTimeout, [&observation] { return observation.closed; });
+}
+
+int RunPendingCapacityTest() {
+  std::unique_ptr<netlib::ThreadPool> worker_pool = CreateDroppingThreadPool();
+  if (!worker_pool) {
+    ReportFailure("failed to create ThreadPool");
+    return 1;
+  }
   std::unique_ptr<netlib::SubReactor> sub_reactor =
-      netlib::SubReactor::Create(16, std::move(callbacks));
+      netlib::SubReactor::Create(1, *worker_pool, {});
   if (!sub_reactor) {
-    ReportFailure("failed to create SubReactor");
+    ReportFailure("failed to create bounded SubReactor");
     return 1;
   }
 
-  netlib::MainReactor::AcceptHandler accept_handler =
-      [&sub_reactor](netlib::UniqueFd connection) {
-        sub_reactor->AdoptConnection(std::move(connection));
-      };
+  netlib::UniqueFd first(dup(STDIN_FILENO));
+  netlib::UniqueFd second(dup(STDIN_FILENO));
+  if (!first || !second || !sub_reactor->AdoptConnection(first) || first ||
+      sub_reactor->AdoptConnection(second) || !second) {
+    ReportFailure("pending queue capacity was not enforced");
+    return 1;
+  }
+  return 0;
+}
+
+int RunThreadPoolDrainTest() {
+  constexpr std::size_t kMessageCount = 1000;
+  std::atomic<std::size_t> processed{0};
+  std::unique_ptr<netlib::ThreadPool> worker_pool = netlib::ThreadPool::Create(
+      2, kMessageCount + 1, [&processed](netlib::FrameMessage) {
+        processed.fetch_add(1, std::memory_order_relaxed);
+      });
+  if (!worker_pool) {
+    ReportFailure("failed to create drain-test ThreadPool");
+    return 1;
+  }
+
+  for (std::size_t i = 0; i < kMessageCount; ++i) {
+    netlib::FrameMessage message;
+    message.sequence = i;
+    if (!worker_pool->Submit(std::move(message))) {
+      ReportFailure("drain-test ThreadPool queue overflowed");
+      return 1;
+    }
+  }
+  worker_pool->Stop();
+
+  if (processed.load(std::memory_order_relaxed) != kMessageCount ||
+      worker_pool->queued_count() != 0) {
+    ReportFailure("ThreadPool did not drain all messages before stopping");
+    return 1;
+  }
+  if (worker_pool->Submit(netlib::FrameMessage{})) {
+    ReportFailure("ThreadPool accepted work after stopping");
+    return 1;
+  }
+  return 0;
+}
+
+int RunFullSubReactorFallbackTest() {
+  Observation first_observation;
+  Observation second_observation;
+  std::unique_ptr<netlib::ThreadPool> worker_pool = CreateDroppingThreadPool();
+  if (!worker_pool) {
+    ReportFailure("failed to create fallback ThreadPool");
+    return 1;
+  }
+  std::unique_ptr<netlib::SubReactor> first_sub_reactor =
+      netlib::SubReactor::Create(1, *worker_pool,
+                                 MakeConnectionCallbacks(first_observation));
+  std::unique_ptr<netlib::SubReactor> second_sub_reactor =
+      netlib::SubReactor::Create(1, *worker_pool,
+                                 MakeConnectionCallbacks(second_observation));
+  if (!first_sub_reactor || !second_sub_reactor) {
+    ReportFailure("failed to create fallback SubReactors");
+    return 1;
+  }
+
+  netlib::UniqueFd queued_connection(dup(STDIN_FILENO));
+  if (!queued_connection ||
+      !first_sub_reactor->AdoptConnection(queued_connection)) {
+    ReportFailure("failed to fill first SubReactor queue");
+    return 1;
+  }
+
   std::unique_ptr<netlib::MainReactor> main_reactor =
-      netlib::MainReactor::Create(0, std::move(accept_handler));
+      netlib::MainReactor::Create(
+          0, {first_sub_reactor.get(), second_sub_reactor.get()});
   if (!main_reactor) {
-    ReportFailure("failed to create MainReactor");
+    ReportFailure("failed to create fallback MainReactor");
+    return 1;
+  }
+
+  std::thread second_sub_thread(
+      [&second_sub_reactor] { second_sub_reactor->Run(); });
+  std::thread main_thread([&main_reactor] { main_reactor->Run(); });
+
+  bool success = true;
+  netlib::UniqueFd client;
+  if (!ConnectTo(main_reactor->port(), &client)) {
+    ReportFailure("failed to connect fallback client");
+    success = false;
+  }
+  if (success && !WaitForConnected(second_observation)) {
+    ReportFailure("connection was not dispatched to the next SubReactor");
+    success = false;
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(first_observation.mutex);
+    if (first_observation.connected) {
+      ReportFailure("full SubReactor unexpectedly received the connection");
+      success = false;
+    }
+  }
+
+  if (client) {
+    shutdown(client.get(), SHUT_WR);
+    client.Reset();
+  }
+  if (success && !WaitForClosed(second_observation)) {
+    ReportFailure("fallback SubReactor did not observe close");
+    success = false;
+  }
+
+  main_reactor->Stop();
+  first_sub_reactor->Stop();
+  second_sub_reactor->Stop();
+  main_thread.join();
+  second_sub_thread.join();
+  worker_pool->Stop();
+  return success ? 0 : 1;
+}
+
+int RunOversizedFrameTest() {
+  Observation observation;
+  std::unique_ptr<netlib::ThreadPool> worker_pool = CreateDroppingThreadPool();
+  if (!worker_pool) {
+    ReportFailure("failed to create protocol-test ThreadPool");
+    return 1;
+  }
+  std::unique_ptr<netlib::SubReactor> sub_reactor = netlib::SubReactor::Create(
+      16, *worker_pool, MakeConnectionCallbacks(observation));
+  if (!sub_reactor) {
+    ReportFailure("failed to create protocol-test SubReactor");
+    return 1;
+  }
+
+  std::unique_ptr<netlib::MainReactor> main_reactor =
+      netlib::MainReactor::Create(0, {sub_reactor.get()});
+  if (!main_reactor) {
+    ReportFailure("failed to create protocol-test MainReactor");
     return 1;
   }
 
@@ -129,58 +289,148 @@ int RunReactorTest() {
   std::thread main_thread([&main_reactor] { main_reactor->Run(); });
 
   bool success = true;
-  netlib::UniqueFd connection;
-  if (!ConnectTo(main_reactor->port(), &connection)) {
-    ReportFailure("failed to connect");
+  netlib::UniqueFd client;
+  if (!ConnectTo(main_reactor->port(), &client) ||
+      !SendAll(client.get(),
+               MakeLengthPrefix(netlib::kMaxFramePayloadSize + 1U))) {
+    ReportFailure("failed to send oversized frame header");
+    success = false;
+  }
+  if (success && !WaitForClosed(observation)) {
+    ReportFailure("oversized frame did not close the connection");
     success = false;
   }
 
   {
-    std::unique_lock<std::mutex> lock(observation.mutex);
-    if (success && !observation.condition.wait_for(
-                       lock, kWaitTimeout,
-                       [&observation] { return observation.connected; })) {
-      ReportFailure("connection was not handed to SubReactor");
+    std::lock_guard<std::mutex> lock(observation.mutex);
+    if (observation.frame_count != 0) {
+      ReportFailure("oversized frame was delivered to business");
       success = false;
     }
   }
 
-  const std::string payload(128 * 1024, 'x');
-  if (success && !SendAll(connection.get(), payload)) {
-    ReportFailure("failed to send test data");
-    success = false;
-  }
-
-  {
-    std::unique_lock<std::mutex> lock(observation.mutex);
-    if (success && !observation.condition.wait_for(
-                       lock, kWaitTimeout, [&observation, &payload] {
-                         return observation.data.size() == payload.size() &&
-                                observation.data == payload;
-                       })) {
-      ReportFailure("SubReactor did not read test data");
-      success = false;
-    }
-  }
-
-  if (connection) {
-    shutdown(connection.get(), SHUT_WR);
-    connection.Reset();
-  }
-  {
-    std::unique_lock<std::mutex> lock(observation.mutex);
-    if (success && !observation.condition.wait_for(
-                       lock, kWaitTimeout,
-                       [&observation] { return observation.closed; })) {
-      ReportFailure("SubReactor did not observe close");
-      success = false;
-    }
-  }
-
+  client.Reset();
   main_reactor->Stop();
   sub_reactor->Stop();
   main_thread.join();
   sub_thread.join();
+  worker_pool->Stop();
+  return success ? 0 : 1;
+}
+
+int RunReactorTest() {
+  Observation first_observation;
+  Observation second_observation;
+  netlib::ThreadPool::Handler frame_handler =
+      [&first_observation, &second_observation](netlib::FrameMessage message) {
+        Observation* observation = nullptr;
+        if (!message.payload.empty() && message.payload.front() == 'a') {
+          observation = &first_observation;
+        } else if (!message.payload.empty()) {
+          observation = &second_observation;
+        }
+        if (observation == nullptr) {
+          return;
+        }
+
+        std::lock_guard<std::mutex> lock(observation->mutex);
+        observation->data.append(message.payload.data(),
+                                 message.payload.size());
+        ++observation->frame_count;
+        observation->condition.notify_all();
+      };
+  std::unique_ptr<netlib::ThreadPool> worker_pool =
+      netlib::ThreadPool::Create(2, 32, std::move(frame_handler));
+  if (!worker_pool) {
+    ReportFailure("failed to create Reactor ThreadPool");
+    return 1;
+  }
+  std::unique_ptr<netlib::SubReactor> first_sub_reactor =
+      netlib::SubReactor::Create(16, *worker_pool,
+                                 MakeConnectionCallbacks(first_observation));
+  std::unique_ptr<netlib::SubReactor> second_sub_reactor =
+      netlib::SubReactor::Create(16, *worker_pool,
+                                 MakeConnectionCallbacks(second_observation));
+  if (!first_sub_reactor || !second_sub_reactor) {
+    ReportFailure("failed to create SubReactors");
+    return 1;
+  }
+
+  std::unique_ptr<netlib::MainReactor> main_reactor =
+      netlib::MainReactor::Create(
+          0, {first_sub_reactor.get(), second_sub_reactor.get()});
+  if (!main_reactor) {
+    ReportFailure("failed to create MainReactor");
+    return 1;
+  }
+
+  std::thread first_sub_thread(
+      [&first_sub_reactor] { first_sub_reactor->Run(); });
+  std::thread second_sub_thread(
+      [&second_sub_reactor] { second_sub_reactor->Run(); });
+  std::thread main_thread([&main_reactor] { main_reactor->Run(); });
+
+  bool success = true;
+  netlib::UniqueFd first_connection;
+  netlib::UniqueFd second_connection;
+  if (!ConnectTo(main_reactor->port(), &first_connection) ||
+      !ConnectTo(main_reactor->port(), &second_connection)) {
+    ReportFailure("failed to connect clients");
+    success = false;
+  }
+
+  if (success && (!WaitForConnected(first_observation) ||
+                  !WaitForConnected(second_observation))) {
+    ReportFailure("round-robin handoff did not reach both SubReactors");
+    success = false;
+  }
+
+  const std::string first_payload(128 * 1024, 'a');
+  const std::string second_payload(128 * 1024, 'b');
+  const std::string third_payload(64 * 1024, 'c');
+  const std::string first_frame = MakeFrame(first_payload);
+  const std::string second_frame = MakeFrame(second_payload);
+  const std::string third_frame = MakeFrame(third_payload);
+  const std::size_t first_split = first_frame.size() / 2;
+  const std::string second_wire = second_frame + third_frame;
+  const std::string second_expected = second_payload + third_payload;
+  if (success &&
+      (!SendAll(first_connection.get(),
+                std::string_view(first_frame).substr(0, first_split)) ||
+       !SendAll(first_connection.get(),
+                std::string_view(first_frame).substr(first_split)) ||
+       !SendAll(second_connection.get(), second_wire))) {
+    ReportFailure("failed to send test data");
+    success = false;
+  }
+
+  if (success && (!WaitForData(first_observation, first_payload, 1) ||
+                  !WaitForData(second_observation, second_expected, 2))) {
+    ReportFailure("SubReactors did not assemble complete frames");
+    success = false;
+  }
+
+  if (first_connection) {
+    shutdown(first_connection.get(), SHUT_WR);
+    first_connection.Reset();
+  }
+  if (second_connection) {
+    shutdown(second_connection.get(), SHUT_WR);
+    second_connection.Reset();
+  }
+  if (success && (!WaitForClosed(first_observation) ||
+                  !WaitForClosed(second_observation))) {
+    ReportFailure("SubReactors did not observe close");
+    success = false;
+  }
+
+  main_reactor->Stop();
+  first_sub_reactor->Stop();
+  second_sub_reactor->Stop();
+  main_thread.join();
+  first_sub_thread.join();
+  second_sub_thread.join();
+  worker_pool->Stop();
   return success ? 0 : 1;
 }
 
@@ -190,6 +440,18 @@ int main() {
   int capacity_result = RunPendingCapacityTest();
   if (capacity_result != 0) {
     return capacity_result;
+  }
+  int thread_pool_result = RunThreadPoolDrainTest();
+  if (thread_pool_result != 0) {
+    return thread_pool_result;
+  }
+  int fallback_result = RunFullSubReactorFallbackTest();
+  if (fallback_result != 0) {
+    return fallback_result;
+  }
+  int protocol_result = RunOversizedFrameTest();
+  if (protocol_result != 0) {
+    return protocol_result;
   }
   return RunReactorTest();
 }

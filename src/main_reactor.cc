@@ -10,6 +10,7 @@
 
 #include "netlib/channel.h"
 #include "netlib/event_loop.h"
+#include "netlib/sub_reactor.h"
 #include "netlib/unique_fd.h"
 
 namespace netlib {
@@ -61,7 +62,16 @@ ListenSocket CreateListenSocket(uint16_t requested_port) {
 }  // namespace
 
 std::unique_ptr<MainReactor> MainReactor::Create(uint16_t requested_port,
-                                                 AcceptHandler accept_handler) {
+                                                 SubReactorList sub_reactors) {
+  if (sub_reactors.empty()) {
+    return nullptr;
+  }
+  for (SubReactor* sub_reactor : sub_reactors) {
+    if (sub_reactor == nullptr) {
+      return nullptr;
+    }
+  }
+
   std::unique_ptr<EventLoop> event_loop = EventLoop::Create();
   if (!event_loop) {
     return nullptr;
@@ -74,7 +84,7 @@ std::unique_ptr<MainReactor> MainReactor::Create(uint16_t requested_port,
 
   auto reactor = std::unique_ptr<MainReactor>(new MainReactor(
       std::move(event_loop), listen_socket.port,
-      std::move(listen_socket.socket), std::move(accept_handler)));
+      std::move(listen_socket.socket), std::move(sub_reactors)));
   MainReactor* reactor_pointer = reactor.get();
   ChannelCallbacks callbacks{
       [reactor_pointer] { reactor_pointer->HandleReadable(); },
@@ -91,9 +101,9 @@ std::unique_ptr<MainReactor> MainReactor::Create(uint16_t requested_port,
 }
 
 MainReactor::MainReactor(std::unique_ptr<EventLoop> event_loop, uint16_t port,
-                         UniqueFd listen_fd, AcceptHandler accept_handler)
+                         UniqueFd listen_fd, SubReactorList sub_reactors)
     : event_loop_(std::move(event_loop)),
-      accept_handler_(std::move(accept_handler)),
+      sub_reactors_(std::move(sub_reactors)),
       port_(port),
       listen_fd_(std::move(listen_fd)) {}
 
@@ -105,15 +115,23 @@ void MainReactor::Stop() { event_loop_->Stop(); }
 
 uint16_t MainReactor::port() const { return port_; }
 
+void MainReactor::DispatchConnection(UniqueFd& connection) {
+  for (std::size_t attempt = 0; attempt < sub_reactors_.size(); ++attempt) {
+    std::size_t index = next_sub_reactor_;
+    next_sub_reactor_ = (next_sub_reactor_ + 1) % sub_reactors_.size();
+    if (sub_reactors_[index]->AdoptConnection(connection)) {
+      return;
+    }
+  }
+}
+
 void MainReactor::HandleReadable() {
   while (true) {
     int connection_fd = accept4(listen_fd_.get(), nullptr, nullptr,
                                 SOCK_NONBLOCK | SOCK_CLOEXEC);
     if (connection_fd >= 0) {
       UniqueFd connection(connection_fd);
-      if (accept_handler_) {
-        accept_handler_(std::move(connection));
-      }
+      DispatchConnection(connection);
       continue;
     }
     if (errno == EINTR) {
