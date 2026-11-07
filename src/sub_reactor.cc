@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <cstring>
 #include <deque>
+#include <map>
 #include <memory>
 #include <span>
 #include <utility>
@@ -73,7 +74,8 @@ bool WakeEventFd(UniqueFd& wake_fd) {
 
 struct ResponseMessage {
   std::uint64_t connection_id = 0;
-  std::vector<char> payload;
+  std::uint64_t sequence = 0;
+  ApplicationResponse response = BinaryResponse{};
   bool close_after_write = false;
 };
 
@@ -135,10 +137,18 @@ class SubReactor::ResponseQueue {
 
 class SubReactor::Connection {
  public:
+  enum class ResponseStatus : std::uint8_t {
+    kQueued,
+    kStale,
+    kClosed,
+    kOverflow,
+  };
+
   Connection(UniqueFd socket, std::unique_ptr<Channel> channel,
              std::unique_ptr<ProtocolCodec> codec, ConnectionHandle handle,
              std::shared_ptr<std::atomic<bool>> alive,
-             std::size_t max_output_buffer_size);
+             std::size_t max_output_buffer_size,
+             std::size_t max_pending_responses);
 
   int fd() const;
   std::uint64_t connection_id() const;
@@ -151,7 +161,11 @@ class SubReactor::Connection {
   std::span<const char> ReadableBytes() const;
   void Consume(std::size_t size);
 
-  bool AppendResponse(std::span<const char> payload, bool close_after_write);
+  bool AppendResponse(const ApplicationResponse& response,
+                      bool close_after_write);
+  ResponseStatus QueueResponse(std::uint64_t sequence,
+                               ApplicationResponse response,
+                               bool close_after_write);
   bool HasOutput() const;
   std::span<const char> PendingOutput() const;
   void ConsumeOutput(std::size_t size);
@@ -160,8 +174,15 @@ class SubReactor::Connection {
   void set_write_interest_enabled(bool enabled);
   bool SetInterest(ChannelInterest interest);
   void MarkClosed();
+  void SetDecodeTarget(std::size_t target_size);
+  void ClearDecodeTarget();
 
  private:
+  struct PendingResponse {
+    ApplicationResponse response = BinaryResponse{};
+    bool close_after_write = false;
+  };
+
   void MakeWritable(std::size_t min_bytes);
   void CompactOutput();
 
@@ -176,9 +197,13 @@ class SubReactor::Connection {
   std::size_t write_offset_ = 0;
   const std::size_t max_read_buffer_size_;
   const std::size_t max_output_buffer_size_;
-  std::uint64_t next_sequence_ = 0;
+  std::size_t decode_target_size_ = 0;
+  std::uint64_t next_request_sequence_ = 0;
   std::vector<char> output_buffer_;
   std::size_t output_offset_ = 0;
+  const std::size_t max_pending_responses_;
+  std::uint64_t next_response_sequence_ = 0;
+  std::map<std::uint64_t, PendingResponse> pending_responses_;
   bool close_after_write_ = false;
   bool write_interest_enabled_ = false;
 };
@@ -188,7 +213,8 @@ SubReactor::Connection::Connection(UniqueFd socket,
                                    std::unique_ptr<ProtocolCodec> codec,
                                    ConnectionHandle handle,
                                    std::shared_ptr<std::atomic<bool>> alive,
-                                   std::size_t max_output_buffer_size)
+                                   std::size_t max_output_buffer_size,
+                                   std::size_t max_pending_responses)
     : socket_(std::move(socket)),
       channel_(std::move(channel)),
       codec_(std::move(codec)),
@@ -196,7 +222,8 @@ SubReactor::Connection::Connection(UniqueFd socket,
       connection_id_(handle_.id()),
       alive_(std::move(alive)),
       max_read_buffer_size_(codec_->MaxDecodeBufferSize()),
-      max_output_buffer_size_(max_output_buffer_size) {}
+      max_output_buffer_size_(max_output_buffer_size),
+      max_pending_responses_(max_pending_responses) {}
 
 int SubReactor::Connection::fd() const { return socket_.get(); }
 
@@ -211,7 +238,7 @@ const ConnectionHandle& SubReactor::Connection::handle() const {
 ProtocolCodec& SubReactor::Connection::codec() { return *codec_; }
 
 std::uint64_t SubReactor::Connection::NextSequence() {
-  return next_sequence_++;
+  return next_request_sequence_++;
 }
 
 std::span<char> SubReactor::Connection::WritableBytes() {
@@ -221,6 +248,10 @@ std::span<char> SubReactor::Connection::WritableBytes() {
   }
   std::size_t writable_size =
       std::min(kInitialReadBufferSize, max_read_buffer_size_ - readable_size);
+  if (decode_target_size_ > readable_size) {
+    writable_size =
+        std::min(writable_size, decode_target_size_ - readable_size);
+  }
   assert(writable_size != 0);
   MakeWritable(writable_size);
   return std::span<char>(storage_.data() + write_offset_,
@@ -272,23 +303,73 @@ void SubReactor::Connection::MakeWritable(std::size_t min_bytes) {
   storage_.resize(std::max(required_size, grown_size));
 }
 
-bool SubReactor::Connection::AppendResponse(std::span<const char> payload,
+bool SubReactor::Connection::AppendResponse(const ApplicationResponse& response,
                                             bool close_after_write) {
   CompactOutput();
-  if (output_buffer_.size() >= max_output_buffer_size_ ||
-      payload.size() > max_output_buffer_size_ - output_buffer_.size()) {
-    return false;
-  }
   std::size_t old_size = output_buffer_.size();
-  if (!codec_->Encode(payload, &output_buffer_)) {
+  if (!codec_->Encode(response, &output_buffer_)) {
     return false;
   }
   if (output_buffer_.size() > max_output_buffer_size_) {
     output_buffer_.resize(old_size);
     return false;
   }
-  close_after_write_ = close_after_write_ || close_after_write;
+  close_after_write_ = close_after_write_ || close_after_write ||
+                       codec_->ShouldCloseAfterWrite(response);
   return true;
+}
+
+SubReactor::Connection::ResponseStatus SubReactor::Connection::QueueResponse(
+    std::uint64_t sequence, ApplicationResponse response,
+    bool close_after_write) {
+  if (sequence < next_response_sequence_) {
+    return ResponseStatus::kStale;
+  }
+  if (sequence >= next_request_sequence_) {
+    return ResponseStatus::kStale;
+  }
+  if (close_after_write_) {
+    return ResponseStatus::kClosed;
+  }
+  if (sequence == next_response_sequence_) {
+    if (!AppendResponse(response, close_after_write)) {
+      return ResponseStatus::kOverflow;
+    }
+    ++next_response_sequence_;
+    if (close_after_write_) {
+      pending_responses_.clear();
+      return ResponseStatus::kQueued;
+    }
+  } else {
+    if (pending_responses_.find(sequence) != pending_responses_.end()) {
+      return ResponseStatus::kStale;
+    }
+    if (pending_responses_.size() >= max_pending_responses_) {
+      return ResponseStatus::kOverflow;
+    }
+    pending_responses_.emplace(sequence,
+                               PendingResponse{
+                                   .response = std::move(response),
+                                   .close_after_write = close_after_write,
+                               });
+  }
+
+  while (true) {
+    auto current = pending_responses_.find(next_response_sequence_);
+    if (current == pending_responses_.end()) {
+      return ResponseStatus::kQueued;
+    }
+    PendingResponse pending = std::move(current->second);
+    pending_responses_.erase(current);
+    if (!AppendResponse(pending.response, pending.close_after_write)) {
+      return ResponseStatus::kOverflow;
+    }
+    ++next_response_sequence_;
+    if (close_after_write_) {
+      pending_responses_.clear();
+      return ResponseStatus::kQueued;
+    }
+  }
 }
 
 bool SubReactor::Connection::HasOutput() const {
@@ -328,6 +409,12 @@ bool SubReactor::Connection::SetInterest(ChannelInterest interest) {
 void SubReactor::Connection::MarkClosed() {
   alive_->store(false, std::memory_order_release);
 }
+
+void SubReactor::Connection::SetDecodeTarget(std::size_t target_size) {
+  decode_target_size_ = target_size;
+}
+
+void SubReactor::Connection::ClearDecodeTarget() { decode_target_size_ = 0; }
 
 void SubReactor::Connection::CompactOutput() {
   if (output_offset_ == 0) {
@@ -516,16 +603,29 @@ void SubReactor::HandleWake() {
       continue;
     }
     Connection& state = *connection->second;
-    if (!state.AppendResponse(response.payload, response.close_after_write)) {
+    Connection::ResponseStatus status =
+        state.QueueResponse(response.sequence, std::move(response.response),
+                            response.close_after_write);
+    if (status == Connection::ResponseStatus::kQueued) {
+      FlushConnection(response.connection_id);
+      continue;
+    }
+    if (status == Connection::ResponseStatus::kOverflow) {
       if (logger_ != nullptr) {
-        NETLIB_LOG_WARN(*logger_,
-                        "failed to encode response for connection id={}",
-                        response.connection_id);
+        NETLIB_LOG_WARN(
+            *logger_,
+            "response buffer limit reached for connection id={} sequence={}",
+            response.connection_id, response.sequence);
       }
       CloseConnection(response.connection_id);
       continue;
     }
-    FlushConnection(response.connection_id);
+    if (logger_ != nullptr) {
+      NETLIB_LOG_DEBUG(*logger_,
+                       "ignored response for closed or stale connection id={} "
+                       "sequence={}",
+                       response.connection_id, response.sequence);
+    }
   }
 }
 
@@ -591,7 +691,8 @@ void SubReactor::RegisterConnection(UniqueFd connection) {
   std::weak_ptr<ResponseQueue> weak_response_queue = response_queue_;
   ConnectionHandle handle(
       connection_id, alive,
-      [weak_response_queue](std::uint64_t id, std::vector<char> payload,
+      [weak_response_queue](std::uint64_t id, std::uint64_t sequence,
+                            ApplicationResponse response,
                             bool close_after_write) {
         std::shared_ptr<ResponseQueue> response_queue =
             weak_response_queue.lock();
@@ -600,7 +701,8 @@ void SubReactor::RegisterConnection(UniqueFd connection) {
         }
         return response_queue->Enqueue(ResponseMessage{
             .connection_id = id,
-            .payload = std::move(payload),
+            .sequence = sequence,
+            .response = std::move(response),
             .close_after_write = close_after_write,
         });
       });
@@ -619,7 +721,8 @@ void SubReactor::RegisterConnection(UniqueFd connection) {
 
   std::unique_ptr<Connection> state = std::make_unique<Connection>(
       std::move(connection), std::move(channel), std::move(codec),
-      std::move(handle), std::move(alive), options_.max_pending_output_bytes);
+      std::move(handle), std::move(alive), options_.max_pending_output_bytes,
+      options_.max_pending_responses);
   auto inserted = connections_.emplace(connection_id, std::move(state));
   if (!inserted.second) {
     if (logger_ != nullptr) {
@@ -695,6 +798,18 @@ bool SubReactor::ProcessFrames(Connection& connection) {
     std::span<const char> readable = connection.ReadableBytes();
     DecodeResult decode_result = connection.codec().Decode(readable);
     if (decode_result.status == DecodeStatus::kNeedMore) {
+      if (decode_result.required_bytes >
+              connection.codec().MaxDecodeBufferSize() ||
+          (decode_result.required_bytes != 0 &&
+           decode_result.required_bytes <= readable.size())) {
+        if (logger_ != nullptr) {
+          NETLIB_LOG_WARN(*logger_,
+                          "invalid decode target for connection id={}",
+                          connection.connection_id());
+        }
+        return false;
+      }
+      connection.SetDecodeTarget(decode_result.required_bytes);
       return true;
     }
     if (decode_result.status == DecodeStatus::kProtocolError ||
@@ -710,6 +825,7 @@ bool SubReactor::ProcessFrames(Connection& connection) {
       return false;
     }
 
+    connection.ClearDecodeTarget();
     std::uint64_t connection_id = connection.connection_id();
     std::uint64_t sequence = connection.NextSequence();
     std::span<const char> payload = readable.subspan(
@@ -718,6 +834,7 @@ bool SubReactor::ProcessFrames(Connection& connection) {
         .connection_id = connection_id,
         .sequence = sequence,
         .connection = connection.handle(),
+        .metadata = std::move(decode_result.metadata),
         .payload = std::vector<char>(payload.begin(), payload.end()),
     };
     if (!worker_pool_.Submit(std::move(message))) {

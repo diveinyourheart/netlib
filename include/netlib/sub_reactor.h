@@ -22,7 +22,8 @@ namespace netlib {
 struct SubReactorOptions {
   // Maximum accepted descriptors waiting for registration.
   std::size_t max_pending_connections = 1024;
-  // Maximum worker responses waiting for SubReactor processing.
+  // Bound for the global worker-response queue and each connection's reorder
+  // buffer.
   std::size_t max_pending_responses = 4096;
   // Maximum encoded bytes buffered for one slow connection.
   std::size_t max_pending_output_bytes =

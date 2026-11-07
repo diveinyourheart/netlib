@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <memory>
 #include <span>
+#include <variant>
 #include <vector>
 
 #include "netlib/frame_protocol.h"
@@ -16,21 +17,33 @@ class LengthPrefixedCodec final : public ProtocolCodec {
       : max_payload_size_(max_payload_size) {}
 
   DecodeResult Decode(std::span<const char> input) override {
-    if (expected_frame_size_ == 0) {
+    if (state_ == State::kLengthPrefix) {
       if (input.size() < kFrameLengthPrefixSize) {
-        return DecodeResult{.status = DecodeStatus::kNeedMore};
+        return DecodeResult{
+            .status = DecodeStatus::kNeedMore,
+            .required_bytes = kFrameLengthPrefixSize,
+            .metadata = BinaryFrameMetadata{},
+        };
       }
       std::uint32_t payload_size =
           DecodePayloadSize(input.first(kFrameLengthPrefixSize));
       if (payload_size > max_payload_size_) {
-        return DecodeResult{.status = DecodeStatus::kProtocolError};
+        return DecodeResult{
+            .status = DecodeStatus::kProtocolError,
+            .metadata = BinaryFrameMetadata{},
+        };
       }
       expected_frame_size_ =
           kFrameLengthPrefixSize + static_cast<std::size_t>(payload_size);
+      state_ = State::kPayload;
     }
 
     if (input.size() < expected_frame_size_) {
-      return DecodeResult{.status = DecodeStatus::kNeedMore};
+      return DecodeResult{
+          .status = DecodeStatus::kNeedMore,
+          .required_bytes = expected_frame_size_,
+          .metadata = BinaryFrameMetadata{},
+      };
     }
 
     DecodeResult result{
@@ -38,19 +51,26 @@ class LengthPrefixedCodec final : public ProtocolCodec {
         .consumed_bytes = expected_frame_size_,
         .payload_offset = kFrameLengthPrefixSize,
         .payload_size = expected_frame_size_ - kFrameLengthPrefixSize,
+        .metadata = BinaryFrameMetadata{},
     };
     expected_frame_size_ = 0;
+    state_ = State::kLengthPrefix;
     return result;
   }
 
-  bool Encode(std::span<const char> payload,
+  bool Encode(const ApplicationResponse& response,
               std::vector<char>* output) override {
-    if (payload.size() > max_payload_size_) {
+    const BinaryResponse* binary = std::get_if<BinaryResponse>(&response);
+    if (binary == nullptr || binary->payload.size() > max_payload_size_) {
       return false;
     }
 
-    std::uint32_t payload_size = static_cast<std::uint32_t>(payload.size());
-    output->reserve(output->size() + kFrameLengthPrefixSize + payload.size());
+    std::span<const char> payload(binary->payload.data(),
+                                  binary->payload.size());
+    std::uint32_t payload_size =
+        static_cast<std::uint32_t>(binary->payload.size());
+    output->reserve(output->size() + kFrameLengthPrefixSize +
+                    binary->payload.size());
     output->push_back(static_cast<char>((payload_size >> 24U) & 0xFFU));
     output->push_back(static_cast<char>((payload_size >> 16U) & 0xFFU));
     output->push_back(static_cast<char>((payload_size >> 8U) & 0xFFU));
@@ -59,11 +79,20 @@ class LengthPrefixedCodec final : public ProtocolCodec {
     return true;
   }
 
+  bool ShouldCloseAfterWrite(const ApplicationResponse&) const override {
+    return false;
+  }
+
   std::size_t MaxDecodeBufferSize() const override {
     return kFrameLengthPrefixSize + max_payload_size_;
   }
 
  private:
+  enum class State : std::uint8_t {
+    kLengthPrefix,
+    kPayload,
+  };
+
   std::uint32_t DecodePayloadSize(std::span<const char> header) const {
     return (static_cast<std::uint32_t>(static_cast<unsigned char>(header[0]))
             << 24U) |
@@ -75,6 +104,7 @@ class LengthPrefixedCodec final : public ProtocolCodec {
   }
 
   const std::uint32_t max_payload_size_;
+  State state_ = State::kLengthPrefix;
   std::size_t expected_frame_size_ = 0;
 };
 

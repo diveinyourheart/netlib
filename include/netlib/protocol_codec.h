@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "netlib/frame_protocol.h"
+#include "netlib/protocol_message.h"
 
 namespace netlib {
 
@@ -20,9 +21,14 @@ enum class DecodeStatus : std::uint8_t {
 
 struct DecodeResult {
   DecodeStatus status = DecodeStatus::kNeedMore;
+  // For NeedMore, the total unread bytes required to reach the next decoder
+  // state or complete the frame. Zero means the target is not known yet, as
+  // while scanning an HTTP header for its delimiter.
+  std::size_t required_bytes = 0;
   std::size_t consumed_bytes = 0;
   std::size_t payload_offset = 0;
   std::size_t payload_size = 0;
+  FrameMetadata metadata;
 };
 
 // One instance is owned by each connection. Decode() receives the unconsumed
@@ -39,8 +45,10 @@ class ProtocolCodec {
   virtual ~ProtocolCodec() = default;
 
   virtual DecodeResult Decode(std::span<const char> input) = 0;
-  virtual bool Encode(std::span<const char> payload,
+  virtual bool Encode(const ApplicationResponse& response,
                       std::vector<char>* output) = 0;
+  virtual bool ShouldCloseAfterWrite(
+      const ApplicationResponse& response) const = 0;
   // Maximum unconsumed bytes allowed while assembling one decoded frame.
   virtual std::size_t MaxDecodeBufferSize() const = 0;
 };

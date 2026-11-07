@@ -5,14 +5,17 @@
 #include <vector>
 
 #include "netlib/connection_handle.h"
+#include "netlib/protocol_message.h"
 
 namespace netlib {
 
 // Owns a complete transport frame after it leaves a connection read buffer.
 struct FrameMessage {
   std::uint64_t connection_id = 0;
+  // Zero-based per-connection request order; return it with the response.
   std::uint64_t sequence = 0;
   ConnectionHandle connection;
+  FrameMetadata metadata;
   std::vector<char> payload;
 };
 

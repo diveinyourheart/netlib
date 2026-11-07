@@ -26,6 +26,7 @@ complete Frame
 worker response
   -> ConnectionHandle
   -> SubReactor response queue
+  -> per-connection sequence reorder buffer
   -> codec encode
   -> output buffer
   -> send until EAGAIN
@@ -99,6 +100,57 @@ the codec's own response-payload limit. Output backlog uses the separate
 `SubReactorOptions::max_pending_output_bytes` policy because multiple encoded
 responses may be waiting for a slow client.
 
+`DecodeResult::required_bytes` lets a stateful codec communicate the next known
+read target without exposing its internal state to Connection. Zero means the
+target is not yet knowable.
+
+Length-prefixed framing uses two states:
+
+```text
+read 4-byte length -> required_bytes = 4
+read payload       -> required_bytes = 4 + payload_length
+```
+
+An HTTP/1.1 codec can use these states:
+
+```text
+scan for CRLFCRLF  -> required_bytes = 0
+parse Content-Length
+read body          -> required_bytes = header_end + content_length
+```
+
+Chunked transfer adds states for chunk-size lines, chunk data, CRLF, and the
+zero-length trailer. Every state returns either NeedMore, FrameReady, or
+ProtocolError and may provide a new required_bytes target.
+
+## Protocol messages
+
+Network reading, protocol parsing, business processing, and response writing
+are separate stages. The non-template SubReactor owns the byte buffers and
+Channel. A per-connection `ProtocolCodec` produces a `DecodeResult` with payload
+offset and typed `FrameMetadata`. The ThreadPool handler receives the common
+`FrameMessage` envelope:
+
+```text
+connection handle
+request sequence
+FrameMetadata variant
+body payload bytes
+```
+
+`FrameMetadata` currently contains `BinaryFrameMetadata` and
+`HttpRequestMetadata`. Responses use
+`ApplicationResponse = BinaryResponse | HttpResponse`. This typed variant avoids
+RTTI and avoids compiling a separate Reactor and ThreadPool for every protocol.
+Adding a protocol requires a new metadata/response alternative and Codec, while
+read/write buffering and worker scheduling remain unchanged.
+
+`Http1Codec` parses HTTP/1.0 and HTTP/1.1 request lines and headers, extracts
+Content-Length and keep-alive, and emits the body through the normal payload
+path. `HttpResponse` encoding adds Content-Length and Connection headers. Chunked
+request framing returns ProtocolError in this first implementation; its state
+machine can be extended without changing SubReactor.
+
 `recv()` writes directly into the connection buffer. A complete payload is
 copied once into an owned `FrameMessage` and submitted to the ThreadPool.
 Reusable input capacity remains attached to the connection and is compacted
@@ -118,14 +170,25 @@ grow memory without limit. Dequeue releases a slot before the handler runs, so
 the configured limit covers queued work while a bounded number of messages can
 also be in flight in Worker calls.
 
-Handlers run concurrently and have no global ordering guarantee. Ordering that
-matters to an application must use `connection_id` and `sequence`. Queue
-submission failure applies backpressure by closing that connection.
+Handlers run concurrently and have no global completion-order guarantee.
+SubReactor therefore keeps a bounded reorder buffer per connection and only
+appends responses whose sequence is the connection's next expected sequence.
+This preserves request order on HTTP/1.1 pipelines and on binary connections
+with multiple in-flight requests. Queue submission failure applies backpressure
+by closing that connection.
 
 `FrameMessage::connection` is a `ConnectionHandle`. Workers call `Respond()` to
-move an application payload into the bound response queue of the owning
-SubReactor. The handle is weak: responses for a closed connection fail instead
-of writing to an fd that may have been reused.
+move an application payload and its request sequence into the bound response
+queue of the owning SubReactor. Every dispatched frame requires exactly one
+accepted response with the same sequence. A missing sequence stalls later
+responses for that connection. Duplicate, unknown, or already closed responses
+are discarded. The handle is weak: a response for a closed connection fails
+instead of writing to an fd that may have been reused.
+
+`SubReactorOptions::max_pending_responses` bounds both the global response
+queue and each connection's out-of-order buffer. Exceeding the per-connection
+bound closes that connection because its application-level ordering contract
+can no longer be maintained safely.
 
 SubReactor drains responses on its own thread, encodes them using the
 connection's `ProtocolCodec`, and appends them to the output buffer. It writes
