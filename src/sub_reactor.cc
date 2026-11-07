@@ -73,7 +73,7 @@ bool WakeEventFd(UniqueFd& wake_fd) {
 
 struct ResponseMessage {
   std::uint64_t connection_id = 0;
-  std::vector<char> payload;
+  ApplicationResponse response = BinaryResponse{};
   bool close_after_write = false;
 };
 
@@ -151,7 +151,8 @@ class SubReactor::Connection {
   std::span<const char> ReadableBytes() const;
   void Consume(std::size_t size);
 
-  bool AppendResponse(std::span<const char> payload, bool close_after_write);
+  bool AppendResponse(const ApplicationResponse& response,
+                      bool close_after_write);
   bool HasOutput() const;
   std::span<const char> PendingOutput() const;
   void ConsumeOutput(std::size_t size);
@@ -279,22 +280,19 @@ void SubReactor::Connection::MakeWritable(std::size_t min_bytes) {
   storage_.resize(std::max(required_size, grown_size));
 }
 
-bool SubReactor::Connection::AppendResponse(std::span<const char> payload,
+bool SubReactor::Connection::AppendResponse(const ApplicationResponse& response,
                                             bool close_after_write) {
   CompactOutput();
-  if (output_buffer_.size() >= max_output_buffer_size_ ||
-      payload.size() > max_output_buffer_size_ - output_buffer_.size()) {
-    return false;
-  }
   std::size_t old_size = output_buffer_.size();
-  if (!codec_->Encode(payload, &output_buffer_)) {
+  if (!codec_->Encode(response, &output_buffer_)) {
     return false;
   }
   if (output_buffer_.size() > max_output_buffer_size_) {
     output_buffer_.resize(old_size);
     return false;
   }
-  close_after_write_ = close_after_write_ || close_after_write;
+  close_after_write_ = close_after_write_ || close_after_write ||
+                       codec_->ShouldCloseAfterWrite(response);
   return true;
 }
 
@@ -529,7 +527,7 @@ void SubReactor::HandleWake() {
       continue;
     }
     Connection& state = *connection->second;
-    if (!state.AppendResponse(response.payload, response.close_after_write)) {
+    if (!state.AppendResponse(response.response, response.close_after_write)) {
       if (logger_ != nullptr) {
         NETLIB_LOG_WARN(*logger_,
                         "failed to encode response for connection id={}",
@@ -604,7 +602,7 @@ void SubReactor::RegisterConnection(UniqueFd connection) {
   std::weak_ptr<ResponseQueue> weak_response_queue = response_queue_;
   ConnectionHandle handle(
       connection_id, alive,
-      [weak_response_queue](std::uint64_t id, std::vector<char> payload,
+      [weak_response_queue](std::uint64_t id, ApplicationResponse response,
                             bool close_after_write) {
         std::shared_ptr<ResponseQueue> response_queue =
             weak_response_queue.lock();
@@ -613,7 +611,7 @@ void SubReactor::RegisterConnection(UniqueFd connection) {
         }
         return response_queue->Enqueue(ResponseMessage{
             .connection_id = id,
-            .payload = std::move(payload),
+            .response = std::move(response),
             .close_after_write = close_after_write,
         });
       });
@@ -744,6 +742,7 @@ bool SubReactor::ProcessFrames(Connection& connection) {
         .connection_id = connection_id,
         .sequence = sequence,
         .connection = connection.handle(),
+        .metadata = std::move(decode_result.metadata),
         .payload = std::vector<char>(payload.begin(), payload.end()),
     };
     if (!worker_pool_.Submit(std::move(message))) {

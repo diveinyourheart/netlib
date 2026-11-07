@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "netlib/connection_handle.h"
+#include "netlib/protocol_message.h"
 
 namespace netlib {
 
@@ -13,6 +14,7 @@ struct FrameMessage {
   std::uint64_t connection_id = 0;
   std::uint64_t sequence = 0;
   ConnectionHandle connection;
+  FrameMetadata metadata;
   std::vector<char> payload;
 };
 

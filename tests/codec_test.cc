@@ -6,6 +6,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "netlib/frame_protocol.h"
@@ -29,6 +30,25 @@ class TestHttpLikeCodec final : public netlib::ProtocolCodec {
             .required_bytes = 0,
         };
       }
+
+      std::size_t request_line_end = bytes.find("\r\n");
+      std::size_t first_space = bytes.find(' ');
+      std::size_t second_space = bytes.find(
+          ' ', first_space == std::string_view::npos ? first_space
+                                                     : first_space + 1);
+      if (request_line_end == std::string_view::npos ||
+          first_space == std::string_view::npos ||
+          second_space == std::string_view::npos ||
+          second_space >= request_line_end) {
+        return netlib::DecodeResult{
+            .status = netlib::DecodeStatus::kProtocolError,
+        };
+      }
+      metadata_.method = std::string(bytes.substr(0, first_space));
+      metadata_.target = std::string(
+          bytes.substr(first_space + 1, second_space - first_space - 1));
+      metadata_.version = std::string(
+          bytes.substr(second_space + 1, request_line_end - second_space - 1));
 
       std::size_t length_position = bytes.find("Content-Length: ");
       if (length_position == std::string_view::npos) {
@@ -57,6 +77,7 @@ class TestHttpLikeCodec final : public netlib::ProtocolCodec {
       payload_offset_ = delimiter + 4;
       expected_frame_size_ = payload_offset_ + content_length;
       payload_size_ = content_length;
+      metadata_.content_length = content_length;
       state_ = State::kBody;
     }
 
@@ -72,12 +93,19 @@ class TestHttpLikeCodec final : public netlib::ProtocolCodec {
         .consumed_bytes = expected_frame_size_,
         .payload_offset = payload_offset_,
         .payload_size = payload_size_,
+        .metadata = std::move(metadata_),
     };
+    metadata_ = netlib::HttpRequestMetadata{};
     state_ = State::kHeader;
     return result;
   }
 
-  bool Encode(std::span<const char>, std::vector<char>*) override {
+  bool Encode(const netlib::ApplicationResponse&, std::vector<char>*) override {
+    return false;
+  }
+
+  bool ShouldCloseAfterWrite(
+      const netlib::ApplicationResponse&) const override {
     return false;
   }
 
@@ -93,6 +121,7 @@ class TestHttpLikeCodec final : public netlib::ProtocolCodec {
   std::size_t payload_offset_ = 0;
   std::size_t payload_size_ = 0;
   std::size_t expected_frame_size_ = 0;
+  netlib::HttpRequestMetadata metadata_;
 };
 
 int RunLengthPrefixedCodecTest() {
@@ -106,12 +135,14 @@ int RunLengthPrefixedCodecTest() {
   constexpr std::string_view kFirstPayload = "first";
   constexpr std::string_view kSecondPayload = "second";
   std::vector<char> encoded;
-  if (!codec->Encode(
-          std::span<const char>(kFirstPayload.data(), kFirstPayload.size()),
-          &encoded) ||
-      !codec->Encode(
-          std::span<const char>(kSecondPayload.data(), kSecondPayload.size()),
-          &encoded)) {
+  if (!codec->Encode(netlib::BinaryResponse{.payload = std::vector<char>(
+                                                kFirstPayload.begin(),
+                                                kFirstPayload.end())},
+                     &encoded) ||
+      !codec->Encode(netlib::BinaryResponse{.payload = std::vector<char>(
+                                                kSecondPayload.begin(),
+                                                kSecondPayload.end())},
+                     &encoded)) {
     ReportFailure("codec encode failed");
     return 1;
   }
@@ -175,7 +206,11 @@ int RunCodecLimitTest() {
 
   const char payload[] = {'1', '2', '3', '4', '5'};
   std::vector<char> output;
-  if (codec->Encode(std::span<const char>(payload, sizeof(payload)), &output)) {
+  if (codec->Encode(
+          netlib::BinaryResponse{
+              .payload = std::vector<char>(payload, payload + sizeof(payload)),
+          },
+          &output)) {
     ReportFailure("codec encoded an oversized response");
     return 1;
   }
@@ -207,6 +242,9 @@ int RunHttpLikeStateMachineTest() {
   if (result.status != netlib::DecodeStatus::kFrameReady ||
       result.consumed_bytes != request.size() ||
       result.payload_offset != header_size || result.payload_size != 5 ||
+      std::get_if<netlib::HttpRequestMetadata>(&result.metadata) == nullptr ||
+      std::get_if<netlib::HttpRequestMetadata>(&result.metadata)->method !=
+          "POST" ||
       std::string_view(request.data() + result.payload_offset,
                        result.payload_size) != "hello") {
     ReportFailure("HTTP-like codec did not produce a complete frame");

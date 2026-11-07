@@ -12,6 +12,7 @@
 - `MainReactor`：监听 IPv4 端口，循环 `accept4`，轮询分发给多个 `SubReactor`。
 - `SubReactor`：管理每连接 Codec、读写缓冲、响应队列和 ET 事件。
 - `ProtocolCodec`：负责字节流分帧和响应编码，默认实现为 4 字节长度前缀。
+- `Http1Codec`：解析 HTTP/1.0、HTTP/1.1 Header、Content-Length Body 和 keep-alive。
 - `ConnectionHandle`：Worker 回写响应的安全弱连接句柄。
 - `frame_protocol.h`：定义 4 字节大端 payload 长度和 16 MiB payload 上限。
 - `ThreadPool`：使用 moodycamel MPMC 队列消费拥有数据的 `FrameMessage`。
@@ -45,6 +46,18 @@ TCP bytes
   -> ProtocolCodec::Encode
   -> nonblocking send / EPOLLOUT
 ```
+
+协议解析和业务层通过 typed variant 解耦：
+
+```cpp
+FrameMetadata = std::variant<BinaryFrameMetadata, HttpRequestMetadata>;
+ApplicationResponse =
+    std::variant<BinaryResponse, HttpResponse>;
+```
+
+网络层仍然只有一份非模板 SubReactor。长度前缀协议提交
+`BinaryFrameMetadata`，HTTP 提交包含 method、target、version、Headers、
+Content-Length 和 keep-alive 的 `HttpRequestMetadata`。
 
 长度字段为 4 字节网络字节序，只计算 payload，不包含长度头。payload 最大
 16 MiB。Worker Handler 并发执行，没有跨连接的全局顺序保证；业务需要顺序时
@@ -89,6 +102,26 @@ Codec 在读取 4 字节长度头时返回 4，解析出 payload 长度后返回
 HTTP Codec 在寻找 `\r\n\r\n` 时可以返回 0 表示目标未知，解析出
 `Content-Length` 后再返回 Header 长度加 Body 长度。Connection 使用该值控制
 下一次读取和几何扩容，不会因为协议最大帧大小较大就一次分配整块最大缓冲。
+
+HTTP 业务处理示例：
+
+```cpp
+const auto* request =
+    std::get_if<netlib::HttpRequestMetadata>(&message.metadata);
+if (request != nullptr && request->target == "/rpc") {
+  message.connection.Respond(netlib::HttpResponse{
+      .status_code = 200,
+      .reason_phrase = "OK",
+      .headers = {{.name = "Content-Type", .value = "application/json"}},
+      .body = response_json,
+      .keep_alive = request->keep_alive,
+  });
+}
+```
+
+当前 HTTP Codec 支持 Content-Length 请求；chunked transfer encoding 会返回
+`ProtocolError`，后续可在同一个状态机中增加 chunk size、chunk data 和 trailer
+状态。HTTP 响应由 Codec 自动生成 Content-Length 和 Connection Header。
 
 默认 SubReactor 使用 `CreateLengthPrefixedCodec()`。自定义协议可以实现
 `ProtocolCodec` 并通过带 `ProtocolCodecFactory` 的 `SubReactor::Create`

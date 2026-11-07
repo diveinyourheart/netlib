@@ -19,8 +19,8 @@ class ConnectionHandle::State {
 
   bool valid() const { return alive_->load(std::memory_order_acquire); }
 
-  bool Respond(std::vector<char> payload, bool close_after_write) const {
-    return valid() && responder_(id_, std::move(payload), close_after_write);
+  bool Respond(ApplicationResponse response, bool close_after_write) const {
+    return valid() && responder_(id_, std::move(response), close_after_write);
   }
 
  private:
@@ -43,10 +43,10 @@ bool ConnectionHandle::valid() const {
   return state_ != nullptr && state_->valid();
 }
 
-bool ConnectionHandle::Respond(std::vector<char> payload,
+bool ConnectionHandle::Respond(ApplicationResponse response,
                                bool close_after_write) const {
   return state_ != nullptr &&
-         state_->Respond(std::move(payload), close_after_write);
+         state_->Respond(std::move(response), close_after_write);
 }
 
 }  // namespace netlib

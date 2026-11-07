@@ -122,6 +122,34 @@ Chunked transfer adds states for chunk-size lines, chunk data, CRLF, and the
 zero-length trailer. Every state returns either NeedMore, FrameReady, or
 ProtocolError and may provide a new required_bytes target.
 
+## Protocol messages
+
+Network reading, protocol parsing, business processing, and response writing
+are separate stages. The non-template SubReactor owns the byte buffers and
+Channel. A per-connection `ProtocolCodec` produces a `DecodeResult` with payload
+offset and typed `FrameMetadata`. The ThreadPool handler receives the common
+`FrameMessage` envelope:
+
+```text
+connection handle
+request sequence
+FrameMetadata variant
+body payload bytes
+```
+
+`FrameMetadata` currently contains `BinaryFrameMetadata` and
+`HttpRequestMetadata`. Responses use
+`ApplicationResponse = BinaryResponse | HttpResponse`. This typed variant avoids
+RTTI and avoids compiling a separate Reactor and ThreadPool for every protocol.
+Adding a protocol requires a new metadata/response alternative and Codec, while
+read/write buffering and worker scheduling remain unchanged.
+
+`Http1Codec` parses HTTP/1.0 and HTTP/1.1 request lines and headers, extracts
+Content-Length and keep-alive, and emits the body through the normal payload
+path. `HttpResponse` encoding adds Content-Length and Connection headers. Chunked
+request framing returns ProtocolError in this first implementation; its state
+machine can be extended without changing SubReactor.
+
 `recv()` writes directly into the connection buffer. A complete payload is
 copied once into an owned `FrameMessage` and submitted to the ThreadPool.
 Reusable input capacity remains attached to the connection and is compacted

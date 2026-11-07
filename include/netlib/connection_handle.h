@@ -5,7 +5,10 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <utility>
 #include <vector>
+
+#include "netlib/protocol_message.h"
 
 namespace netlib {
 
@@ -23,13 +26,20 @@ class ConnectionHandle {
 
   std::uint64_t id() const;
   bool valid() const;
-  bool Respond(std::vector<char> payload, bool close_after_write = false) const;
+  bool Respond(ApplicationResponse response,
+               bool close_after_write = false) const;
+  bool Respond(std::vector<char> payload,
+               bool close_after_write = false) const {
+    return Respond(BinaryResponse{.payload = std::move(payload)},
+                   close_after_write);
+  }
 
  private:
   class State;
   friend class SubReactor;
 
-  using Responder = std::function<bool(std::uint64_t, std::vector<char>, bool)>;
+  using Responder =
+      std::function<bool(std::uint64_t, ApplicationResponse, bool)>;
 
   ConnectionHandle(std::uint64_t id,
                    std::shared_ptr<const std::atomic<bool>> alive,

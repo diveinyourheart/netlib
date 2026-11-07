@@ -19,6 +19,7 @@ add_library(
     src/channel.cc
     src/connection_handle.cc
     src/event_loop.cc
+    src/http1_codec.cc
     src/length_prefixed_codec.cc
     src/main_reactor.cc
     src/sub_reactor.cc
@@ -82,4 +83,8 @@ if(BUILD_TESTING)
   add_executable(netlib_codec_test tests/codec_test.cc)
   target_link_libraries(netlib_codec_test PRIVATE netlib::netlib)
   add_test(NAME netlib_codec_test COMMAND netlib_codec_test)
+
+  add_executable(netlib_http_codec_test tests/http_codec_test.cc)
+  target_link_libraries(netlib_http_codec_test PRIVATE netlib::netlib)
+  add_test(NAME netlib_http_codec_test COMMAND netlib_http_codec_test)
 endif()
