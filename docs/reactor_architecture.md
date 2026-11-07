@@ -99,6 +99,29 @@ the codec's own response-payload limit. Output backlog uses the separate
 `SubReactorOptions::max_pending_output_bytes` policy because multiple encoded
 responses may be waiting for a slow client.
 
+`DecodeResult::required_bytes` lets a stateful codec communicate the next known
+read target without exposing its internal state to Connection. Zero means the
+target is not yet knowable.
+
+Length-prefixed framing uses two states:
+
+```text
+read 4-byte length -> required_bytes = 4
+read payload       -> required_bytes = 4 + payload_length
+```
+
+An HTTP/1.1 codec can use these states:
+
+```text
+scan for CRLFCRLF  -> required_bytes = 0
+parse Content-Length
+read body          -> required_bytes = header_end + content_length
+```
+
+Chunked transfer adds states for chunk-size lines, chunk data, CRLF, and the
+zero-length trailer. Every state returns either NeedMore, FrameReady, or
+ProtocolError and may provide a new required_bytes target.
+
 `recv()` writes directly into the connection buffer. A complete payload is
 copied once into an owned `FrameMessage` and submitted to the ThreadPool.
 Reusable input capacity remains attached to the connection and is compacted

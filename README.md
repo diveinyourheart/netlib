@@ -84,6 +84,12 @@ Sub 的生产者，再调用 `ThreadPool::Stop()` 排空消息并 join Worker。
 Codec 通过 `MaxDecodeBufferSize()` 描述输入分帧缓冲上限，单次响应 payload
 限制由 `Encode()` 自己执行。输出积压策略不再隐式绑定到 Codec 的输入缓冲上限。
 
+`DecodeResult::required_bytes` 是下一次解析推进所需的总未消费字节数。长度前缀
+Codec 在读取 4 字节长度头时返回 4，解析出 payload 长度后返回完整帧大小。
+HTTP Codec 在寻找 `\r\n\r\n` 时可以返回 0 表示目标未知，解析出
+`Content-Length` 后再返回 Header 长度加 Body 长度。Connection 使用该值控制
+下一次读取和几何扩容，不会因为协议最大帧大小较大就一次分配整块最大缓冲。
+
 默认 SubReactor 使用 `CreateLengthPrefixedCodec()`。自定义协议可以实现
 `ProtocolCodec` 并通过带 `ProtocolCodecFactory` 的 `SubReactor::Create`
 重载传入。每个连接拥有独立的 Codec 实例，因此可以维护自定义解析状态。

@@ -20,6 +20,10 @@ enum class DecodeStatus : std::uint8_t {
 
 struct DecodeResult {
   DecodeStatus status = DecodeStatus::kNeedMore;
+  // For NeedMore, the total unread bytes required to reach the next decoder
+  // state or complete the frame. Zero means the target is not known yet, as
+  // while scanning an HTTP header for its delimiter.
+  std::size_t required_bytes = 0;
   std::size_t consumed_bytes = 0;
   std::size_t payload_offset = 0;
   std::size_t payload_size = 0;

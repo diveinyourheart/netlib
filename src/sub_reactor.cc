@@ -160,6 +160,8 @@ class SubReactor::Connection {
   void set_write_interest_enabled(bool enabled);
   bool SetInterest(ChannelInterest interest);
   void MarkClosed();
+  void SetDecodeTarget(std::size_t target_size);
+  void ClearDecodeTarget();
 
  private:
   void MakeWritable(std::size_t min_bytes);
@@ -176,6 +178,7 @@ class SubReactor::Connection {
   std::size_t write_offset_ = 0;
   const std::size_t max_read_buffer_size_;
   const std::size_t max_output_buffer_size_;
+  std::size_t decode_target_size_ = 0;
   std::uint64_t next_sequence_ = 0;
   std::vector<char> output_buffer_;
   std::size_t output_offset_ = 0;
@@ -221,6 +224,10 @@ std::span<char> SubReactor::Connection::WritableBytes() {
   }
   std::size_t writable_size =
       std::min(kInitialReadBufferSize, max_read_buffer_size_ - readable_size);
+  if (decode_target_size_ > readable_size) {
+    writable_size =
+        std::min(writable_size, decode_target_size_ - readable_size);
+  }
   assert(writable_size != 0);
   MakeWritable(writable_size);
   return std::span<char>(storage_.data() + write_offset_,
@@ -328,6 +335,12 @@ bool SubReactor::Connection::SetInterest(ChannelInterest interest) {
 void SubReactor::Connection::MarkClosed() {
   alive_->store(false, std::memory_order_release);
 }
+
+void SubReactor::Connection::SetDecodeTarget(std::size_t target_size) {
+  decode_target_size_ = target_size;
+}
+
+void SubReactor::Connection::ClearDecodeTarget() { decode_target_size_ = 0; }
 
 void SubReactor::Connection::CompactOutput() {
   if (output_offset_ == 0) {
@@ -695,6 +708,18 @@ bool SubReactor::ProcessFrames(Connection& connection) {
     std::span<const char> readable = connection.ReadableBytes();
     DecodeResult decode_result = connection.codec().Decode(readable);
     if (decode_result.status == DecodeStatus::kNeedMore) {
+      if (decode_result.required_bytes >
+              connection.codec().MaxDecodeBufferSize() ||
+          (decode_result.required_bytes != 0 &&
+           decode_result.required_bytes <= readable.size())) {
+        if (logger_ != nullptr) {
+          NETLIB_LOG_WARN(*logger_,
+                          "invalid decode target for connection id={}",
+                          connection.connection_id());
+        }
+        return false;
+      }
+      connection.SetDecodeTarget(decode_result.required_bytes);
       return true;
     }
     if (decode_result.status == DecodeStatus::kProtocolError ||
@@ -710,6 +735,7 @@ bool SubReactor::ProcessFrames(Connection& connection) {
       return false;
     }
 
+    connection.ClearDecodeTarget();
     std::uint64_t connection_id = connection.connection_id();
     std::uint64_t sequence = connection.NextSequence();
     std::span<const char> payload = readable.subspan(
