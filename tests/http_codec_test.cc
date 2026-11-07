@@ -55,6 +55,22 @@ bool ConnectTo(uint16_t port, netlib::UniqueFd* connection) {
                  sizeof(address)) == 0;
 }
 
+bool SendAll(int fd, std::string_view data) {
+  std::size_t sent = 0;
+  while (sent < data.size()) {
+    ssize_t result = send(fd, data.data() + sent, data.size() - sent, 0);
+    if (result > 0) {
+      sent += static_cast<std::size_t>(result);
+      continue;
+    }
+    if (result < 0 && errno == EINTR) {
+      continue;
+    }
+    return false;
+  }
+  return true;
+}
+
 bool ReadUntilClosed(int fd, std::string* output) {
   char buffer[4096];
   while (true) {
@@ -218,45 +234,82 @@ int RunInvalidRequestTest() {
   return 0;
 }
 
-int RunHttpServerTest() {
+int RunHttpPipelineTest() {
   std::mutex handler_mutex;
   std::condition_variable handler_condition;
-  bool handler_completed = false;
-  bool handler_ok = false;
+  std::size_t completed_requests = 0;
+  bool first_request_started = false;
+  bool second_response_queued = false;
+  bool handler_ok = true;
 
-  netlib::ThreadPool::Handler handler =
-      [&handler_mutex, &handler_condition, &handler_completed,
-       &handler_ok](netlib::FrameMessage message) {
-        const netlib::HttpRequestMetadata* metadata =
-            std::get_if<netlib::HttpRequestMetadata>(&message.metadata);
-        bool valid = metadata != nullptr && metadata->method == "POST" &&
-                     metadata->target == "/rpc" &&
-                     message.payload == std::vector<char>{'p', 'i', 'n', 'g'};
-        if (valid) {
-          valid = message.connection.Respond(netlib::HttpResponse{
-              .status_code = 200,
-              .reason_phrase = "OK",
-              .headers =
-                  {
-                      netlib::HttpHeader{
-                          .name = "Content-Type",
-                          .value = "text/plain",
-                      },
-                  },
-              .body = {'p', 'o', 'n', 'g'},
-              .keep_alive = false,
-          });
-        }
-        {
-          std::lock_guard<std::mutex> lock(handler_mutex);
-          handler_completed = true;
-          handler_ok = valid;
-          handler_condition.notify_all();
-        }
-      };
+  netlib::ThreadPool::Handler handler = [&handler_mutex, &handler_condition,
+                                         &completed_requests,
+                                         &first_request_started,
+                                         &second_response_queued, &handler_ok](
+                                            netlib::FrameMessage message) {
+    const netlib::HttpRequestMetadata* metadata =
+        std::get_if<netlib::HttpRequestMetadata>(&message.metadata);
+    bool first = message.sequence == 0 && metadata != nullptr &&
+                 metadata->method == "POST" && metadata->target == "/first" &&
+                 message.payload == std::vector<char>{'o', 'n', 'e'};
+    bool second = message.sequence == 1 && metadata != nullptr &&
+                  metadata->method == "POST" && metadata->target == "/second" &&
+                  message.payload == std::vector<char>{'t', 'w', 'o'};
+    bool accepted = false;
+
+    if (first) {
+      std::unique_lock<std::mutex> lock(handler_mutex);
+      first_request_started = true;
+      handler_condition.notify_all();
+      if (handler_condition.wait_for(
+              lock, std::chrono::seconds(2),
+              [&second_response_queued] { return second_response_queued; })) {
+        lock.unlock();
+        accepted = message.connection.Respond(
+            message.sequence, netlib::HttpResponse{
+                                  .status_code = 200,
+                                  .reason_phrase = "OK",
+                                  .headers =
+                                      {
+                                          netlib::HttpHeader{
+                                              .name = "Content-Type",
+                                              .value = "text/plain",
+                                          },
+                                      },
+                                  .body = {'f', 'i', 'r', 's', 't'},
+                                  .keep_alive = true,
+                              });
+      }
+    } else if (second) {
+      accepted = message.connection.Respond(
+          message.sequence, netlib::HttpResponse{
+                                .status_code = 200,
+                                .reason_phrase = "OK",
+                                .headers =
+                                    {
+                                        netlib::HttpHeader{
+                                            .name = "Content-Type",
+                                            .value = "text/plain",
+                                        },
+                                    },
+                                .body = {'s', 'e', 'c', 'o', 'n', 'd'},
+                                .keep_alive = false,
+                            });
+    }
+
+    {
+      std::lock_guard<std::mutex> lock(handler_mutex);
+      ++completed_requests;
+      handler_ok = handler_ok && accepted;
+      if (second && accepted) {
+        second_response_queued = true;
+      }
+      handler_condition.notify_all();
+    }
+  };
 
   std::unique_ptr<netlib::ThreadPool> worker_pool =
-      netlib::ThreadPool::Create(1, 16, std::move(handler));
+      netlib::ThreadPool::Create(2, 16, std::move(handler));
   if (!worker_pool) {
     ReportFailure("failed to create HTTP ThreadPool");
     return 1;
@@ -284,16 +337,24 @@ int RunHttpServerTest() {
 
   bool success = true;
   netlib::UniqueFd client;
-  constexpr std::string_view kRequest =
-      "POST /rpc HTTP/1.1\r\n"
+  constexpr std::string_view kFirstRequest =
+      "POST /first HTTP/1.1\r\n"
       "Host: localhost\r\n"
-      "Content-Length: 4\r\n"
+      "Content-Length: 3\r\n"
       "\r\n"
-      "ping";
+      "one";
+  constexpr std::string_view kSecondRequest =
+      "POST /second HTTP/1.1\r\n"
+      "Host: localhost\r\n"
+      "Content-Length: 3\r\n"
+      "Connection: close\r\n"
+      "\r\n"
+      "two";
+  std::string requests(kFirstRequest);
+  requests.append(kSecondRequest);
   if (!ConnectTo(main_reactor->port(), &client) ||
-      send(client.get(), kRequest.data(), kRequest.size(), MSG_NOSIGNAL) !=
-          static_cast<ssize_t>(kRequest.size())) {
-    ReportFailure("failed to send HTTP request");
+      !SendAll(client.get(), requests)) {
+    ReportFailure("failed to send pipelined HTTP requests");
     success = false;
   }
 
@@ -301,12 +362,15 @@ int RunHttpServerTest() {
     std::unique_lock<std::mutex> lock(handler_mutex);
     if (success && !handler_condition.wait_for(
                        lock, std::chrono::seconds(2),
-                       [&handler_completed] { return handler_completed; })) {
-      ReportFailure("HTTP Worker did not process the request");
+                       [&completed_requests, &first_request_started] {
+                         return completed_requests == 2 &&
+                                first_request_started;
+                       })) {
+      ReportFailure("HTTP Workers did not process both pipelined requests");
       success = false;
     }
     if (success && !handler_ok) {
-      ReportFailure("HTTP request context was incorrect");
+      ReportFailure("pipelined HTTP request context was incorrect");
       success = false;
     }
   }
@@ -316,11 +380,14 @@ int RunHttpServerTest() {
     ReportFailure("failed to read HTTP response");
     success = false;
   }
-  if (success && (response.find("HTTP/1.1 200 OK\r\n") != 0 ||
-                  response.find("Content-Length: 4\r\n") == std::string::npos ||
-                  response.find("Connection: close\r\n") == std::string::npos ||
-                  response.find("\r\n\r\npong") == std::string::npos)) {
-    ReportFailure("HTTP response wire format is incorrect");
+  if (success &&
+      (response.find("HTTP/1.1 200 OK\r\n") != 0 ||
+       response.find("Content-Length: 5\r\n") == std::string::npos ||
+       response.find("Connection: close\r\n") == std::string::npos ||
+       response.find("\r\n\r\nfirst") == std::string::npos ||
+       response.find("\r\n\r\nsecond") == std::string::npos ||
+       response.find("\r\n\r\nfirst") > response.find("\r\n\r\nsecond"))) {
+    ReportFailure("pipelined HTTP responses were out of order or malformed");
     success = false;
   }
 
@@ -352,5 +419,5 @@ int main() {
   if (invalid_result != 0) {
     return invalid_result;
   }
-  return RunHttpServerTest();
+  return RunHttpPipelineTest();
 }

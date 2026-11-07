@@ -400,7 +400,8 @@ int RunLateResponseTest() {
                               [&release_handler] { return release_handler; });
         }
 
-        bool accepted = message.connection.Respond(std::vector<char>{'x'});
+        bool accepted = message.connection.Respond(message.sequence,
+                                                   std::vector<char>{'x'});
         {
           std::lock_guard<std::mutex> lock(gate_mutex);
           response_attempted = true;
@@ -501,9 +502,14 @@ int RunReactorTest() {
     return 1;
   }
   std::atomic<std::size_t> response_errors{0};
+  std::mutex response_gate_mutex;
+  std::condition_variable response_gate_condition;
+  bool later_response_queued = false;
+  bool pipeline_gate_timed_out = false;
   netlib::ThreadPool::Handler frame_handler =
-      [&first_observation, &second_observation,
-       &response_errors](netlib::FrameMessage message) {
+      [&first_observation, &second_observation, &response_errors,
+       &response_gate_mutex, &response_gate_condition, &later_response_queued,
+       &pipeline_gate_timed_out](netlib::FrameMessage message) {
         Observation* observation = nullptr;
         if (!message.payload.empty() && message.payload.front() == 'a') {
           observation = &first_observation;
@@ -522,6 +528,15 @@ int RunReactorTest() {
           observation->condition.notify_all();
         }
 
+        if (message.payload.front() == 'b') {
+          std::unique_lock<std::mutex> lock(response_gate_mutex);
+          if (!response_gate_condition.wait_for(
+                  lock, kWaitTimeout,
+                  [&later_response_queued] { return later_response_queued; })) {
+            pipeline_gate_timed_out = true;
+          }
+        }
+
         std::vector<char> response;
         if (message.payload.front() == 'a') {
           response.assign(8 * 1024 * 1024, 'R');
@@ -531,9 +546,15 @@ int RunReactorTest() {
           response.assign(text.begin(), text.end());
         }
         bool close_after_write = message.payload.front() == 'a';
-        if (!message.connection.Respond(std::move(response),
-                                        close_after_write)) {
+        bool accepted = message.connection.Respond(
+            message.sequence, std::move(response), close_after_write);
+        if (!accepted) {
           response_errors.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (message.payload.front() == 'c') {
+          std::lock_guard<std::mutex> lock(response_gate_mutex);
+          later_response_queued = accepted;
+          response_gate_condition.notify_all();
         }
       };
   std::unique_ptr<netlib::ThreadPool> worker_pool =
@@ -626,13 +647,18 @@ int RunReactorTest() {
   }
   if (success) {
     const std::string expected_first_response(8 * 1024 * 1024, 'R');
-    const bool second_replies = (second_response_one == "response-b" &&
-                                 second_response_two == "response-c") ||
-                                (second_response_one == "response-c" &&
-                                 second_response_two == "response-b");
-    if (first_response != expected_first_response || !second_replies ||
+    if (first_response != expected_first_response ||
+        second_response_one != "response-b" ||
+        second_response_two != "response-c" ||
         response_errors.load(std::memory_order_relaxed) != 0) {
-      ReportFailure("worker responses were lost or corrupted");
+      ReportFailure("worker responses were lost, corrupted, or reordered");
+      success = false;
+    }
+  }
+  {
+    std::lock_guard<std::mutex> lock(response_gate_mutex);
+    if (pipeline_gate_timed_out) {
+      ReportFailure("pipeline response gate timed out");
       success = false;
     }
   }

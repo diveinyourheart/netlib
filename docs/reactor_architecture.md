@@ -26,6 +26,7 @@ complete Frame
 worker response
   -> ConnectionHandle
   -> SubReactor response queue
+  -> per-connection sequence reorder buffer
   -> codec encode
   -> output buffer
   -> send until EAGAIN
@@ -169,14 +170,25 @@ grow memory without limit. Dequeue releases a slot before the handler runs, so
 the configured limit covers queued work while a bounded number of messages can
 also be in flight in Worker calls.
 
-Handlers run concurrently and have no global ordering guarantee. Ordering that
-matters to an application must use `connection_id` and `sequence`. Queue
-submission failure applies backpressure by closing that connection.
+Handlers run concurrently and have no global completion-order guarantee.
+SubReactor therefore keeps a bounded reorder buffer per connection and only
+appends responses whose sequence is the connection's next expected sequence.
+This preserves request order on HTTP/1.1 pipelines and on binary connections
+with multiple in-flight requests. Queue submission failure applies backpressure
+by closing that connection.
 
 `FrameMessage::connection` is a `ConnectionHandle`. Workers call `Respond()` to
-move an application payload into the bound response queue of the owning
-SubReactor. The handle is weak: responses for a closed connection fail instead
-of writing to an fd that may have been reused.
+move an application payload and its request sequence into the bound response
+queue of the owning SubReactor. Every dispatched frame requires exactly one
+accepted response with the same sequence. A missing sequence stalls later
+responses for that connection. Duplicate, unknown, or already closed responses
+are discarded. The handle is weak: a response for a closed connection fails
+instead of writing to an fd that may have been reused.
+
+`SubReactorOptions::max_pending_responses` bounds both the global response
+queue and each connection's out-of-order buffer. Exceeding the per-connection
+bound closes that connection because its application-level ordering contract
+can no longer be maintained safely.
 
 SubReactor drains responses on its own thread, encodes them using the
 connection's `ProtocolCodec`, and appends them to the output buffer. It writes
