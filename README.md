@@ -177,11 +177,11 @@ NETLIB_LOG_INFO(*logger, "server started on port={} workers={}", 8080, 4);
 行号、函数名及消息。TTY 输出自动启用 ANSI 颜色，重定向时可使用
 `ColorMode::kNever`。消息中的终端控制字符会被转义。
 
-`Flush()` 使用单调递增的票据号和 Writer 完成水位：每个 Flush 控制消息携带
-一个 ticket，Writer 执行 Sink Flush 后推进 completed watermark 并唤醒等待者。
-Flush 和 Stop 控制消息共用一个显式 moodycamel producer token，保证并发 Flush
-时控制消息按 FIFO 处理。Flush 是队列屏障；Flush 期间由其他线程继续写入的日志
-可能排在该屏障之后。
+Flush() 会记录已接受日志的截止编号，等待这个范围内的日志全部写出后再刷新。
+写线程跟踪连续完成进度，不依赖不同 producer 之间的出队顺序；后续日志可继续提交。
+Stop() 关闭提交入口、排空已接受日志并完成刷新，然后等待后台线程退出。
+默认每 1000ms 自动请求刷新，可通过 LoggerOptions::flush_interval 调整（0 表示关闭）。
+刷新仍使用 fflush()，不保证断电持久化。可复用定时器见[定时器文档](docs/timer.md)。
 
 日志宏使用固定版本 fmtlib 11.2.0，格式串在编译期检查，例如：
 

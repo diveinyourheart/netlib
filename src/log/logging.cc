@@ -18,31 +18,22 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <deque>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
 #include <utility>
 
-#include "blockingconcurrentqueue.h"
+#include "concurrentqueue.h"
+#include "netlib/timer.h"
 
 namespace netlib::log {
 namespace {
 
 constexpr std::size_t kWriterBatchSize = 64;
-
-enum class WorkItemKind : std::uint8_t {
-  kMessage,
-  kFlush,
-  kStop,
-};
-
-struct WorkItem {
-  WorkItemKind kind = WorkItemKind::kMessage;
-  LogRecord record;
-  std::uint64_t flush_id = 0;
-};
 
 std::string_view LevelName(LogLevel level) {
   switch (level) {
@@ -257,202 +248,222 @@ class StdoutSink final : public LogSink {
 
 class Logger::Impl {
  public:
-  Impl(LoggerOptions options, std::unique_ptr<LogSink> sink);
-  ~Impl();
+  struct FlushRequest {
+    std::uint64_t target;
+    bool done = false;
+  };
 
-  Impl(const Impl&) = delete;
-  Impl& operator=(const Impl&) = delete;
-  Impl(Impl&&) = delete;
-  Impl& operator=(Impl&&) = delete;
+  Impl(LoggerOptions options, std::unique_ptr<LogSink> sink)
+      : logger_name_(std::move(options.name)),
+        minimum_level_(options.minimum_level),
+        capacity_(options.queue_capacity),
+        flush_each_record_(options.flush_each_record),
+        queue_(capacity_),
+        sink_(std::move(sink)),
+        consumer_(queue_) {
+    if (options.flush_interval.count() > 0) {
+      timer_ = std::make_unique<TimerScheduler>();
+      timer_->ScheduleEvery(options.flush_interval, [this] {
+        std::lock_guard<std::mutex> lock(mutex_);
+        // Keep the first pending target fixed: continuous logging must not
+        // postpone its completion. Coalesce ticks while a request is pending.
+        if (!stopping_ && !periodic_target_) {
+          periodic_target_ = accepted_;
+          work_.notify_one();
+        }
+      });
+    }
+    writer_ = std::thread([this] { WriterLoop(); });
+  }
+  ~Impl() { Stop(); }
 
-  bool IsEnabled(LogLevel level) const;
+  bool IsEnabled(LogLevel level) const {
+    return IsValidLevel(level) && level >= minimum_level_;
+  }
   bool Log(LogLevel level, std::string_view message,
-           std::source_location source);
+           std::source_location source) {
+    return LogOwned(level, std::string(message), source);
+  }
   bool LogOwned(LogLevel level, std::string message,
-                std::source_location source);
-  bool Flush();
-  void Stop();
-  std::size_t queued_count() const;
-  std::uint64_t dropped_count() const;
+                std::source_location source) {
+    if (!IsEnabled(level)) return false;
+    LogRecord record{
+        .timestamp = std::chrono::system_clock::now(),
+        .level = level,
+        .thread_id = CurrentThreadId(),
+        .source = source,
+        .logger_name = logger_name_,
+        .message = std::move(message),
+    };
+    // Admission and publication are atomic with respect to Flush and Stop.
+    // No sink I/O, formatting, or completion wait holds this lock.
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (stopping_) return false;
+    if (completion_.size() >= capacity_) {
+      Drop();
+      return false;
+    }
+    record.sequence = accepted_;
+    record.dropped_messages = unreported_drops_;
+    try {
+      completion_.push_back(false);
+    } catch (...) {
+      Drop();
+      return false;
+    }
+    bool enqueued = false;
+    try {
+      enqueued = queue_.enqueue(std::move(record));
+    } catch (...) {
+    }
+    if (!enqueued) {
+      completion_.pop_back();  // No ticket was accepted: no permanent hole.
+      Drop();
+      return false;
+    }
+    unreported_drops_ = 0;
+    ++accepted_;
+    ++queued_;
+    work_.notify_one();
+    return true;
+  }
+  bool Flush() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    if (stopping_) return false;
+    std::shared_ptr<FlushRequest> request =
+        std::make_shared<FlushRequest>(FlushRequest{accepted_});
+    requests_.push_back(request);
+    work_.notify_one();
+    progress_.wait(lock, [&] { return request->done || failed_; });
+    return request->done;
+  }
+  void Stop() {
+    // Serializes join, so even concurrent Stop calls wait for full shutdown.
+    std::lock_guard<std::mutex> join_lock(stop_mutex_);
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      stopping_ = true;
+      work_.notify_one();
+    }
+    if (timer_) timer_->Stop();
+    if (writer_.joinable()) writer_.join();
+  }
+  std::size_t queued_count() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return queued_;
+  }
+  std::uint64_t dropped_count() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return dropped_;
+  }
 
  private:
-  bool ReserveQueueSlot();
-  void WriterLoop();
+  void Drop() {
+    ++dropped_;
+    ++unreported_drops_;
+  }
+  // Called by writer between records, never while holding the admission lock.
+  bool ServiceFlushes() {
+    for (;;) {
+      std::shared_ptr<FlushRequest> request;
+      bool final_flush = false;
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!requests_.empty() && requests_.front()->target <= completed_) {
+          request = requests_.front();
+          requests_.pop_front();
+        } else if (periodic_target_ && *periodic_target_ <= completed_) {
+          periodic_target_.reset();
+        } else if (stopping_ && completed_ == accepted_) {
+          final_flush = true;
+        } else {
+          return false;
+        }
+      }
+      sink_->Flush();
+      if (request) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        request->done = true;
+        progress_.notify_all();
+      }
+      if (final_flush) return true;
+    }
+  }
+  void WriterLoop() {
+    try {
+      std::array<LogRecord, kWriterBatchSize> records{};
+      for (;;) {
+        if (ServiceFlushes()) return;
+        std::size_t count;
+        {
+          std::unique_lock<std::mutex> lock(mutex_);
+          work_.wait(lock, [&] {
+            return queued_ != 0 || stopping_ ||
+                   (!requests_.empty() &&
+                    requests_.front()->target <= completed_) ||
+                   (periodic_target_ && *periodic_target_ <= completed_);
+          });
+          count = queue_.try_dequeue_bulk(consumer_, records.data(),
+                                          records.size());
+        }
+        for (std::size_t i = 0; i < count; ++i) {
+          LogRecord& record = records[i];
+          sink_->Write(record);
+          if (flush_each_record_ || record.level >= LogLevel::kWarn)
+            sink_->Flush();
+          {
+            std::lock_guard<std::mutex> lock(mutex_);
+            --queued_;
+            // A high sequence alone is insufficient: preserve every hole.
+            completion_[static_cast<std::size_t>(record.sequence -
+                                                 completed_)] = true;
+            while (!completion_.empty() && completion_.front()) {
+              completion_.pop_front();
+              ++completed_;
+            }
+          }
+          if (ServiceFlushes()) return;
+        }
+      }
+    } catch (...) {
+      // Sink failures must wake Flush callers instead of hanging forever.
+      std::lock_guard<std::mutex> lock(mutex_);
+      failed_ = true;
+      stopping_ = true;
+      progress_.notify_all();
+    }
+  }
 
   std::string logger_name_;
-  std::atomic<LogLevel> minimum_level_;
-  const std::size_t queue_capacity_;
+  const LogLevel minimum_level_;
+  const std::size_t capacity_;
   const bool flush_each_record_;
-  moodycamel::BlockingConcurrentQueue<WorkItem> queue_;
-  moodycamel::ProducerToken control_token_;
+  moodycamel::ConcurrentQueue<LogRecord> queue_;
   std::unique_ptr<LogSink> sink_;
-  moodycamel::ConsumerToken consumer_token_;
-  std::atomic<std::size_t> queued_count_{0};
-  std::atomic<std::uint64_t> dropped_count_{0};
-  std::atomic<std::uint64_t> unreported_drop_count_{0};
-  std::atomic<std::uint64_t> next_sequence_{0};
-  std::atomic<bool> stopping_{false};
-  std::uint64_t next_flush_id_ = 1;
-  std::uint64_t completed_flush_id_ = 0;
-  std::mutex lifecycle_mutex_;
-  std::mutex flush_mutex_;
-  std::condition_variable flush_condition_;
+  moodycamel::ConsumerToken consumer_;
+  mutable std::mutex mutex_;
+  std::condition_variable work_;
+  std::condition_variable progress_;
+  std::deque<bool> completion_;
+  std::deque<std::shared_ptr<FlushRequest>> requests_;
+  std::optional<std::uint64_t> periodic_target_;
+  std::uint64_t accepted_ = 0;
+  std::uint64_t completed_ = 0;
+  std::size_t queued_ = 0;
+  std::uint64_t dropped_ = 0;
+  std::uint64_t unreported_drops_ = 0;
+  bool stopping_ = false;
+  bool failed_ = false;
+  std::mutex stop_mutex_;
+  std::unique_ptr<TimerScheduler> timer_;
   std::thread writer_;
 };
-
-Logger::Impl::Impl(LoggerOptions options, std::unique_ptr<LogSink> sink)
-    : logger_name_(std::move(options.name)),
-      minimum_level_(options.minimum_level),
-      queue_capacity_(options.queue_capacity),
-      flush_each_record_(options.flush_each_record),
-      queue_(options.queue_capacity),
-      control_token_(queue_),
-      sink_(std::move(sink)),
-      consumer_token_(queue_) {
-  writer_ = std::thread([this] { WriterLoop(); });
-}
-
-Logger::Impl::~Impl() { Stop(); }
-
-bool Logger::Impl::IsEnabled(LogLevel level) const {
-  return IsValidLevel(level) &&
-         level >= minimum_level_.load(std::memory_order_relaxed);
-}
-
-bool Logger::Impl::Log(LogLevel level, std::string_view message,
-                       std::source_location source) {
-  return LogOwned(level, std::string(message), source);
-}
-
-bool Logger::Impl::LogOwned(LogLevel level, std::string message,
-                            std::source_location source) {
-  if (!IsEnabled(level) || stopping_.load(std::memory_order_acquire) ||
-      !ReserveQueueSlot()) {
-    return false;
-  }
-
-  std::uint64_t dropped_messages =
-      unreported_drop_count_.exchange(0, std::memory_order_acq_rel);
-  LogRecord record{
-      .timestamp = std::chrono::system_clock::now(),
-      .level = level,
-      .sequence = next_sequence_.fetch_add(1, std::memory_order_relaxed),
-      .thread_id = CurrentThreadId(),
-      .dropped_messages = dropped_messages,
-      .source = source,
-      .logger_name = logger_name_,
-      .message = std::move(message),
-  };
-  WorkItem item{
-      .kind = WorkItemKind::kMessage,
-      .record = std::move(record),
-      .flush_id = 0,
-  };
-  if (!queue_.enqueue(std::move(item))) {
-    queued_count_.fetch_sub(1, std::memory_order_release);
-    return false;
-  }
-  return true;
-}
-
-bool Logger::Impl::Flush() {
-  std::uint64_t flush_id = 0;
-  {
-    std::lock_guard<std::mutex> lock(lifecycle_mutex_);
-    if (stopping_.load(std::memory_order_acquire)) {
-      return false;
-    }
-
-    flush_id = next_flush_id_++;
-    if (!queue_.enqueue(control_token_, WorkItem{
-                                            .kind = WorkItemKind::kFlush,
-                                            .record = LogRecord{},
-                                            .flush_id = flush_id,
-                                        })) {
-      return false;
-    }
-  }
-
-  std::unique_lock<std::mutex> lock(flush_mutex_);
-  flush_condition_.wait(
-      lock, [this, flush_id] { return completed_flush_id_ >= flush_id; });
-  return true;
-}
-
-void Logger::Impl::Stop() {
-  {
-    std::lock_guard<std::mutex> lock(lifecycle_mutex_);
-    if (stopping_.exchange(true, std::memory_order_acq_rel)) {
-      return;
-    }
-    queue_.enqueue(control_token_, WorkItem{
-                                       .kind = WorkItemKind::kStop,
-                                       .record = LogRecord{},
-                                       .flush_id = 0,
-                                   });
-  }
-  if (writer_.joinable()) {
-    writer_.join();
-  }
-}
-
-std::size_t Logger::Impl::queued_count() const {
-  return queued_count_.load(std::memory_order_acquire);
-}
-
-std::uint64_t Logger::Impl::dropped_count() const {
-  return dropped_count_.load(std::memory_order_acquire);
-}
-
-bool Logger::Impl::ReserveQueueSlot() {
-  std::size_t current = queued_count_.load(std::memory_order_relaxed);
-  while (current < queue_capacity_) {
-    if (queued_count_.compare_exchange_weak(current, current + 1,
-                                            std::memory_order_acq_rel,
-                                            std::memory_order_relaxed)) {
-      return true;
-    }
-  }
-
-  dropped_count_.fetch_add(1, std::memory_order_relaxed);
-  unreported_drop_count_.fetch_add(1, std::memory_order_relaxed);
-  return false;
-}
-
-void Logger::Impl::WriterLoop() {
-  std::array<WorkItem, kWriterBatchSize> items{};
-  while (true) {
-    std::size_t count =
-        queue_.wait_dequeue_bulk(consumer_token_, items.data(), items.size());
-    for (std::size_t i = 0; i < count; ++i) {
-      WorkItem& item = items[i];
-      if (item.kind == WorkItemKind::kStop) {
-        sink_->Flush();
-        return;
-      }
-      if (item.kind == WorkItemKind::kFlush) {
-        sink_->Flush();
-        {
-          std::lock_guard<std::mutex> lock(flush_mutex_);
-          completed_flush_id_ = item.flush_id;
-        }
-        flush_condition_.notify_all();
-        continue;
-      }
-
-      queued_count_.fetch_sub(1, std::memory_order_acq_rel);
-      sink_->Write(item.record);
-      if (flush_each_record_ || item.record.level >= LogLevel::kWarn) {
-        sink_->Flush();
-      }
-    }
-  }
-}
 
 std::unique_ptr<Logger> Logger::Create(LoggerOptions options,
                                        std::unique_ptr<LogSink> sink) {
   if (options.name.empty() || options.queue_capacity == 0 || !sink ||
-      !IsValidLevel(options.minimum_level)) {
+      !IsValidLevel(options.minimum_level) ||
+      options.flush_interval.count() < 0) {
     return nullptr;
   }
 

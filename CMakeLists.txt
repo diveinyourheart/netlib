@@ -65,6 +65,15 @@ target_include_directories(
     $<INSTALL_INTERFACE:include>)
 target_link_libraries(netlib PUBLIC Threads::Threads netlib::platform)
 
+add_library(netlib_timer STATIC src/timer.cc)
+add_library(netlib::timer ALIAS netlib_timer)
+target_compile_features(netlib_timer PUBLIC cxx_std_20)
+target_include_directories(netlib_timer PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>)
+target_link_libraries(netlib_timer PUBLIC Threads::Threads)
+netlib_warnings(netlib_timer)
+
 add_library(netlib_log STATIC src/log/logging.cc)
 add_library(netlib::log ALIAS netlib_log)
 
@@ -93,7 +102,7 @@ if(MSVC)
   # Public logging macros use C++20 __VA_OPT__, including in consumer code.
   target_compile_options(netlib_log PUBLIC /Zc:preprocessor /utf-8)
 endif()
-target_link_libraries(netlib_log PUBLIC Threads::Threads)
+target_link_libraries(netlib_log PUBLIC Threads::Threads netlib::timer)
 
 target_link_libraries(netlib PUBLIC netlib_log)
 
@@ -103,6 +112,10 @@ target_link_libraries(netlib_log_example PRIVATE netlib::log)
 include(CTest)
 
 if(BUILD_TESTING)
+  add_executable(netlib_timer_test tests/timer_test.cc)
+  target_link_libraries(netlib_timer_test PRIVATE netlib::timer)
+  add_test(NAME netlib_timer_test COMMAND netlib_timer_test)
+  set_tests_properties(netlib_timer_test PROPERTIES TIMEOUT 30)
   add_executable(netlib_platform_test tests/platform_test.cc)
   target_link_libraries(netlib_platform_test PRIVATE netlib::netlib)
   add_test(NAME netlib_platform_test COMMAND netlib_platform_test)
@@ -113,6 +126,10 @@ if(BUILD_TESTING)
   add_executable(netlib_log_test tests/log_test.cc)
   target_link_libraries(netlib_log_test PRIVATE netlib::log)
   add_test(NAME netlib_log_test COMMAND netlib_log_test)
+  add_executable(netlib_log_barrier_test tests/log_barrier_test.cc)
+  target_link_libraries(netlib_log_barrier_test PRIVATE netlib::log)
+  add_test(NAME netlib_log_barrier_test COMMAND netlib_log_barrier_test)
+  set_tests_properties(netlib_log_barrier_test PROPERTIES TIMEOUT 30)
 
   add_executable(netlib_codec_test tests/codec_test.cc)
   target_link_libraries(netlib_codec_test PRIVATE netlib::netlib)
