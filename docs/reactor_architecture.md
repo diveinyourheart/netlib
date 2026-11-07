@@ -27,9 +27,11 @@ complete Frame
   -> FrameMessage (owned payload)
   -> moodycamel MPMC queue
   -> ThreadPool workers
+  -> per-request timeout deadline
 
 worker response
   -> ConnectionHandle
+  -> cancel matching timeout
   -> SubReactor response queue
   -> per-connection sequence reorder buffer
   -> codec encode
@@ -197,6 +199,27 @@ connection's `ProtocolCodec`, and appends them to the output buffer. It writes
 nonblocking until `EAGAIN`; only then does the Channel add `EPOLLOUT`. Once the
 buffer drains, write interest is removed. `close_after_write` closes the
 connection only after all queued output is flushed.
+
+After a frame is accepted by the Worker pool, SubReactor schedules a one-shot
+deadline using its `TimerScheduler`. The default is ten minutes and is
+configurable through `SubReactorOptions::request_timeout`. The scheduler thread
+only posts a control event back through the SubReactor wakeup. It never touches
+Codec, Channel, or connection state directly.
+
+An accepted Worker response removes and cancels its sequence's timer. A timeout
+is inserted into the same per-connection sequence reorder path as a normal
+response and always carries close-after-write. This makes timeout delivery
+ordered with an HTTP pipeline and makes timeout-versus-business-response races
+resolve through one owner thread. Timeout control events may temporarily exceed
+the ordinary response queue capacity; they are bounded by the per-connection
+in-flight request limit instead of being dropped when business responses fill
+the queue.
+
+`ProtocolCodec::CreateTimeoutResponse()` owns the protocol representation.
+HTTP creates `504 Gateway Timeout` with a text body and `Connection: close`.
+Length-prefixed framing has no portable error envelope, so it returns nullopt
+and SubReactor closes without inventing application data. A custom protocol can
+return its own error frame when its client contract defines one.
 
 Producers must stop before `ThreadPool::Stop()`. Stop enqueues one sentinel per
 Worker, waits for earlier messages to drain, and joins all Worker threads.

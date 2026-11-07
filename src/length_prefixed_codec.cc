@@ -1,6 +1,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
 #include <variant>
 #include <vector>
@@ -81,6 +82,12 @@ class LengthPrefixedCodec final : public ProtocolCodec {
 
   bool ShouldCloseAfterWrite(const ApplicationResponse&) const override {
     return false;
+  }
+
+  std::optional<ApplicationResponse> CreateTimeoutResponse() const override {
+    // Length-prefix framing has no portable error envelope. Closing without
+    // inventing a payload lets the application protocol report transport I/O.
+    return std::nullopt;
   }
 
   std::size_t MaxDecodeBufferSize() const override {

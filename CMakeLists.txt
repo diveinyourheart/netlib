@@ -63,7 +63,7 @@ target_include_directories(
   PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>)
-target_link_libraries(netlib PUBLIC Threads::Threads netlib::platform)
+target_link_libraries(netlib PUBLIC Threads::Threads netlib::platform netlib::timer)
 
 add_library(netlib_timer STATIC src/timer.cc)
 add_library(netlib::timer ALIAS netlib_timer)

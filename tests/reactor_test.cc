@@ -471,6 +471,56 @@ int RunLateResponseTest() {
   return success ? 0 : 1;
 }
 
+int RunRequestTimeoutTest() {
+  Observation observation;
+  std::unique_ptr<netlib::ThreadPool> worker_pool = CreateDroppingThreadPool();
+  if (!worker_pool) {
+    ReportFailure("failed to create timeout ThreadPool");
+    return 1;
+  }
+  netlib::SubReactorOptions sub_options{
+      .max_pending_connections = 8,
+      .max_pending_responses = 8,
+      .max_pending_output_bytes = 64 * 1024,
+      .request_timeout = std::chrono::milliseconds(100),
+  };
+  std::unique_ptr<netlib::SubReactor> sub_reactor = netlib::SubReactor::Create(
+      sub_options, *worker_pool, MakeConnectionCallbacks(observation));
+  if (!sub_reactor) {
+    ReportFailure("failed to create timeout SubReactor");
+    return 1;
+  }
+  std::unique_ptr<netlib::MainReactor> main_reactor =
+      netlib::MainReactor::Create(0, {sub_reactor.get()});
+  if (!main_reactor) {
+    ReportFailure("failed to create timeout MainReactor");
+    return 1;
+  }
+
+  std::thread sub_thread([&sub_reactor] { sub_reactor->Run(); });
+  std::thread main_thread([&main_reactor] { main_reactor->Run(); });
+
+  bool success = true;
+  netlib::UniqueFd client;
+  if (!ConnectTo(main_reactor->port(), &client) ||
+      !SendAll(client.get(), MakeFrame("no-response"))) {
+    ReportFailure("failed to send request for timeout test");
+    success = false;
+  }
+  if (success && !WaitForClosed(observation)) {
+    ReportFailure("timed-out binary connection did not close");
+    success = false;
+  }
+
+  client.Reset();
+  main_reactor->Stop();
+  sub_reactor->Stop();
+  main_thread.join();
+  sub_thread.join();
+  worker_pool->Stop();
+  return success ? 0 : 1;
+}
+
 int RunReactorTest() {
   Observation first_observation;
   Observation second_observation;
@@ -703,6 +753,10 @@ int main() {
   int late_response_result = RunLateResponseTest();
   if (late_response_result != 0) {
     return late_response_result;
+  }
+  int timeout_result = RunRequestTimeoutTest();
+  if (timeout_result != 0) {
+    return timeout_result;
   }
   return RunReactorTest();
 }

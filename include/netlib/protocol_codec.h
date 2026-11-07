@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -49,6 +50,9 @@ class ProtocolCodec {
                       std::vector<char>* output) = 0;
   virtual bool ShouldCloseAfterWrite(
       const ApplicationResponse& response) const = 0;
+  // Returns a protocol-valid timeout response, or nullopt when the protocol
+  // cannot represent one safely. SubReactor closes the connection afterward.
+  virtual std::optional<ApplicationResponse> CreateTimeoutResponse() const = 0;
   // Maximum unconsumed bytes allowed while assembling one decoded frame.
   virtual std::size_t MaxDecodeBufferSize() const = 0;
 };

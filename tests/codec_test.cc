@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -107,6 +108,11 @@ class TestHttpLikeCodec final : public netlib::ProtocolCodec {
   bool ShouldCloseAfterWrite(
       const netlib::ApplicationResponse&) const override {
     return false;
+  }
+
+  std::optional<netlib::ApplicationResponse> CreateTimeoutResponse()
+      const override {
+    return std::nullopt;
   }
 
   std::size_t MaxDecodeBufferSize() const override { return 256; }

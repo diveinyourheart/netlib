@@ -41,8 +41,10 @@ TCP bytes
   -> FrameMessage（拥有 payload）
   -> moodycamel BlockingConcurrentQueue
   -> ThreadPool Worker
+  -> 每请求 timeout deadline
   -> 业务 Handler
   -> ConnectionHandle::Respond
+  -> 取消对应 deadline
   -> SubReactor response queue + Wakeup
   -> per-connection sequence reorder buffer
   -> ProtocolCodec::Encode
@@ -79,6 +81,7 @@ netlib::SubReactorOptions sub_options{
     .max_pending_connections = 1024,
     .max_pending_responses = 4096,
     .max_pending_output_bytes = 16 * 1024 * 1024,
+    .request_timeout = std::chrono::minutes(10),
 };
 
 auto sub = netlib::SubReactor::Create(
@@ -100,6 +103,17 @@ SubReactor 会按每条连接的 `max_pending_responses` 限制乱序缓存；�
 `SubReactorOptions` 分别控制待注册连接数、待处理响应数和单连接输出积压字节数。
 Codec 通过 `MaxDecodeBufferSize()` 描述输入分帧缓冲上限，单次响应 payload
 限制由 `Encode()` 自己执行。输出积压策略不再隐式绑定到 Codec 的输入缓冲上限。
+
+Frame 成功提交给 Worker 后，SubReactor 为该 sequence 注册独立的
+`request_timeout`，默认 10 分钟。Worker 响应被接受后立即取消对应 timer。
+超时事件只唤醒 SubReactor，由 SubReactor 线程完成协议编码、响应排序和连接
+关闭，业务线程不会直接操作连接。`max_pending_responses` 同时限制每条连接
+尚未完成响应处理的请求数，避免超时 timer 和乱序响应无界增长。
+
+超时响应由 `ProtocolCodec::CreateTimeoutResponse()` 定义。HTTP Codec 返回
+`504 Gateway Timeout`、文本 body 和 `Connection: close`；长度前缀 Codec 没有
+通用错误 envelope，因此不伪造 payload，而是记录日志后直接关闭连接。其他协议
+可以实现自己的超时帧，并声明 close-after-write 语义。
 
 `DecodeResult::required_bytes` 是下一次解析推进所需的总未消费字节数。长度前缀
 Codec 在读取 4 字节长度头时返回 4，解析出 payload 长度后返回完整帧大小。
