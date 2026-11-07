@@ -1,8 +1,5 @@
 #include "netlib/main_reactor.h"
 
-#include <arpa/inet.h>
-#include <sys/socket.h>
-
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
@@ -18,8 +15,6 @@
 namespace netlib {
 namespace {
 
-constexpr int kListenBacklog = 256;
-
 struct ListenSocket {
   UniqueFd socket;
   uint16_t port = 0;
@@ -27,58 +22,10 @@ struct ListenSocket {
 
 ListenSocket CreateListenSocket(uint16_t requested_port, log::Logger* logger) {
   ListenSocket result;
-  result.socket.Reset(
-      socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0));
-  if (!result.socket) {
-    if (logger != nullptr) {
-      NETLIB_LOG_ERROR(*logger, "listen socket creation failed: {}",
-                       std::strerror(errno));
-    }
-    return result;
+  result.socket.Reset(platform::ListenTcp(requested_port, result.port));
+  if (!result.socket && logger != nullptr) {
+    NETLIB_LOG_ERROR(*logger, "listen failed: {}", platform::ErrorMessage());
   }
-
-  int reuse_address = 1;
-  if (setsockopt(result.socket.get(), SOL_SOCKET, SO_REUSEADDR, &reuse_address,
-                 sizeof(reuse_address)) != 0) {
-    if (logger != nullptr) {
-      NETLIB_LOG_ERROR(*logger, "SO_REUSEADDR failed: {}",
-                       std::strerror(errno));
-    }
-    result.socket.Reset();
-    return result;
-  }
-
-  sockaddr_in address{};
-  address.sin_family = AF_INET;
-  address.sin_addr.s_addr = htonl(INADDR_ANY);
-  address.sin_port = htons(requested_port);
-  if (bind(result.socket.get(), reinterpret_cast<const sockaddr*>(&address),
-           sizeof(address)) != 0) {
-    if (logger != nullptr) {
-      NETLIB_LOG_ERROR(*logger, "listen socket bind failed for port={}: {}",
-                       requested_port, std::strerror(errno));
-    }
-    result.socket.Reset();
-    return result;
-  }
-  if (listen(result.socket.get(), kListenBacklog) != 0) {
-    if (logger != nullptr) {
-      NETLIB_LOG_ERROR(*logger, "listen failed: {}", std::strerror(errno));
-    }
-    result.socket.Reset();
-    return result;
-  }
-
-  socklen_t address_length = sizeof(address);
-  if (getsockname(result.socket.get(), reinterpret_cast<sockaddr*>(&address),
-                  &address_length) != 0) {
-    if (logger != nullptr) {
-      NETLIB_LOG_ERROR(*logger, "getsockname failed: {}", std::strerror(errno));
-    }
-    result.socket.Reset();
-    return result;
-  }
-  result.port = ntohs(address.sin_port);
   return result;
 }
 
@@ -158,7 +105,7 @@ void MainReactor::Stop() {
 uint16_t MainReactor::port() const { return port_; }
 
 void MainReactor::DispatchConnection(UniqueFd& connection) {
-  int fd = connection.get();
+  SocketHandle fd = connection.get();
   for (std::size_t attempt = 0; attempt < sub_reactors_.size(); ++attempt) {
     std::size_t index = next_sub_reactor_;
     next_sub_reactor_ = (next_sub_reactor_ + 1) % sub_reactors_.size();
@@ -178,9 +125,8 @@ void MainReactor::DispatchConnection(UniqueFd& connection) {
 
 void MainReactor::HandleReadable() {
   while (true) {
-    int connection_fd = accept4(listen_fd_.get(), nullptr, nullptr,
-                                SOCK_NONBLOCK | SOCK_CLOEXEC);
-    if (connection_fd >= 0) {
+    SocketHandle connection_fd = platform::Accept(listen_fd_.get());
+    if (connection_fd != kInvalidSocket) {
       UniqueFd connection(connection_fd);
       if (logger_ != nullptr) {
         NETLIB_LOG_DEBUG(*logger_, "accepted fd={}", connection_fd);
@@ -188,22 +134,22 @@ void MainReactor::HandleReadable() {
       DispatchConnection(connection);
       continue;
     }
-    if (errno == EINTR) {
+    if (platform::Interrupted(platform::LastError())) {
       continue;
     }
-    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+    if (platform::WouldBlock(platform::LastError())) {
       return;
     }
-    if (errno == ECONNABORTED || errno == EPROTO) {
+    if (platform::TransientAcceptError(platform::LastError())) {
       if (logger_ != nullptr) {
         NETLIB_LOG_WARN(*logger_, "transient accept error: {}",
-                        std::strerror(errno));
+                        platform::ErrorMessage());
       }
       continue;
     }
     if (logger_ != nullptr) {
       NETLIB_LOG_ERROR(*logger_, "fatal accept error: {}",
-                       std::strerror(errno));
+                       platform::ErrorMessage());
     }
     event_loop_->Stop();
     return;

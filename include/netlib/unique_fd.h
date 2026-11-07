@@ -1,13 +1,16 @@
 #ifndef NETLIB_INCLUDE_NETLIB_UNIQUE_FD_H_
 #define NETLIB_INCLUDE_NETLIB_UNIQUE_FD_H_
 
+#include "netlib/platform.h"
+
 namespace netlib {
 
-// Owns one POSIX file descriptor and closes it exactly once.
+// Owns one native socket (or POSIX descriptor on Linux) and closes it exactly
+// once.
 class UniqueFd {
  public:
   UniqueFd() noexcept = default;
-  explicit UniqueFd(int fd) noexcept;
+  explicit UniqueFd(SocketHandle fd) noexcept;
   ~UniqueFd();
 
   UniqueFd(const UniqueFd&) = delete;
@@ -15,13 +18,13 @@ class UniqueFd {
   UniqueFd(UniqueFd&& other) noexcept;
   UniqueFd& operator=(UniqueFd&& other) noexcept;
 
-  int get() const noexcept;
+  SocketHandle get() const noexcept;
   explicit operator bool() const noexcept;
-  int Release() noexcept;
-  void Reset(int fd = -1) noexcept;
+  SocketHandle Release() noexcept;
+  void Reset(SocketHandle fd = kInvalidSocket) noexcept;
 
  private:
-  int fd_ = -1;
+  SocketHandle fd_ = kInvalidSocket;
 };
 
 }  // namespace netlib

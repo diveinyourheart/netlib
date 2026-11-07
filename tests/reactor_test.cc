@@ -1,7 +1,3 @@
-#include <arpa/inet.h>
-#include <sys/socket.h>
-#include <unistd.h>
-
 #include <array>
 #include <atomic>
 #include <cerrno>
@@ -21,6 +17,7 @@
 #include "netlib/frame_protocol.h"
 #include "netlib/log/logging.h"
 #include "netlib/main_reactor.h"
+#include "netlib/platform.h"
 #include "netlib/sub_reactor.h"
 #include "netlib/thread_pool.h"
 #include "netlib/unique_fd.h"
@@ -59,35 +56,24 @@ void ReportFailure(const char* message) {
 }
 
 bool ConnectTo(uint16_t port, netlib::UniqueFd* connection) {
-  sockaddr_in address{};
-  address.sin_family = AF_INET;
-  address.sin_port = htons(port);
-  address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-
-  connection->Reset(socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0));
-  if (!*connection) {
-    return false;
-  }
-  timeval receive_timeout{};
-  receive_timeout.tv_sec = 2;
-  setsockopt(connection->get(), SOL_SOCKET, SO_RCVTIMEO, &receive_timeout,
-             sizeof(receive_timeout));
-  int receive_buffer_size = 8 * 1024;
-  setsockopt(connection->get(), SOL_SOCKET, SO_RCVBUF, &receive_buffer_size,
-             sizeof(receive_buffer_size));
-  return connect(connection->get(), reinterpret_cast<const sockaddr*>(&address),
-                 sizeof(address)) == 0;
+  connection->Reset(netlib::platform::CreateTcpSocket(false));
+  return *connection &&
+         netlib::platform::SetReceiveTimeout(connection->get(), 2000) &&
+         netlib::platform::SetReceiveBuffer(connection->get(), 8 * 1024) &&
+         netlib::platform::ConnectLoopback(connection->get(), port);
 }
 
-bool SendAll(int fd, std::string_view data) {
+bool SendAll(netlib::SocketHandle fd, std::string_view data) {
   std::size_t sent = 0;
   while (sent < data.size()) {
-    ssize_t result = send(fd, data.data() + sent, data.size() - sent, 0);
+    std::ptrdiff_t result =
+        netlib::platform::Send(fd, data.data() + sent, data.size() - sent);
     if (result > 0) {
       sent += static_cast<std::size_t>(result);
       continue;
     }
-    if (result < 0 && errno == EINTR) {
+    if (result < 0 &&
+        netlib::platform::Interrupted(netlib::platform::LastError())) {
       continue;
     }
     return false;
@@ -95,15 +81,17 @@ bool SendAll(int fd, std::string_view data) {
   return true;
 }
 
-bool ReceiveAll(int fd, char* data, std::size_t size) {
+bool ReceiveAll(netlib::SocketHandle fd, char* data, std::size_t size) {
   std::size_t received = 0;
   while (received < size) {
-    ssize_t result = recv(fd, data + received, size - received, 0);
+    std::ptrdiff_t result =
+        netlib::platform::Receive(fd, data + received, size - received);
     if (result > 0) {
       received += static_cast<std::size_t>(result);
       continue;
     }
-    if (result < 0 && errno == EINTR) {
+    if (result < 0 &&
+        netlib::platform::Interrupted(netlib::platform::LastError())) {
       continue;
     }
     return false;
@@ -111,7 +99,7 @@ bool ReceiveAll(int fd, char* data, std::size_t size) {
   return true;
 }
 
-bool ReadFrame(int fd, std::string* payload) {
+bool ReadFrame(netlib::SocketHandle fd, std::string* payload) {
   std::array<char, netlib::kFrameLengthPrefixSize> header{};
   if (!ReceiveAll(fd, header.data(), header.size())) {
     return false;
@@ -152,12 +140,12 @@ std::string MakeFrame(std::string_view payload) {
 netlib::SubReactor::ConnectionCallbacks MakeConnectionCallbacks(
     Observation& observation) {
   netlib::SubReactor::ConnectionCallbacks callbacks;
-  callbacks.on_connected = [&observation](int) {
+  callbacks.on_connected = [&observation](netlib::SocketHandle) {
     std::lock_guard<std::mutex> lock(observation.mutex);
     observation.connected = true;
     observation.condition.notify_all();
   };
-  callbacks.on_closed = [&observation](int) {
+  callbacks.on_closed = [&observation](netlib::SocketHandle) {
     std::lock_guard<std::mutex> lock(observation.mutex);
     observation.closed = true;
     observation.condition.notify_all();
@@ -207,8 +195,8 @@ int RunPendingCapacityTest() {
     return 1;
   }
 
-  netlib::UniqueFd first(dup(STDIN_FILENO));
-  netlib::UniqueFd second(dup(STDIN_FILENO));
+  netlib::UniqueFd first(netlib::platform::CreateTcpSocket());
+  netlib::UniqueFd second(netlib::platform::CreateTcpSocket());
   if (!first || !second || !sub_reactor->AdoptConnection(first) || first ||
       sub_reactor->AdoptConnection(second) || !second) {
     ReportFailure("pending queue capacity was not enforced");
@@ -270,7 +258,7 @@ int RunFullSubReactorFallbackTest() {
     return 1;
   }
 
-  netlib::UniqueFd queued_connection(dup(STDIN_FILENO));
+  netlib::UniqueFd queued_connection(netlib::platform::CreateTcpSocket());
   if (!queued_connection ||
       !first_sub_reactor->AdoptConnection(queued_connection)) {
     ReportFailure("failed to fill first SubReactor queue");
@@ -309,7 +297,7 @@ int RunFullSubReactorFallbackTest() {
   }
 
   if (client) {
-    shutdown(client.get(), SHUT_WR);
+    netlib::platform::ShutdownWrite(client.get());
     client.Reset();
   }
   if (success && !WaitForClosed(second_observation)) {
@@ -664,11 +652,11 @@ int RunReactorTest() {
   }
 
   if (first_connection) {
-    shutdown(first_connection.get(), SHUT_WR);
+    netlib::platform::ShutdownWrite(first_connection.get());
     first_connection.Reset();
   }
   if (second_connection) {
-    shutdown(second_connection.get(), SHUT_WR);
+    netlib::platform::ShutdownWrite(second_connection.get());
     second_connection.Reset();
   }
   if (success && (!WaitForClosed(first_observation) ||

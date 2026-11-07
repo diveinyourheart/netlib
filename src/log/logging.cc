@@ -1,7 +1,12 @@
 #include "netlib/log/logging.h"
 
+#ifdef _WIN32
+#include <io.h>
+#include <windows.h>
+#else
 #include <sys/syscall.h>
 #include <unistd.h>
+#endif
 
 #include <array>
 #include <atomic>
@@ -80,11 +85,15 @@ bool IsValidLevel(LogLevel level) {
 }
 
 std::uint64_t CurrentThreadId() {
+#ifdef _WIN32
+  return static_cast<std::uint64_t>(GetCurrentThreadId());
+#else
   return static_cast<std::uint64_t>(static_cast<long>(syscall(SYS_gettid)));
+#endif
 }
 
 std::string_view BaseName(std::string_view path) {
-  std::size_t slash = path.find_last_of('/');
+  std::size_t slash = path.find_last_of("/\\");
   if (slash == std::string_view::npos) {
     return path;
   }
@@ -107,7 +116,11 @@ std::string FormatTimestamp(std::chrono::system_clock::time_point timestamp) {
 
   std::time_t raw_time = std::chrono::system_clock::to_time_t(seconds_time);
   std::tm local_time{};
+#ifdef _WIN32
+  if (localtime_s(&local_time, &raw_time) != 0) {
+#else
   if (localtime_r(&raw_time, &local_time) == nullptr) {
+#endif
     return "0000-00-00 00:00:00.000";
   }
 
@@ -170,11 +183,23 @@ std::string MakePrefix(const LogRecord& record, bool color) {
   return prefix;
 }
 
+bool IsTerminal(std::FILE* output) {
+#ifdef _WIN32
+  if (_isatty(_fileno(output)) == 0) return false;
+  HANDLE handle = reinterpret_cast<HANDLE>(_get_osfhandle(_fileno(output)));
+  DWORD mode = 0;
+  return GetConsoleMode(handle, &mode) &&
+         SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+#else
+  return isatty(fileno(output)) != 0;
+#endif
+}
+
 class StdoutSink final : public LogSink {
  public:
   StdoutSink(ColorMode color_mode, std::FILE* output) : output_(output) {
     color_ = color_mode == ColorMode::kAlways ||
-             (color_mode == ColorMode::kAuto && isatty(fileno(output_)) != 0);
+             (color_mode == ColorMode::kAuto && IsTerminal(output_));
   }
 
   void Write(const LogRecord& record) override {

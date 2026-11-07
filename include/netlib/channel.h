@@ -5,6 +5,8 @@
 #include <functional>
 #include <memory>
 
+#include "netlib/platform.h"
+
 namespace netlib {
 
 class EventLoop;
@@ -15,8 +17,8 @@ struct ChannelInterest {
   bool write = false;
 };
 
-// Callbacks run on the EventLoop thread. A Channel invokes at most one callback
-// for an epoll event, so a readable callback may safely close the connection.
+// Callbacks run on the EventLoop thread. EventLoop checks registration
+// before each callback; removal cancels remaining readiness flags.
 struct ChannelCallbacks {
   std::function<void()> on_readable;
   std::function<void()> on_writable;
@@ -27,7 +29,7 @@ struct ChannelCallbacks {
 // are non-owning dependencies and must both outlive the Channel.
 class Channel {
  public:
-  static std::unique_ptr<Channel> Create(EventLoop& loop, int fd,
+  static std::unique_ptr<Channel> Create(EventLoop& loop, SocketHandle fd,
                                          ChannelInterest interest,
                                          ChannelCallbacks callbacks);
 
@@ -38,18 +40,18 @@ class Channel {
   ~Channel();
 
   bool SetInterest(ChannelInterest interest);
-  int fd() const;
+  SocketHandle fd() const;
 
  private:
   friend class EventLoop;
 
-  Channel(EventLoop& loop, int fd, ChannelInterest interest,
+  Channel(EventLoop& loop, SocketHandle fd, ChannelInterest interest,
           ChannelCallbacks callbacks);
 
-  void Dispatch(uint32_t events);
+  std::uint64_t token_ = 0;
 
   EventLoop& loop_;
-  int fd_;
+  SocketHandle fd_;
   ChannelInterest interest_;
   ChannelCallbacks callbacks_;
   bool registered_ = false;

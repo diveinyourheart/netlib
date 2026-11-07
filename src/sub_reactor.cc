@@ -1,10 +1,5 @@
 #include "netlib/sub_reactor.h"
 
-#include <fcntl.h>
-#include <sys/eventfd.h>
-#include <sys/socket.h>
-#include <unistd.h>
-
 #include <algorithm>
 #include <atomic>
 #include <cassert>
@@ -40,36 +35,6 @@ std::uint64_t AllocateConnectionId() {
   return next_connection_id.fetch_add(1, std::memory_order_relaxed);
 }
 
-bool SetNonBlocking(int fd) {
-  int flags = fcntl(fd, F_GETFL, 0);
-  if (flags < 0) {
-    return false;
-  }
-  return fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0;
-}
-
-bool SetCloseOnExec(int fd) {
-  int flags = fcntl(fd, F_GETFD, 0);
-  if (flags < 0) {
-    return false;
-  }
-  return fcntl(fd, F_SETFD, flags | FD_CLOEXEC) == 0;
-}
-
-bool WakeEventFd(UniqueFd& wake_fd) {
-  uint64_t one = 1;
-  while (true) {
-    ssize_t result = write(wake_fd.get(), &one, sizeof(one));
-    if (result == sizeof(one)) {
-      return true;
-    }
-    if (result < 0 && errno == EINTR) {
-      continue;
-    }
-    return result < 0 && (errno == EAGAIN || errno == EWOULDBLOCK);
-  }
-}
-
 }  // namespace
 
 struct ResponseMessage {
@@ -81,7 +46,7 @@ struct ResponseMessage {
 
 class SubReactor::ResponseQueue {
  public:
-  ResponseQueue(std::size_t capacity, std::shared_ptr<UniqueFd> wake_fd)
+  ResponseQueue(std::size_t capacity, std::shared_ptr<platform::Wakeup> wake_fd)
       : capacity_(capacity),
         wake_fd_(std::move(wake_fd)),
         queue_(capacity),
@@ -125,10 +90,10 @@ class SubReactor::ResponseQueue {
     return false;
   }
 
-  bool Wake() { return wake_fd_ != nullptr && WakeEventFd(*wake_fd_); }
+  bool Wake() { return wake_fd_ != nullptr && wake_fd_->Notify(); }
 
   const std::size_t capacity_;
-  const std::shared_ptr<UniqueFd> wake_fd_;
+  const std::shared_ptr<platform::Wakeup> wake_fd_;
   moodycamel::ConcurrentQueue<ResponseMessage> queue_;
   moodycamel::ConsumerToken consumer_token_;
   std::atomic<std::size_t> queued_count_{0};
@@ -150,7 +115,7 @@ class SubReactor::Connection {
              std::size_t max_output_buffer_size,
              std::size_t max_pending_responses);
 
-  int fd() const;
+  SocketHandle fd() const;
   std::uint64_t connection_id() const;
   const ConnectionHandle& handle() const;
   ProtocolCodec& codec();
@@ -225,7 +190,7 @@ SubReactor::Connection::Connection(UniqueFd socket,
       max_output_buffer_size_(max_output_buffer_size),
       max_pending_responses_(max_pending_responses) {}
 
-int SubReactor::Connection::fd() const { return socket_.get(); }
+SocketHandle SubReactor::Connection::fd() const { return socket_.get(); }
 
 std::uint64_t SubReactor::Connection::connection_id() const {
   return connection_id_;
@@ -490,12 +455,11 @@ std::unique_ptr<SubReactor> SubReactor::Create(
     return nullptr;
   }
 
-  std::shared_ptr<UniqueFd> wake_fd =
-      std::make_shared<UniqueFd>(eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC));
-  if (!*wake_fd) {
+  std::shared_ptr<platform::Wakeup> wake_fd = platform::Wakeup::Create();
+  if (!wake_fd) {
     if (logger != nullptr) {
-      NETLIB_LOG_ERROR(*logger, "SubReactor eventfd failed: {}",
-                       std::strerror(errno));
+      NETLIB_LOG_ERROR(*logger, "SubReactor notification failed: {}",
+                       platform::ErrorMessage());
     }
     return nullptr;
   }
@@ -510,7 +474,7 @@ std::unique_ptr<SubReactor> SubReactor::Create(
       [reactor_pointer] { reactor_pointer->Stop(); },
   };
   reactor->wake_channel_ =
-      Channel::Create(*reactor->event_loop_, reactor->wake_fd_->get(),
+      Channel::Create(*reactor->event_loop_, reactor->wake_fd_->handle(),
                       ChannelInterest{.read = true}, std::move(wake_callbacks));
   if (!reactor->wake_channel_) {
     return nullptr;
@@ -527,7 +491,7 @@ std::unique_ptr<SubReactor> SubReactor::Create(
 }
 
 SubReactor::SubReactor(std::unique_ptr<EventLoop> event_loop,
-                       std::shared_ptr<UniqueFd> wake_fd,
+                       std::shared_ptr<platform::Wakeup> wake_fd,
                        SubReactorOptions options, ThreadPool& worker_pool,
                        ProtocolCodecFactory codec_factory,
                        ConnectionCallbacks callbacks, log::Logger* logger)
@@ -579,7 +543,7 @@ void SubReactor::Stop() {
 void SubReactor::HandleWake() {
   if (!DrainWake()) {
     if (logger_ != nullptr) {
-      NETLIB_LOG_ERROR(*logger_, "SubReactor wake eventfd drain failed");
+      NETLIB_LOG_ERROR(*logger_, "SubReactor wake notification drain failed");
     }
     Stop();
     return;
@@ -629,50 +593,32 @@ void SubReactor::HandleWake() {
   }
 }
 
-bool SubReactor::DrainWake() {
-  uint64_t value = 0;
-  while (true) {
-    ssize_t result = read(wake_fd_->get(), &value, sizeof(value));
-    if (result == sizeof(value)) {
-      continue;
-    }
-    if (result < 0 && errno == EINTR) {
-      continue;
-    }
-    if (result < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-      return true;
-    }
-    if (logger_ != nullptr) {
-      NETLIB_LOG_ERROR(*logger_, "SubReactor eventfd read failed: {}",
-                       std::strerror(errno));
-    }
-    return false;
-  }
-}
+bool SubReactor::DrainWake() { return wake_fd_->Drain(); }
 
 bool SubReactor::Wake() {
-  if (wake_fd_ != nullptr && WakeEventFd(*wake_fd_)) {
+  if (wake_fd_ != nullptr && wake_fd_->Notify()) {
     return true;
   }
   if (logger_ != nullptr) {
-    NETLIB_LOG_ERROR(*logger_, "SubReactor eventfd write failed");
+    NETLIB_LOG_ERROR(*logger_, "SubReactor notification write failed");
   }
   return false;
 }
 
 void SubReactor::RegisterConnection(UniqueFd connection) {
-  int fd = connection.get();
-  if (!SetNonBlocking(fd)) {
+  SocketHandle fd = connection.get();
+  if (!platform::SetNonBlocking(fd)) {
     if (logger_ != nullptr) {
-      NETLIB_LOG_ERROR(*logger_, "failed to set O_NONBLOCK for fd={}: {}", fd,
-                       std::strerror(errno));
+      NETLIB_LOG_ERROR(*logger_, "failed to set nonblocking mode for fd={}: {}",
+                       fd, platform::ErrorMessage());
     }
     return;
   }
-  if (!SetCloseOnExec(fd)) {
+  if (!platform::SetCloseOnExec(fd)) {
     if (logger_ != nullptr) {
-      NETLIB_LOG_ERROR(*logger_, "failed to set FD_CLOEXEC for fd={}: {}", fd,
-                       std::strerror(errno));
+      NETLIB_LOG_ERROR(*logger_,
+                       "failed to set non-inheritable mode for fd={}: {}", fd,
+                       platform::ErrorMessage());
     }
     return;
   }
@@ -750,7 +696,7 @@ void SubReactor::HandleReadable(std::uint64_t connection_id) {
   if (state.close_after_write()) {
     return;
   }
-  int fd = state.fd();
+  SocketHandle fd = state.fd();
   while (true) {
     std::span<char> writable = state.WritableBytes();
     if (writable.empty()) {
@@ -762,7 +708,8 @@ void SubReactor::HandleReadable(std::uint64_t connection_id) {
       CloseConnection(connection_id);
       return;
     }
-    ssize_t result = recv(fd, writable.data(), writable.size(), 0);
+    std::ptrdiff_t result =
+        platform::Receive(fd, writable.data(), writable.size());
     if (result > 0) {
       state.CommitWrite(static_cast<std::size_t>(result));
       if (!ProcessFrames(state)) {
@@ -778,15 +725,15 @@ void SubReactor::HandleReadable(std::uint64_t connection_id) {
       CloseConnection(connection_id);
       return;
     }
-    if (errno == EINTR) {
+    if (platform::Interrupted(platform::LastError())) {
       continue;
     }
-    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+    if (platform::WouldBlock(platform::LastError())) {
       return;
     }
     if (logger_ != nullptr) {
       NETLIB_LOG_WARN(*logger_, "recv failed for fd={}: {}", fd,
-                      std::strerror(errno));
+                      platform::ErrorMessage());
     }
     CloseConnection(connection_id);
     return;
@@ -860,18 +807,18 @@ void SubReactor::FlushConnection(std::uint64_t connection_id) {
   }
 
   Connection& state = *connection->second;
-  int fd = state.fd();
+  SocketHandle fd = state.fd();
   while (state.HasOutput()) {
     std::span<const char> output = state.PendingOutput();
-    ssize_t result = send(fd, output.data(), output.size(), MSG_NOSIGNAL);
+    std::ptrdiff_t result = platform::Send(fd, output.data(), output.size());
     if (result > 0) {
       state.ConsumeOutput(static_cast<std::size_t>(result));
       continue;
     }
-    if (result < 0 && errno == EINTR) {
+    if (result < 0 && platform::Interrupted(platform::LastError())) {
       continue;
     }
-    if (result < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+    if (result < 0 && (platform::WouldBlock(platform::LastError()))) {
       if (!state.write_interest_enabled()) {
         ChannelInterest write_interest{
             .read = !state.close_after_write(),
@@ -887,7 +834,7 @@ void SubReactor::FlushConnection(std::uint64_t connection_id) {
     }
     if (logger_ != nullptr) {
       NETLIB_LOG_WARN(*logger_, "send failed for connection id={}: {}",
-                      connection_id, std::strerror(errno));
+                      connection_id, platform::ErrorMessage());
     }
     CloseConnection(connection_id);
     return;
@@ -911,7 +858,7 @@ void SubReactor::CloseConnection(std::uint64_t connection_id) {
   if (connection == connections_.end()) {
     return;
   }
-  int fd = connection->second->fd();
+  SocketHandle fd = connection->second->fd();
   connection->second->MarkClosed();
   if (logger_ != nullptr) {
     NETLIB_LOG_DEBUG(*logger_, "closing connection fd={} id={}", fd,

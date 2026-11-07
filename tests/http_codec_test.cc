@@ -1,7 +1,3 @@
-#include <arpa/inet.h>
-#include <sys/socket.h>
-#include <unistd.h>
-
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -21,6 +17,7 @@
 #include "netlib/frame_message.h"
 #include "netlib/http1_codec.h"
 #include "netlib/main_reactor.h"
+#include "netlib/platform.h"
 #include "netlib/protocol_codec.h"
 #include "netlib/protocol_message.h"
 #include "netlib/sub_reactor.h"
@@ -38,32 +35,24 @@ std::span<const char> Bytes(std::string_view value) {
 }
 
 bool ConnectTo(uint16_t port, netlib::UniqueFd* connection) {
-  sockaddr_in address{};
-  address.sin_family = AF_INET;
-  address.sin_port = htons(port);
-  address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-
-  connection->Reset(socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0));
-  if (!*connection) {
-    return false;
-  }
-  timeval timeout{};
-  timeout.tv_sec = 2;
-  setsockopt(connection->get(), SOL_SOCKET, SO_RCVTIMEO, &timeout,
-             sizeof(timeout));
-  return connect(connection->get(), reinterpret_cast<const sockaddr*>(&address),
-                 sizeof(address)) == 0;
+  connection->Reset(netlib::platform::CreateTcpSocket(false));
+  return *connection &&
+         netlib::platform::SetReceiveTimeout(connection->get(), 2000) &&
+         netlib::platform::SetReceiveBuffer(connection->get(), 8 * 1024) &&
+         netlib::platform::ConnectLoopback(connection->get(), port);
 }
 
-bool SendAll(int fd, std::string_view data) {
+bool SendAll(netlib::SocketHandle fd, std::string_view data) {
   std::size_t sent = 0;
   while (sent < data.size()) {
-    ssize_t result = send(fd, data.data() + sent, data.size() - sent, 0);
+    std::ptrdiff_t result =
+        netlib::platform::Send(fd, data.data() + sent, data.size() - sent);
     if (result > 0) {
       sent += static_cast<std::size_t>(result);
       continue;
     }
-    if (result < 0 && errno == EINTR) {
+    if (result < 0 &&
+        netlib::platform::Interrupted(netlib::platform::LastError())) {
       continue;
     }
     return false;
@@ -71,10 +60,11 @@ bool SendAll(int fd, std::string_view data) {
   return true;
 }
 
-bool ReadUntilClosed(int fd, std::string* output) {
+bool ReadUntilClosed(netlib::SocketHandle fd, std::string* output) {
   char buffer[4096];
   while (true) {
-    ssize_t result = recv(fd, buffer, sizeof(buffer), 0);
+    std::ptrdiff_t result =
+        netlib::platform::Receive(fd, buffer, sizeof(buffer));
     if (result > 0) {
       output->append(buffer, static_cast<std::size_t>(result));
       continue;
@@ -82,7 +72,7 @@ bool ReadUntilClosed(int fd, std::string* output) {
     if (result == 0) {
       return true;
     }
-    if (errno == EINTR) {
+    if (netlib::platform::Interrupted(netlib::platform::LastError())) {
       continue;
     }
     return false;

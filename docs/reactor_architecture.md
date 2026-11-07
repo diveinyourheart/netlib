@@ -1,5 +1,10 @@
 # Reactor foundations
 
+The epoll/eventfd details below describe the original Linux backend. Windows
+uses the same Reactor lifecycle through Poller/Wakeup; see [platform.md](platform.md).
+Ready events now carry registration tokens. Both read and write callbacks can
+run for one ready event, with registration rechecked between callbacks.
+
 The first layer keeps descriptor ownership, event registration, and thread
 handoff separate:
 
@@ -70,10 +75,7 @@ the payloads remain in their independent bounded queues.
 
 All Channels are edge triggered. Readable callbacks drain accept or `recv`
 until `EAGAIN`. `EPOLLRDHUP` is included in the readable path so existing bytes
-are read before `recv` returns zero. A Channel invokes at most one callback per
-epoll event, and keeps a local callback copy while dispatching. This lets a
-SubReactor close a connection from inside its readable callback without
-leaving EventLoop with a dangling Channel pointer.
+are read before `recv` returns zero. EventLoop dispatches both readable and writable readiness when requested, rechecking the registration token between callbacks. Callback copies remain alive even if a callback removes its Channel.
 
 ## Framing
 

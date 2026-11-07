@@ -1,205 +1,99 @@
 #include "netlib/event_loop.h"
 
-#include <sys/epoll.h>
-#include <sys/eventfd.h>
-#include <unistd.h>
-
 #include <array>
-#include <cerrno>
-#include <cstdint>
-#include <cstring>
-#include <memory>
+#include <utility>
 
 #include "netlib/channel.h"
 #include "netlib/log/logging.h"
-#include "netlib/unique_fd.h"
 
 namespace netlib {
-namespace {
-
-constexpr int kMaxEvents = 64;
-
-uint32_t ToEpollEvents(ChannelInterest interest) {
-  uint32_t events = EPOLLET;
-  if (interest.read) {
-    events |= EPOLLIN | EPOLLRDHUP;
-  }
-  if (interest.write) {
-    events |= EPOLLOUT;
-  }
-  return events;
-}
-
-}  // namespace
-
 std::unique_ptr<EventLoop> EventLoop::Create(log::Logger* logger) {
-  UniqueFd epoll_fd(epoll_create1(EPOLL_CLOEXEC));
-  if (!epoll_fd) {
-    if (logger != nullptr) {
-      NETLIB_LOG_ERROR(*logger, "event loop epoll_create1 failed: {}",
-                       std::strerror(errno));
-    }
+  auto poller = platform::Poller::Create();
+  auto wakeup = platform::Wakeup::Create();
+  if (!poller || !wakeup) {
+    if (logger)
+      NETLIB_LOG_ERROR(*logger, "event loop creation failed: {}",
+                       platform::ErrorMessage());
     return nullptr;
   }
-
-  UniqueFd stop_event_fd(eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC));
-  if (!stop_event_fd) {
-    if (logger != nullptr) {
-      NETLIB_LOG_ERROR(*logger, "event loop eventfd failed: {}",
-                       std::strerror(errno));
-    }
-    return nullptr;
-  }
-
-  std::unique_ptr<EventLoop> loop = std::unique_ptr<EventLoop>(
-      new EventLoop(std::move(epoll_fd), std::move(stop_event_fd), logger));
-  EventLoop* loop_pointer = loop.get();
-  ChannelCallbacks stop_callbacks{
-      [loop_pointer] { loop_pointer->DrainStopEvent(); },
-      {},
-      [loop_pointer] { loop_pointer->Stop(); },
-  };
-  loop->stop_channel_ =
-      Channel::Create(*loop, loop->stop_event_fd_.get(),
-                      ChannelInterest{.read = true}, std::move(stop_callbacks));
-  if (!loop->stop_channel_) {
-    if (logger != nullptr) {
-      NETLIB_LOG_ERROR(*logger,
-                       "event loop stop Channel registration failed: {}",
-                       std::strerror(errno));
-    }
-    return nullptr;
-  }
-  if (logger != nullptr) {
-    NETLIB_LOG_DEBUG(*logger, "event loop created");
-  }
+  auto loop = std::unique_ptr<EventLoop>(
+      new EventLoop(std::move(poller), std::move(wakeup), logger));
+  auto* pointer = loop.get();
+  loop->stop_channel_ = Channel::Create(
+      *loop, loop->wakeup_->handle(), ChannelInterest{.read = true},
+      ChannelCallbacks{[pointer] { pointer->DrainStopEvent(); },
+                       {},
+                       [pointer] { pointer->Stop(); }});
+  if (!loop->stop_channel_) return nullptr;
   return loop;
 }
-
-EventLoop::EventLoop(UniqueFd epoll_fd, UniqueFd stop_event_fd,
+EventLoop::EventLoop(std::unique_ptr<platform::Poller> poller,
+                     std::unique_ptr<platform::Wakeup> wakeup,
                      log::Logger* logger)
-    : epoll_fd_(std::move(epoll_fd)),
-      stop_event_fd_(std::move(stop_event_fd)),
-      logger_(logger) {}
-
-EventLoop::~EventLoop() = default;
-
+    : poller_(std::move(poller)), wakeup_(std::move(wakeup)), logger_(logger) {}
+EventLoop::~EventLoop() {
+  // Unregister while the channel map and poller are still alive.
+  stop_channel_.reset();
+}
 void EventLoop::Run() {
-  if (logger_ != nullptr) {
-    NETLIB_LOG_DEBUG(*logger_, "event loop started");
-  }
-  std::array<epoll_event, kMaxEvents> events{};
+  if (logger_) NETLIB_LOG_DEBUG(*logger_, "event loop started");
+  std::array<platform::ReadyEvent, 64> events{};
   while (!stopping_.load()) {
-    int ready_count =
-        epoll_wait(epoll_fd_.get(), events.data(), kMaxEvents, -1);
-    if (ready_count < 0) {
-      if (errno == EINTR) {
-        continue;
-      }
-      if (logger_ != nullptr) {
-        NETLIB_LOG_ERROR(*logger_, "epoll_wait failed: {}",
-                         std::strerror(errno));
-      }
+    int count = poller_->Wait(events);
+    if (count < 0) {
+      if (platform::Interrupted(platform::LastError())) continue;
+      if (logger_)
+        NETLIB_LOG_ERROR(*logger_, "event wait failed: {}",
+                         platform::ErrorMessage());
       break;
     }
-
-    for (int i = 0; i < ready_count; ++i) {
-      Dispatch(events[i].data.fd, events[i].events);
-    }
+    for (int i = 0; i < count; ++i) Dispatch(events[i].token, events[i].events);
   }
-  if (logger_ != nullptr) {
-    NETLIB_LOG_DEBUG(*logger_, "event loop stopped");
-  }
+  if (logger_) NETLIB_LOG_DEBUG(*logger_, "event loop stopped");
 }
-
 void EventLoop::Stop() {
-  if (!stopping_.exchange(true)) {
-    if (logger_ != nullptr) {
-      NETLIB_LOG_DEBUG(*logger_, "event loop stop requested");
-    }
-    WakeForStop();
-  }
+  if (!stopping_.exchange(true)) WakeForStop();
 }
-
 bool EventLoop::AddChannel(Channel& channel) {
-  epoll_event event{};
-  event.events = ToEpollEvents(channel.interest_);
-  event.data.fd = channel.fd_;
-  if (epoll_ctl(epoll_fd_.get(), EPOLL_CTL_ADD, channel.fd_, &event) != 0) {
-    if (logger_ != nullptr) {
-      NETLIB_LOG_ERROR(*logger_, "epoll_ctl ADD failed for fd={}: {}",
-                       channel.fd_, std::strerror(errno));
-    }
+  channel.token_ = next_token_++;
+  if (!poller_->Add(channel.fd_, channel.token_, channel.interest_.read,
+                    channel.interest_.write))
     return false;
-  }
-
-  channels_.emplace(channel.fd_, &channel);
+  channels_.emplace(channel.token_, &channel);
   return true;
 }
-
 void EventLoop::RemoveChannel(Channel& channel) {
-  channels_.erase(channel.fd_);
-  if (epoll_ctl(epoll_fd_.get(), EPOLL_CTL_DEL, channel.fd_, nullptr) != 0 &&
-      errno != ENOENT && errno != EBADF && logger_ != nullptr) {
-    NETLIB_LOG_ERROR(*logger_, "epoll_ctl DEL failed for fd={}: {}",
-                     channel.fd_, std::strerror(errno));
-  }
+  channels_.erase(channel.token_);
+  poller_->Remove(channel.fd_);
 }
-
 bool EventLoop::ModifyChannel(Channel& channel) {
-  epoll_event event{};
-  event.events = ToEpollEvents(channel.interest_);
-  event.data.fd = channel.fd_;
-  if (epoll_ctl(epoll_fd_.get(), EPOLL_CTL_MOD, channel.fd_, &event) != 0) {
-    if (logger_ != nullptr) {
-      NETLIB_LOG_ERROR(*logger_, "epoll_ctl MOD failed for fd={}: {}",
-                       channel.fd_, std::strerror(errno));
-    }
-    return false;
-  }
-  return true;
+  return poller_->Modify(channel.fd_, channel.token_, channel.interest_.read,
+                         channel.interest_.write);
 }
-
-void EventLoop::Dispatch(int fd, uint32_t events) {
-  auto channel = channels_.find(fd);
-  if (channel != channels_.end()) {
-    channel->second->Dispatch(events);
+void EventLoop::Dispatch(std::uint64_t token, uint32_t events) {
+  // Re-lookup after each callback: it may destroy a Channel, reuse its socket,
+  // or change interests. Both read and write must be serviced for epoll ET.
+  for (auto flag :
+       {platform::kReadable, platform::kWritable, platform::kError}) {
+    if (!(events & flag)) continue;
+    auto found = channels_.find(token);
+    if (found == channels_.end()) return;
+    Channel& channel = *found->second;
+    std::function<void()> callback;
+    if (flag == platform::kReadable && channel.interest_.read)
+      callback = channel.callbacks_.on_readable;
+    if (flag == platform::kWritable && channel.interest_.write)
+      callback = channel.callbacks_.on_writable;
+    if (flag == platform::kError) callback = channel.callbacks_.on_error;
+    if (callback) callback();
   }
 }
-
 void EventLoop::DrainStopEvent() {
-  uint64_t value = 0;
-  while (true) {
-    ssize_t result = read(stop_event_fd_.get(), &value, sizeof(value));
-    if (result == sizeof(value)) {
-      continue;
-    }
-    if (result < 0 && errno == EINTR) {
-      continue;
-    }
-    if (result < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-      return;
-    }
-    if (logger_ != nullptr) {
-      NETLIB_LOG_ERROR(*logger_, "stop eventfd read failed: {}",
-                       std::strerror(errno));
-    }
-    return;
-  }
+  if (!wakeup_->Drain()) Stop();
 }
-
 void EventLoop::WakeForStop() {
-  uint64_t one = 1;
-  while (write(stop_event_fd_.get(), &one, sizeof(one)) < 0) {
-    if (errno == EINTR) {
-      continue;
-    }
-    if (logger_ != nullptr) {
-      NETLIB_LOG_ERROR(*logger_, "stop eventfd write failed: {}",
-                       std::strerror(errno));
-    }
-    break;
-  }
+  if (!wakeup_->Notify() && logger_)
+    NETLIB_LOG_ERROR(*logger_, "stop notification failed: {}",
+                     platform::ErrorMessage());
 }
-
 }  // namespace netlib

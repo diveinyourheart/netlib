@@ -1,16 +1,16 @@
 # netlib
 
-一个用于复习 Unix 网络编程、C++ 面向对象设计和性能工程的练习库。
+一个支持 Windows 和 Linux、用于学习网络编程、C++ 面向对象设计和性能工程的练习库。
 
 ## 当前阶段
 
 当前具备第一层 Reactor 抽象：
 
-- `EventLoop`：封装 epoll 事件循环，通过内部 stop Channel 优雅唤醒退出。
+- `EventLoop`：通过平台 Poller 运行事件循环，通过内部 stop Channel 优雅唤醒退出。
 - `Channel`：把一个 fd 上的读写、错误回调注册到 `EventLoop`。
-- `UniqueFd`：表达 fd 的唯一所有权，支持跨线程移动。
-- `MainReactor`：监听 IPv4 端口，循环 `accept4`，轮询分发给多个 `SubReactor`。
-- `SubReactor`：管理每连接 Codec、读写缓冲、响应队列和 ET 事件。
+- `UniqueFd`：表达原生 socket 句柄的唯一所有权，支持跨线程移动。
+- `MainReactor`：监听 IPv4 端口，循环调用平台 accept 接口，轮询分发给多个 `SubReactor`。
+- `SubReactor`：管理每连接 Codec、读写缓冲、响应队列和非阻塞就绪事件。
 - `ProtocolCodec`：负责字节流分帧和响应编码，默认实现为 4 字节长度前缀。
 - `Http1Codec`：解析 HTTP/1.0、HTTP/1.1 Header、Content-Length Body 和 keep-alive。
 - `ConnectionHandle`：Worker 回写响应的安全弱连接句柄。
@@ -28,8 +28,9 @@
 - 性能测试：`benchmarks/`
 - 设计记录：`docs/`
 
-当前只实现了 Linux epoll 后端。传输帧分帧、Worker 线程池以及非阻塞响应写回已经
-加入。架构和生命周期约定见
+当前支持 Linux epoll 和 Windows Winsock / WSAPoll 后端。系统调用集中到独立的 `netlib::platform` 库。传输帧分帧、Worker 线程池以及非阻塞响应写回已经
+加入。Windows 构建、API 迁移和 macOS 扩展说明见
+[平台文档](docs/platform.md)。架构和生命周期约定见
 [`docs/reactor_architecture.md`](docs/reactor_architecture.md)。
 
 ## 数据流程
@@ -42,10 +43,10 @@ TCP bytes
   -> ThreadPool Worker
   -> 业务 Handler
   -> ConnectionHandle::Respond
-  -> SubReactor response queue + eventfd
+  -> SubReactor response queue + Wakeup
   -> per-connection sequence reorder buffer
   -> ProtocolCodec::Encode
-  -> nonblocking send / EPOLLOUT
+  -> platform::Send / writable readiness
 ```
 
 协议解析和业务层通过 typed variant 解耦：
@@ -132,9 +133,8 @@ if (request != nullptr && request->target == "/rpc") {
 `ProtocolCodec` 并通过带 `ProtocolCodecFactory` 的 `SubReactor::Create`
 重载传入。每个连接拥有独立的 Codec 实例，因此可以维护自定义解析状态。
 
-发送采用循环 `send(..., MSG_NOSIGNAL)` 直到缓冲区为空或 `EAGAIN`。仅在存在
-输出积压且遇到 `EAGAIN` 时注册 `EPOLLOUT`，写空后立即恢复为只关注读取，
-避免可写 socket 持续触发 epoll。
+发送通过平台接口循环执行，直到缓冲区为空或 would-block。仅在输出积压时关注
+可写事件，写空后恢复为只读。Linux 保留 epoll ET，Windows 使用 WSAPoll LT。
 
 Reactor 和 ThreadPool 的工厂函数支持可选的 `Logger*` 参数。建议由服务编排层
 创建 Logger，并作为最后一个非拥有参数传给三者。当前会记录 EventLoop 启动和
@@ -142,9 +142,9 @@ Reactor 和 ThreadPool 的工厂函数支持可选的 `Logger*` 参数。建议�
 Worker 队列背压及 Reactor 关闭等事件；逐 epoll 事件和每次成功 `recv` 不记录
 INFO 日志，避免热路径产生日志风暴。
 
-EventLoop 的 stop eventfd 也作为普通 Channel 注册。跨线程 `Stop()` 会先设置
-停止状态，再写入 stop eventfd 唤醒阻塞的 `epoll_wait()`；当前 ready batch
-处理完后，`Run()` 检查停止状态并返回，随后由调用方 join 事件循环线程。
+EventLoop 的 Wakeup 也作为普通 Channel 注册。跨线程 Stop() 设置停止状态并唤醒
+事件等待；Linux 使用 eventfd，Windows 使用本地 TCP 连接对。当前 ready batch
+处理完成后 Run() 返回，再由调用方 join 事件循环线程。
 
 ## 日志
 
@@ -207,6 +207,8 @@ cmake --build --preset debug --target netlib_log_example
 ```
 
 ## 构建
+
+以下为 Linux 命令；Windows 的 MinGW 和 MSVC 命令见[平台文档](docs/platform.md)。
 
 ```bash
 cmake --preset debug

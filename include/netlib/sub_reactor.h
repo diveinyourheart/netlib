@@ -34,8 +34,8 @@ struct SubReactorOptions {
 class SubReactor {
  public:
   struct ConnectionCallbacks {
-    std::function<void(int)> on_connected;
-    std::function<void(int)> on_closed;
+    std::function<void(SocketHandle)> on_connected;
+    std::function<void(SocketHandle)> on_closed;
   };
 
   // Compatibility overload with the same capacity for connections and
@@ -77,9 +77,10 @@ class SubReactor {
   class ResponseQueue;
 
   SubReactor(std::unique_ptr<EventLoop> event_loop,
-             std::shared_ptr<UniqueFd> wake_fd, SubReactorOptions options,
-             ThreadPool& worker_pool, ProtocolCodecFactory codec_factory,
-             ConnectionCallbacks callbacks, log::Logger* logger);
+             std::shared_ptr<platform::Wakeup> wake_fd,
+             SubReactorOptions options, ThreadPool& worker_pool,
+             ProtocolCodecFactory codec_factory, ConnectionCallbacks callbacks,
+             log::Logger* logger);
 
   void HandleWake();
   bool DrainWake();
@@ -96,7 +97,7 @@ class SubReactor {
   ProtocolCodecFactory codec_factory_;
   ConnectionCallbacks callbacks_;
   std::unordered_map<std::uint64_t, std::unique_ptr<Connection>> connections_;
-  std::shared_ptr<UniqueFd> wake_fd_;
+  std::shared_ptr<platform::Wakeup> wake_fd_;
   std::unique_ptr<Channel> wake_channel_;
   std::shared_ptr<ResponseQueue> response_queue_;
   const SubReactorOptions options_;
