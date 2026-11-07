@@ -133,8 +133,10 @@ SocketHandle CreateTcpSocket(bool nonblocking) {
              SOCK_STREAM | SOCK_CLOEXEC | (nonblocking ? SOCK_NONBLOCK : 0), 0);
 #endif
   if (result == kInvalidSocket) return result;
+#ifdef _WIN32
   if (!SetCloseOnExec(result) || (nonblocking && !SetNonBlocking(result)))
     return CloseFailed(result);
+#endif
   return result;
 }
 SocketHandle ListenTcp(std::uint16_t requested_port, std::uint16_t& port,
@@ -168,8 +170,10 @@ SocketHandle Accept(SocketHandle listener) {
       accept4(listener, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
 #endif
   if (result == kInvalidSocket) return result;
+#ifdef _WIN32
   if (!SetNonBlocking(result) || !SetCloseOnExec(result))
     return CloseFailed(result);
+#endif
   return result;
 }
 bool ConnectLoopback(SocketHandle socket, std::uint16_t port) {
