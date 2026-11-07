@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -176,6 +177,23 @@ class Http1Codec final : public ProtocolCodec {
       const ApplicationResponse& response) const override {
     const HttpResponse* http_response = std::get_if<HttpResponse>(&response);
     return http_response == nullptr || !http_response->keep_alive;
+  }
+
+  std::optional<ApplicationResponse> CreateTimeoutResponse() const override {
+    constexpr std::string_view kTimeoutBody = "request timed out\n";
+    return HttpResponse{
+        .status_code = 504,
+        .reason_phrase = "Gateway Timeout",
+        .headers =
+            {
+                HttpHeader{
+                    .name = "Content-Type",
+                    .value = "text/plain; charset=utf-8",
+                },
+            },
+        .body = std::vector<char>(kTimeoutBody.begin(), kTimeoutBody.end()),
+        .keep_alive = false,
+    };
   }
 
   std::size_t MaxDecodeBufferSize() const override {

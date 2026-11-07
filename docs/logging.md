@@ -7,11 +7,11 @@ ThreadPool implementation.
 
 ```text
 producer thread
-  -> collect timestamp, Linux tid, sequence, source location
+  -> collect timestamp, OS tid, sequence, source location
   -> level short-circuit
   -> compile-time checked fmt formatting
   -> move formatted message into LogRecord
-  -> bounded moodycamel BlockingConcurrentQueue
+  -> bounded moodycamel ConcurrentQueue
 
 Logger writer thread
   -> bulk dequeue
@@ -35,8 +35,8 @@ Every standard output line contains:
 
 - local timestamp with millisecond precision
 - level name aligned for scanning
-- process-wide sequence number
-- Linux thread ID
+- per-logger acceptance sequence number
+- OS thread ID
 - logger name
 - source file, line, and function
 - optional dropped-record count
@@ -69,17 +69,51 @@ lock. A Sink that stores records beyond `Write()` must copy owned data because
 
 ## Flush and shutdown
 
-`Flush()` obtains a monotonically increasing ticket from `next_flush_id_` and
-enqueues a control item carrying that ticket. The writer calls
-`LogSink::Flush()` and advances the monotonic `completed_flush_id_` watermark.
-Waiters sleep until the watermark reaches their ticket.
+Admission, sequence assignment and queue publication share a short mutex with
+Flush snapshots and Stop. The mutex is never held during sink I/O, formatting,
+or a completion wait. Producers retain independent moodycamel queues; correctness
+does not depend on their dequeue order.
 
-Flush and stop control items use one explicit moodycamel producer token while
-the lifecycle mutex serializes command submission. Concurrent flushes therefore
-have a consistent control-channel order, and the completion watermark never
-moves backwards.
+A successful Log accepts one gap-free sequence. Flush snapshots the accepted
+count under the mutex, then waits for that fixed prefix to be written and a
+subsequent Sink::Flush to finish. Logs whose calls have returned true before
+Flush starts are included. Log calls overlapping the snapshot are included if
+accepted before it; formatting or a not-yet-admitted call is not an accepted log.
+Rejected/disabled logs are excluded. Later producers can continue, and do not
+extend a pending Flush target. Flush does not guarantee exclusion of later logs.
 
-Flush is a queue barrier. Records submitted concurrently by other producers can
-appear after the flush marker. `Stop()` rejects later flushes, drains previously
-queued records, flushes the Sink, and joins the writer thread. Application
-producers should stop logging before `Stop()`.
+The writer tracks each outstanding sequence in a bounded completion window and
+advances its prefix only through contiguous completed records. It services ready
+flush requests between records, so a control request never blocks the writer
+from consuming the very logs needed to satisfy it. Queue allocation failures
+roll back admission without creating missing sequence numbers. The capacity
+bounds the entire outstanding completion window (including a record being
+written and out-of-order completions), not just the physical queue length.
+queued_count counts accepted records not yet written.
+
+Stop closes admission under the same mutex, stops the timer, drains all accepted
+logs, completes already registered Flush calls, performs a final flush and joins
+the writer. Concurrent Stop callers all wait for shutdown. No allocating stop
+message is required. Calls after Stop are rejected. Keep the Logger alive until
+all producer calls have returned; racing destruction is not supported.
+
+Sink exceptions stop admission and wake pending Flush callers with false.
+Stop still joins. Sink Write/Flush must not reenter this Logger's Flush/Stop.
+The built-in StdoutSink uses fflush, not fsync/FlushFileBuffers; successful
+completion is not a power-loss durability guarantee. Its existing void Flush
+interface also does not report FILE* write/fflush return codes.
+
+## Periodic flushing
+
+LoggerOptions::flush_interval defaults to 1000 milliseconds. Zero disables it;
+negative intervals are rejected. Each enabled logger owns a TimerScheduler
+thread in addition to its writer. The timer only registers a nonblocking flush
+request; all sink operations still run serially on the writer. At most one
+unserviced periodic request is retained, with its first target kept fixed.
+
+WARN and higher levels, and flush_each_record, retain their immediate writer-side
+flush behavior. A periodic interval is a scheduling target, not a maximum
+delivery latency: slow sinks/backlogs delay completion. A full outstanding
+window rejects new logs instead of waiting for I/O.
+
+See [timer.md](timer.md) for the reusable scheduler and future Reactor integration.

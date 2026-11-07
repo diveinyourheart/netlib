@@ -13,8 +13,8 @@ namespace netlib {
 
 class Channel;
 
-// Runs epoll events on the calling thread. Run() must be called by one thread;
-// Stop() is thread-safe.
+// Runs platform readiness events on the calling thread. Run() must be called by
+// one thread; Stop() is thread-safe.
 class EventLoop {
  public:
   // logger is optional and must outlive the EventLoop when non-null.
@@ -32,19 +32,21 @@ class EventLoop {
  private:
   friend class Channel;
 
-  EventLoop(UniqueFd epoll_fd, UniqueFd stop_event_fd, log::Logger* logger);
+  EventLoop(std::unique_ptr<platform::Poller> poller,
+            std::unique_ptr<platform::Wakeup> wakeup, log::Logger* logger);
 
   bool AddChannel(Channel& channel);
   void RemoveChannel(Channel& channel);
   bool ModifyChannel(Channel& channel);
-  void Dispatch(int fd, uint32_t events);
+  void Dispatch(std::uint64_t token, uint32_t events);
   void DrainStopEvent();
   void WakeForStop();
 
-  UniqueFd epoll_fd_;
-  UniqueFd stop_event_fd_;
+  std::unique_ptr<platform::Poller> poller_;
+  std::unique_ptr<platform::Wakeup> wakeup_;
   std::unique_ptr<Channel> stop_channel_;
-  std::unordered_map<int, Channel*> channels_;
+  std::unordered_map<std::uint64_t, Channel*> channels_;
+  std::uint64_t next_token_ = 1;
   std::atomic<bool> stopping_{false};
   log::Logger* logger_;
 };

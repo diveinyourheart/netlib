@@ -1,4 +1,3 @@
-#include <unistd.h>
 
 #include <atomic>
 #include <cstddef>

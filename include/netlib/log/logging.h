@@ -61,6 +61,8 @@ struct LoggerOptions {
   std::size_t queue_capacity = 8192;
   ColorMode color_mode = ColorMode::kAuto;
   bool flush_each_record = false;
+  // Zero disables background flush requests; negative intervals are invalid.
+  std::chrono::milliseconds flush_interval{1000};
 };
 
 // Multi-producer logger with one asynchronous sink writer.
@@ -89,7 +91,12 @@ class Logger {
     return LogFormatted(
         level, fmt::format(format_string, std::forward<Args>(args)...), source);
   }
+  // Waits for all previously accepted logs to be written and the sink flushed.
+  // Later submissions may proceed. False after shutdown or sink failure.
+  // Flush/Stop must not be called from a sink callback.
   bool Flush();
+  // Closes admission, drains accepted logs, flushes, and joins all background
+  // threads. Concurrent callers all wait for completion.
   void Stop();
   std::size_t queued_count() const;
   std::uint64_t dropped_count() const;

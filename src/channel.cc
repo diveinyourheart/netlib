@@ -1,7 +1,5 @@
 #include "netlib/channel.h"
 
-#include <sys/epoll.h>
-
 #include <cstdint>
 #include <utility>
 
@@ -10,10 +8,10 @@
 
 namespace netlib {
 
-std::unique_ptr<Channel> Channel::Create(EventLoop& loop, int fd,
+std::unique_ptr<Channel> Channel::Create(EventLoop& loop, SocketHandle fd,
                                          ChannelInterest interest,
                                          ChannelCallbacks callbacks) {
-  if (fd < 0 || (!interest.read && !interest.write)) {
+  if (fd == kInvalidSocket || (!interest.read && !interest.write)) {
     if (loop.logger_ != nullptr) {
       NETLIB_LOG_WARN(*loop.logger_,
                       "channel creation rejected for fd={} "
@@ -35,7 +33,7 @@ std::unique_ptr<Channel> Channel::Create(EventLoop& loop, int fd,
   return channel;
 }
 
-Channel::Channel(EventLoop& loop, int fd, ChannelInterest interest,
+Channel::Channel(EventLoop& loop, SocketHandle fd, ChannelInterest interest,
                  ChannelCallbacks callbacks)
     : loop_(loop),
       fd_(fd),
@@ -65,22 +63,6 @@ bool Channel::SetInterest(ChannelInterest interest) {
   return true;
 }
 
-int Channel::fd() const { return fd_; }
-
-void Channel::Dispatch(uint32_t events) {
-  // Keep callbacks alive even if the callback removes this Channel.
-  ChannelCallbacks callbacks = callbacks_;
-  if ((events & (EPOLLIN | EPOLLRDHUP)) != 0 && callbacks.on_readable) {
-    callbacks.on_readable();
-    return;
-  }
-  if ((events & EPOLLOUT) != 0 && callbacks.on_writable) {
-    callbacks.on_writable();
-    return;
-  }
-  if ((events & (EPOLLERR | EPOLLHUP)) != 0 && callbacks.on_error) {
-    callbacks.on_error();
-  }
-}
+SocketHandle Channel::fd() const { return fd_; }
 
 }  // namespace netlib

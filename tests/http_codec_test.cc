@@ -1,7 +1,3 @@
-#include <arpa/inet.h>
-#include <sys/socket.h>
-#include <unistd.h>
-
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -21,6 +17,7 @@
 #include "netlib/frame_message.h"
 #include "netlib/http1_codec.h"
 #include "netlib/main_reactor.h"
+#include "netlib/platform.h"
 #include "netlib/protocol_codec.h"
 #include "netlib/protocol_message.h"
 #include "netlib/sub_reactor.h"
@@ -38,32 +35,24 @@ std::span<const char> Bytes(std::string_view value) {
 }
 
 bool ConnectTo(uint16_t port, netlib::UniqueFd* connection) {
-  sockaddr_in address{};
-  address.sin_family = AF_INET;
-  address.sin_port = htons(port);
-  address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-
-  connection->Reset(socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0));
-  if (!*connection) {
-    return false;
-  }
-  timeval timeout{};
-  timeout.tv_sec = 2;
-  setsockopt(connection->get(), SOL_SOCKET, SO_RCVTIMEO, &timeout,
-             sizeof(timeout));
-  return connect(connection->get(), reinterpret_cast<const sockaddr*>(&address),
-                 sizeof(address)) == 0;
+  connection->Reset(netlib::platform::CreateTcpSocket(false));
+  return *connection &&
+         netlib::platform::SetReceiveTimeout(connection->get(), 2000) &&
+         netlib::platform::SetReceiveBuffer(connection->get(), 8 * 1024) &&
+         netlib::platform::ConnectLoopback(connection->get(), port);
 }
 
-bool SendAll(int fd, std::string_view data) {
+bool SendAll(netlib::SocketHandle fd, std::string_view data) {
   std::size_t sent = 0;
   while (sent < data.size()) {
-    ssize_t result = send(fd, data.data() + sent, data.size() - sent, 0);
+    std::ptrdiff_t result =
+        netlib::platform::Send(fd, data.data() + sent, data.size() - sent);
     if (result > 0) {
       sent += static_cast<std::size_t>(result);
       continue;
     }
-    if (result < 0 && errno == EINTR) {
+    if (result < 0 &&
+        netlib::platform::Interrupted(netlib::platform::LastError())) {
       continue;
     }
     return false;
@@ -71,10 +60,11 @@ bool SendAll(int fd, std::string_view data) {
   return true;
 }
 
-bool ReadUntilClosed(int fd, std::string* output) {
+bool ReadUntilClosed(netlib::SocketHandle fd, std::string* output) {
   char buffer[4096];
   while (true) {
-    ssize_t result = recv(fd, buffer, sizeof(buffer), 0);
+    std::ptrdiff_t result =
+        netlib::platform::Receive(fd, buffer, sizeof(buffer));
     if (result > 0) {
       output->append(buffer, static_cast<std::size_t>(result));
       continue;
@@ -82,7 +72,7 @@ bool ReadUntilClosed(int fd, std::string* output) {
     if (result == 0) {
       return true;
     }
-    if (errno == EINTR) {
+    if (netlib::platform::Interrupted(netlib::platform::LastError())) {
       continue;
     }
     return false;
@@ -400,6 +390,256 @@ int RunHttpPipelineTest() {
   return success ? 0 : 1;
 }
 
+int RunHttpTimeoutTest() {
+  std::mutex handler_mutex;
+  std::condition_variable handler_condition;
+  std::size_t completed_requests = 0;
+  bool handler_ok = true;
+
+  netlib::ThreadPool::Handler handler =
+      [&handler_mutex, &handler_condition, &completed_requests,
+       &handler_ok](netlib::FrameMessage message) {
+        const netlib::HttpRequestMetadata* metadata =
+            std::get_if<netlib::HttpRequestMetadata>(&message.metadata);
+        bool slow = message.sequence == 0 && metadata != nullptr &&
+                    metadata->target == "/slow";
+        bool fast = message.sequence == 1 && metadata != nullptr &&
+                    metadata->target == "/fast";
+        bool accepted = slow;
+        if (fast) {
+          accepted = message.connection.Respond(
+              message.sequence, netlib::HttpResponse{
+                                    .status_code = 200,
+                                    .reason_phrase = "OK",
+                                    .body = {'f', 'a', 's', 't'},
+                                    .keep_alive = true,
+                                });
+        }
+
+        {
+          std::lock_guard<std::mutex> lock(handler_mutex);
+          ++completed_requests;
+          handler_ok = handler_ok && accepted;
+          handler_condition.notify_all();
+        }
+      };
+
+  std::unique_ptr<netlib::ThreadPool> worker_pool =
+      netlib::ThreadPool::Create(2, 16, std::move(handler));
+  if (!worker_pool) {
+    ReportFailure("failed to create HTTP timeout ThreadPool");
+    return 1;
+  }
+  netlib::SubReactorOptions sub_options{
+      .max_pending_connections = 8,
+      .max_pending_responses = 8,
+      .max_pending_output_bytes = 64 * 1024,
+      .request_timeout = std::chrono::milliseconds(100),
+  };
+  std::unique_ptr<netlib::SubReactor> sub_reactor = netlib::SubReactor::Create(
+      sub_options, *worker_pool, {}, [] { return netlib::CreateHttp1Codec(); });
+  if (!sub_reactor) {
+    ReportFailure("failed to create HTTP timeout SubReactor");
+    return 1;
+  }
+  std::unique_ptr<netlib::MainReactor> main_reactor =
+      netlib::MainReactor::Create(0, {sub_reactor.get()});
+  if (!main_reactor) {
+    ReportFailure("failed to create HTTP timeout MainReactor");
+    return 1;
+  }
+
+  std::thread sub_thread([&sub_reactor] { sub_reactor->Run(); });
+  std::thread main_thread([&main_reactor] { main_reactor->Run(); });
+
+  bool success = true;
+  netlib::UniqueFd client;
+  constexpr std::string_view kRequests =
+      "GET /slow HTTP/1.1\r\n"
+      "Host: localhost\r\n"
+      "\r\n"
+      "GET /fast HTTP/1.1\r\n"
+      "Host: localhost\r\n"
+      "\r\n";
+  if (!ConnectTo(main_reactor->port(), &client) ||
+      !SendAll(client.get(), kRequests)) {
+    ReportFailure("failed to send requests for HTTP timeout test");
+    success = false;
+  }
+
+  {
+    std::unique_lock<std::mutex> lock(handler_mutex);
+    if (success && !handler_condition.wait_for(lock, std::chrono::seconds(2),
+                                               [&completed_requests] {
+                                                 return completed_requests == 2;
+                                               })) {
+      ReportFailure("HTTP timeout test requests were not dispatched");
+      success = false;
+    }
+    if (success && !handler_ok) {
+      ReportFailure("HTTP timeout test request context was incorrect");
+      success = false;
+    }
+  }
+
+  std::string response;
+  if (success && !ReadUntilClosed(client.get(), &response)) {
+    ReportFailure("timed-out HTTP connection did not close");
+    success = false;
+  }
+  if (success &&
+      (response.find("HTTP/1.1 504 Gateway Timeout\r\n") != 0 ||
+       response.find("Content-Length: 18\r\n") == std::string::npos ||
+       response.find("Connection: close\r\n") == std::string::npos ||
+       response.find("\r\n\r\nrequest timed out\n") == std::string::npos ||
+       response.find("fast") != std::string::npos)) {
+    ReportFailure("HTTP timeout response was missing or malformed");
+    success = false;
+  }
+
+  client.Reset();
+  main_reactor->Stop();
+  sub_reactor->Stop();
+  main_thread.join();
+  sub_thread.join();
+  worker_pool->Stop();
+  return success ? 0 : 1;
+}
+
+int RunHttpResponseCancelsTimeoutTest() {
+  std::mutex handler_mutex;
+  std::condition_variable handler_condition;
+  std::size_t completed_requests = 0;
+  bool handler_ok = true;
+
+  netlib::ThreadPool::Handler handler = [&handler_mutex, &handler_condition,
+                                         &completed_requests, &handler_ok](
+                                            netlib::FrameMessage message) {
+    const netlib::HttpRequestMetadata* metadata =
+        std::get_if<netlib::HttpRequestMetadata>(&message.metadata);
+    bool first = metadata != nullptr && metadata->target == "/cancel-first";
+    bool second = metadata != nullptr && metadata->target == "/cancel-second";
+    bool accepted = false;
+    if (first || second) {
+      accepted = message.connection.Respond(
+          message.sequence,
+          netlib::HttpResponse{
+              .status_code = 200,
+              .reason_phrase = "OK",
+              .body = first ? std::vector<char>{'f', 'i', 'r', 's', 't'}
+                            : std::vector<char>{'s', 'e', 'c', 'o', 'n', 'd'},
+              .keep_alive = first,
+          });
+    }
+
+    {
+      std::lock_guard<std::mutex> lock(handler_mutex);
+      ++completed_requests;
+      handler_ok = handler_ok && accepted;
+      handler_condition.notify_all();
+    }
+  };
+
+  std::unique_ptr<netlib::ThreadPool> worker_pool =
+      netlib::ThreadPool::Create(1, 16, std::move(handler));
+  if (!worker_pool) {
+    ReportFailure("failed to create timeout cancellation ThreadPool");
+    return 1;
+  }
+  netlib::SubReactorOptions sub_options{
+      .max_pending_connections = 8,
+      .max_pending_responses = 8,
+      .max_pending_output_bytes = 64 * 1024,
+      .request_timeout = std::chrono::milliseconds(300),
+  };
+  std::unique_ptr<netlib::SubReactor> sub_reactor = netlib::SubReactor::Create(
+      sub_options, *worker_pool, {}, [] { return netlib::CreateHttp1Codec(); });
+  if (!sub_reactor) {
+    ReportFailure("failed to create timeout cancellation SubReactor");
+    return 1;
+  }
+  std::unique_ptr<netlib::MainReactor> main_reactor =
+      netlib::MainReactor::Create(0, {sub_reactor.get()});
+  if (!main_reactor) {
+    ReportFailure("failed to create timeout cancellation MainReactor");
+    return 1;
+  }
+
+  std::thread sub_thread([&sub_reactor] { sub_reactor->Run(); });
+  std::thread main_thread([&main_reactor] { main_reactor->Run(); });
+
+  bool success = true;
+  netlib::UniqueFd client;
+  constexpr std::string_view kFirstRequest =
+      "POST /cancel-first HTTP/1.1\r\n"
+      "Host: localhost\r\n"
+      "Content-Length: 0\r\n"
+      "\r\n";
+  constexpr std::string_view kSecondRequest =
+      "POST /cancel-second HTTP/1.1\r\n"
+      "Host: localhost\r\n"
+      "Content-Length: 0\r\n"
+      "Connection: close\r\n"
+      "\r\n";
+  if (!ConnectTo(main_reactor->port(), &client) ||
+      !SendAll(client.get(), kFirstRequest)) {
+    ReportFailure("failed to send first cancellation-test request");
+    success = false;
+  }
+
+  {
+    std::unique_lock<std::mutex> lock(handler_mutex);
+    if (success && !handler_condition.wait_for(lock, std::chrono::seconds(2),
+                                               [&completed_requests] {
+                                                 return completed_requests >= 1;
+                                               })) {
+      ReportFailure("first cancellation-test request was not processed");
+      success = false;
+    }
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(400));
+  if (success && !SendAll(client.get(), kSecondRequest)) {
+    ReportFailure("successful response did not cancel the request timeout");
+    success = false;
+  }
+
+  {
+    std::unique_lock<std::mutex> lock(handler_mutex);
+    if (success && !handler_condition.wait_for(lock, std::chrono::seconds(2),
+                                               [&completed_requests] {
+                                                 return completed_requests >= 2;
+                                               })) {
+      ReportFailure("timed-out connection rejected the second request");
+      success = false;
+    }
+    if (success && !handler_ok) {
+      ReportFailure("timeout cancellation-test request context was incorrect");
+      success = false;
+    }
+  }
+
+  std::string response;
+  if (success && !ReadUntilClosed(client.get(), &response)) {
+    ReportFailure("failed to read timeout cancellation-test responses");
+    success = false;
+  }
+  if (success &&
+      (response.find("\r\n\r\nfirst") == std::string::npos ||
+       response.find("\r\n\r\nsecond") == std::string::npos ||
+       response.find("HTTP/1.1 504 Gateway Timeout") != std::string::npos)) {
+    ReportFailure("timeout fired after the business response was accepted");
+    success = false;
+  }
+
+  client.Reset();
+  main_reactor->Stop();
+  sub_reactor->Stop();
+  main_thread.join();
+  sub_thread.join();
+  worker_pool->Stop();
+  return success ? 0 : 1;
+}
+
 }  // namespace
 
 int main() {
@@ -419,5 +659,13 @@ int main() {
   if (invalid_result != 0) {
     return invalid_result;
   }
-  return RunHttpPipelineTest();
+  int pipeline_result = RunHttpPipelineTest();
+  if (pipeline_result != 0) {
+    return pipeline_result;
+  }
+  int cancellation_result = RunHttpResponseCancelsTimeoutTest();
+  if (cancellation_result != 0) {
+    return cancellation_result;
+  }
+  return RunHttpTimeoutTest();
 }

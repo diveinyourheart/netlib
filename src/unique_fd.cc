@@ -1,12 +1,10 @@
 #include "netlib/unique_fd.h"
 
-#include <unistd.h>
-
 #include <utility>
 
 namespace netlib {
 
-UniqueFd::UniqueFd(int fd) noexcept : fd_(fd) {}
+UniqueFd::UniqueFd(SocketHandle fd) noexcept : fd_(fd) {}
 
 UniqueFd::~UniqueFd() { Reset(); }
 
@@ -19,22 +17,22 @@ UniqueFd& UniqueFd::operator=(UniqueFd&& other) noexcept {
   return *this;
 }
 
-int UniqueFd::get() const noexcept { return fd_; }
+SocketHandle UniqueFd::get() const noexcept { return fd_; }
 
-UniqueFd::operator bool() const noexcept { return fd_ >= 0; }
+UniqueFd::operator bool() const noexcept { return fd_ != kInvalidSocket; }
 
-int UniqueFd::Release() noexcept {
-  int fd = fd_;
-  fd_ = -1;
+SocketHandle UniqueFd::Release() noexcept {
+  SocketHandle fd = fd_;
+  fd_ = kInvalidSocket;
   return fd;
 }
 
-void UniqueFd::Reset(int fd) noexcept {
+void UniqueFd::Reset(SocketHandle fd) noexcept {
   if (fd_ == fd) {
     return;
   }
-  if (fd_ >= 0) {
-    close(fd_);
+  if (fd_ != kInvalidSocket) {
+    platform::CloseSocket(fd_);
   }
   fd_ = fd;
 }
