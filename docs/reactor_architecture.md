@@ -221,8 +221,17 @@ Length-prefixed framing has no portable error envelope, so it returns nullopt
 and SubReactor closes without inventing application data. A custom protocol can
 return its own error frame when its client contract defines one.
 
-Producers must stop before `ThreadPool::Stop()`. Stop enqueues one sentinel per
-Worker, waits for earlier messages to drain, and joins all Worker threads.
+ThreadPool::Stop closes admission and waits for submissions already inside the
+gate, then for all accepted handlers to finish. Only afterward does it enqueue
+one implicit sentinel per Worker and join the threads. Concurrent Stop callers
+all wait for completion. A handler must not call Stop on its own pool.
+
+Each SubReactor owns a ThreadPool::Submitter with an explicit producer token.
+Workers keep their explicit consumer tokens. Each SubReactor response queue
+prepares one explicit producer token per worker of its pool; a thread-local pool
+identity/index selects it during Respond. Timer callbacks and external responders
+use implicit enqueue. See [queue_topology.md](queue_topology.md) for ownership,
+ordering, and lifetime diagrams.
 
 ## Lifecycle
 

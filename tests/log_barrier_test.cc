@@ -1,6 +1,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <cstdio>
 #include <future>
 #include <mutex>
@@ -22,6 +23,7 @@ struct State {
   bool block_flush = false;
   bool flush_entered = false;
   std::set<std::string> written;
+  std::vector<std::uint64_t> sequences;
   std::set<std::string> flushed;
   int flushes = 0;
 };
@@ -34,6 +36,7 @@ class Sink : public netlib::log::LogSink {
     state_->cv.notify_all();
     state_->cv.wait(lock, [&] { return !state_->block; });
     state_->written.insert(record.message);
+    state_->sequences.push_back(record.sequence);
   }
   void Flush() override {
     std::unique_lock<std::mutex> lock(state_->mutex);
@@ -107,6 +110,13 @@ bool TestBarrierAndAdmission() {
              ok;
   }
   logger->Stop();
+  {
+    std::lock_guard<std::mutex> lock(state->mutex);
+    ok = state->sequences.size() == 1202 && ok;
+    for (std::size_t i = 0; i < state->sequences.size(); ++i) {
+      ok = state->sequences[i] == i && ok;
+    }
+  }
   return ok;
 }
 

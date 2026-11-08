@@ -471,6 +471,62 @@ int RunLateResponseTest() {
   return success ? 0 : 1;
 }
 
+int RunForeignWorkerResponseTest() {
+  std::atomic<bool> handlers_ok{true};
+  std::unique_ptr<netlib::ThreadPool> foreign_pool =
+      netlib::ThreadPool::Create(2, 8, [&](netlib::FrameMessage message) {
+        if (!message.connection.Respond(message.sequence,
+                                        std::move(message.payload))) {
+          handlers_ok.store(false);
+        }
+      });
+  if (!foreign_pool) {
+    return 1;
+  }
+  std::unique_ptr<netlib::ThreadPool> pool =
+      netlib::ThreadPool::Create(1, 8, [&](netlib::FrameMessage message) {
+        if (!foreign_pool->Submit(std::move(message))) {
+          handlers_ok.store(false);
+        }
+      });
+  if (!pool) {
+    return 1;
+  }
+  std::unique_ptr<netlib::SubReactor> sub =
+      netlib::SubReactor::Create(8, *pool, {});
+  if (!sub) {
+    return 1;
+  }
+  std::unique_ptr<netlib::MainReactor> main =
+      netlib::MainReactor::Create(0, {sub.get()});
+  if (!main) {
+    return 1;
+  }
+  std::thread sub_thread([&] { sub->Run(); });
+  std::thread main_thread([&] { main->Run(); });
+  netlib::UniqueFd client;
+  std::string response;
+  // The replying thread belongs to another pool, so it must not use this
+  // reactor's worker-indexed token array. External replies remain supported.
+  const bool success = ConnectTo(main->port(), &client) &&
+                       SendAll(client.get(), MakeFrame("foreign-worker")) &&
+                       ReadFrame(client.get(), &response) &&
+                       response == "foreign-worker";
+  client.Reset();
+  main->Stop();
+  sub->Stop();
+  main_thread.join();
+  sub_thread.join();
+  pool->Stop();
+  foreign_pool->Stop();
+  if (!success || !handlers_ok.load()) {
+    ReportFailure(
+        "response from an external worker did not use implicit enqueue");
+    return 1;
+  }
+  return 0;
+}
+
 int RunRequestTimeoutTest() {
   Observation observation;
   std::unique_ptr<netlib::ThreadPool> worker_pool = CreateDroppingThreadPool();
@@ -767,6 +823,10 @@ int main() {
   int timeout_result = RunRequestTimeoutTest();
   if (timeout_result != 0) {
     return timeout_result;
+  }
+  int foreign_response_result = RunForeignWorkerResponseTest();
+  if (foreign_response_result != 0) {
+    return foreign_response_result;
   }
   return RunReactorTest();
 }

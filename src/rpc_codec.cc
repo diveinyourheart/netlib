@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <span>
 #include <utility>
 #include <variant>
@@ -175,6 +176,14 @@ class RpcCodec final : public ProtocolCodec {
 
   bool ShouldCloseAfterWrite(const ApplicationResponse&) const override {
     return false;
+  }
+
+  std::optional<ApplicationResponse> CreateTimeoutResponse() const override {
+    // A response needs the timed-out request's ID. This context-free interface
+    // cannot identify it when multiple requests are in flight; the last decoded
+    // header may belong to another request. Let SubReactor close the
+    // connection.
+    return std::nullopt;
   }
 
   std::size_t MaxDecodeBufferSize() const override {

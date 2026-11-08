@@ -3,14 +3,18 @@
 `netlib::log` is a separate static library and does not depend on the Reactor or
 ThreadPool implementation.
 
+中文状态与流程图解：[日志状态与刷新水位](logging_state.md)，包含多线程共用单 producer、
+固定 ProducerToken、accepted_/completed_ 双水位，以及 Flush 目标达成的过程。
+
 ## Data path
 
 ```text
 producer thread
-  -> collect timestamp, OS tid, sequence, source location
   -> level short-circuit
   -> compile-time checked fmt formatting
+  -> collect timestamp, OS tid, source location
   -> move formatted message into LogRecord
+  -> under the admission mutex: assign sequence, enqueue using producer_
   -> bounded moodycamel ConcurrentQueue
 
 Logger writer thread
@@ -19,9 +23,10 @@ Logger writer thread
   -> StdoutSink formatting and output
 ```
 
-The producer never waits for terminal or network I/O. A full queue drops the new
-record, increments `dropped_count()`, and reports the pending drop count on the
-next successfully queued record.
+The producer may briefly contend on the admission mutex, but does not wait for
+sink I/O or a Flush to finish. A full outstanding-record budget drops the new record,
+increments `dropped_count()`, and reports the pending drop count on the next
+successfully queued record.
 
 The macros use fmtlib 11.2.0 with compile-time format checking. Formatting is
 performed on the producer thread in one pass and the resulting string is moved
@@ -57,6 +62,18 @@ as visible `\xHH` text.
 - ERROR: red
 - FATAL: bold red
 
+All other metadata is colored as well:
+
+- timestamp, separators, and multi-line continuation prefixes: gray
+- sequence number (`seq`): blue
+- OS thread ID (`tid`): magenta
+- dropped-record count (`drops`), when present: yellow
+- logger name: cyan
+- source file, line, and function: bright blue
+
+Styles are reset between fields and before each business-message line, so the
+message uses the terminal's default style and never inherits the level color.
+
 `ColorMode::kAuto` enables color only when the output stream is a TTY. Use
 `kAlways` for terminal tooling and `kNever` for redirected output and tests.
 
@@ -71,8 +88,9 @@ lock. A Sink that stores records beyond `Write()` must copy owned data because
 
 Admission, sequence assignment and queue publication share a short mutex with
 Flush snapshots and Stop. The mutex is never held during sink I/O, formatting,
-or a completion wait. Producers retain independent moodycamel queues; correctness
-does not depend on their dequeue order.
+or a completion wait. Every producer thread uses the same explicit ProducerToken
+under this mutex. The queue disables implicit producers, so the writer receives
+records in acceptance-sequence order from a single producer stream.
 
 A successful Log accepts one gap-free sequence. Flush snapshots the accepted
 count under the mutex, then waits for that fixed prefix to be written and a
@@ -82,14 +100,11 @@ accepted before it; formatting or a not-yet-admitted call is not an accepted log
 Rejected/disabled logs are excluded. Later producers can continue, and do not
 extend a pending Flush target. Flush does not guarantee exclusion of later logs.
 
-The writer tracks each outstanding sequence in a bounded completion window and
-advances its prefix only through contiguous completed records. It services ready
-flush requests between records, so a control request never blocks the writer
-from consuming the very logs needed to satisfy it. Queue allocation failures
-roll back admission without creating missing sequence numbers. The capacity
-bounds the entire outstanding completion window (including a record being
-written and out-of-order completions), not just the physical queue length.
-queued_count counts accepted records not yet written.
+The writer increments completed_ after each record is written; no completion
+bitmap is needed. It services ready flush requests between records. Enqueue
+failures leave accepted_ unchanged, without creating missing sequence numbers.
+The capacity bounds accepted_ - completed_, including records already dequeued
+into a batch or currently being written. queued_count() returns this difference.
 
 Stop closes admission under the same mutex, stops the timer, drains all accepted
 logs, completes already registered Flush calls, performs a final flush and joins

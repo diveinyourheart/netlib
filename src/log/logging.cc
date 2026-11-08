@@ -10,6 +10,7 @@
 
 #include <array>
 #include <atomic>
+#include <cassert>
 #include <charconv>
 #include <chrono>
 #include <condition_variable>
@@ -34,6 +35,12 @@ namespace netlib::log {
 namespace {
 
 constexpr std::size_t kWriterBatchSize = 64;
+
+struct LogQueueTraits : moodycamel::ConcurrentQueueDefaultTraits {
+  // All log submissions share one explicit producer under Logger::mutex_.
+  static constexpr std::size_t INITIAL_IMPLICIT_PRODUCER_HASH_SIZE = 0;
+};
+using LogQueue = moodycamel::ConcurrentQueue<LogRecord, LogQueueTraits>;
 
 std::string_view LevelName(LogLevel level) {
   switch (level) {
@@ -134,35 +141,50 @@ std::string FormatTimestamp(std::chrono::system_clock::time_point timestamp) {
 std::string MakePrefix(const LogRecord& record, bool color) {
   std::string prefix;
   prefix.reserve(512);
+  // Reset styles between fields too, so FATAL's bold style cannot leak into
+  // the other metadata. The business message starts after the final reset.
+  const std::string_view separator = color ? "\x1b[0;90m | " : " | ";
 
   if (color) {
-    prefix.append("\x1b[2m");
+    prefix.append("\x1b[0;90m");
   }
   prefix.append(FormatTimestamp(record.timestamp));
-  if (color) {
-    prefix.append("\x1b[0m");
-  }
 
-  prefix.append(" | ");
+  prefix.append(separator);
   if (color) {
     prefix.append(LevelColor(record.level));
   }
   prefix.append(LevelName(record.level));
-  if (color) {
-    prefix.append("\x1b[0m");
-  }
 
-  prefix.append(" | seq=");
+  prefix.append(separator);
+  if (color) {
+    prefix.append("\x1b[34m");
+  }
+  prefix.append("seq=");
   AppendUnsigned(prefix, record.sequence);
-  prefix.append(" | tid=");
+  prefix.append(separator);
+  if (color) {
+    prefix.append("\x1b[35m");
+  }
+  prefix.append("tid=");
   AppendUnsigned(prefix, record.thread_id);
   if (record.dropped_messages != 0) {
-    prefix.append(" | drops=");
+    prefix.append(separator);
+    if (color) {
+      prefix.append("\x1b[33m");
+    }
+    prefix.append("drops=");
     AppendUnsigned(prefix, record.dropped_messages);
   }
-  prefix.append(" | ");
+  prefix.append(separator);
+  if (color) {
+    prefix.append("\x1b[36m");
+  }
   prefix.append(record.logger_name);
-  prefix.append(" | ");
+  prefix.append(separator);
+  if (color) {
+    prefix.append("\x1b[94m");
+  }
   prefix.append(BaseName(record.source.file_name()));
   prefix.push_back(':');
   AppendUnsigned(prefix, record.source.line());
@@ -170,7 +192,10 @@ std::string MakePrefix(const LogRecord& record, bool color) {
     prefix.push_back(' ');
     prefix.append(record.source.function_name());
   }
-  prefix.append(" | ");
+  prefix.append(separator);
+  if (color) {
+    prefix.append("\x1b[0m");
+  }
   return prefix;
 }
 
@@ -209,7 +234,9 @@ class StdoutSink final : public LogSink {
       char character = message[i];
       if (character == '\n') {
         WriteSegment(message, segment_start, i);
-        std::fwrite("\n    | ", 1, 7, output_);
+        const std::string_view continuation =
+            color_ ? "\n\x1b[0;90m    | \x1b[0m" : "\n    | ";
+        std::fwrite(continuation.data(), 1, continuation.size(), output_);
         segment_start = i + 1;
         continue;
       }
@@ -259,6 +286,7 @@ class Logger::Impl {
         capacity_(options.queue_capacity),
         flush_each_record_(options.flush_each_record),
         queue_(capacity_),
+        producer_(queue_),
         sink_(std::move(sink)),
         consumer_(queue_) {
     if (options.flush_interval.count() > 0) {
@@ -276,6 +304,7 @@ class Logger::Impl {
     writer_ = std::thread([this] { WriterLoop(); });
   }
   ~Impl() { Stop(); }
+  bool valid() const { return producer_.valid(); }
 
   bool IsEnabled(LogLevel level) const {
     return IsValidLevel(level) && level >= minimum_level_;
@@ -299,31 +328,23 @@ class Logger::Impl {
     // No sink I/O, formatting, or completion wait holds this lock.
     std::lock_guard<std::mutex> lock(mutex_);
     if (stopping_) return false;
-    if (completion_.size() >= capacity_) {
+    if (accepted_ - completed_ >= capacity_) {
       Drop();
       return false;
     }
     record.sequence = accepted_;
     record.dropped_messages = unreported_drops_;
-    try {
-      completion_.push_back(false);
-    } catch (...) {
-      Drop();
-      return false;
-    }
     bool enqueued = false;
     try {
-      enqueued = queue_.enqueue(std::move(record));
+      enqueued = queue_.enqueue(producer_, std::move(record));
     } catch (...) {
     }
     if (!enqueued) {
-      completion_.pop_back();  // No ticket was accepted: no permanent hole.
       Drop();
       return false;
     }
     unreported_drops_ = 0;
     ++accepted_;
-    ++queued_;
     work_.notify_one();
     return true;
   }
@@ -350,7 +371,7 @@ class Logger::Impl {
   }
   std::size_t queued_count() const {
     std::lock_guard<std::mutex> lock(mutex_);
-    return queued_;
+    return static_cast<std::size_t>(accepted_ - completed_);
   }
   std::uint64_t dropped_count() const {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -394,11 +415,11 @@ class Logger::Impl {
       std::array<LogRecord, kWriterBatchSize> records{};
       for (;;) {
         if (ServiceFlushes()) return;
-        std::size_t count;
+        std::size_t count = 0;
         {
           std::unique_lock<std::mutex> lock(mutex_);
           work_.wait(lock, [&] {
-            return queued_ != 0 || stopping_ ||
+            return accepted_ != completed_ || stopping_ ||
                    (!requests_.empty() &&
                     requests_.front()->target <= completed_) ||
                    (periodic_target_ && *periodic_target_ <= completed_);
@@ -413,14 +434,10 @@ class Logger::Impl {
             sink_->Flush();
           {
             std::lock_guard<std::mutex> lock(mutex_);
-            --queued_;
-            // A high sequence alone is insufficient: preserve every hole.
-            completion_[static_cast<std::size_t>(record.sequence -
-                                                 completed_)] = true;
-            while (!completion_.empty() && completion_.front()) {
-              completion_.pop_front();
-              ++completed_;
-            }
+            // One producer and one consumer preserve acceptance order, even
+            // when consecutive submissions originate from different threads.
+            assert(record.sequence == completed_);
+            ++completed_;
           }
           if (ServiceFlushes()) return;
         }
@@ -438,18 +455,17 @@ class Logger::Impl {
   const LogLevel minimum_level_;
   const std::size_t capacity_;
   const bool flush_each_record_;
-  moodycamel::ConcurrentQueue<LogRecord> queue_;
+  LogQueue queue_;
+  moodycamel::ProducerToken producer_;
   std::unique_ptr<LogSink> sink_;
   moodycamel::ConsumerToken consumer_;
   mutable std::mutex mutex_;
   std::condition_variable work_;
   std::condition_variable progress_;
-  std::deque<bool> completion_;
   std::deque<std::shared_ptr<FlushRequest>> requests_;
   std::optional<std::uint64_t> periodic_target_;
   std::uint64_t accepted_ = 0;
   std::uint64_t completed_ = 0;
-  std::size_t queued_ = 0;
   std::uint64_t dropped_ = 0;
   std::uint64_t unreported_drops_ = 0;
   bool stopping_ = false;
@@ -469,6 +485,9 @@ std::unique_ptr<Logger> Logger::Create(LoggerOptions options,
 
   std::unique_ptr<Impl> impl =
       std::make_unique<Impl>(std::move(options), std::move(sink));
+  if (!impl->valid()) {
+    return nullptr;
+  }
   return std::unique_ptr<Logger>(new Logger(std::move(impl)));
 }
 

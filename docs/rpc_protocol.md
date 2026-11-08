@@ -103,6 +103,12 @@ if (request != nullptr &&
 每个投递给 Worker 的帧仍必须产生一个响应；单向调用、流式 RPC、心跳和取消尚未实现，
 不能通过保留 flags 私自启用。远端业务错误通过 error_code 表达，不自动关闭连接。
 
+当前 `CreateTimeoutResponse()` 接口没有传入超时请求的 metadata，无法确定该响应
+应携带哪个 request_id。RPC Codec 因此返回 `std::nullopt`，由 SubReactor 在请求
+超时后关闭连接，不发送无法正确关联的响应。即使 Codec 刚解析过其他请求，也不能
+使用其 ID 作为超时请求的 ID。后续如需 RPC 超时错误帧，应先让接口接收对应请求
+的上下文，再定义超时 error_code 并构造关联响应。
+
 Codec 帧上限与 `SubReactorOptions::max_pending_output_bytes` 分别控制单帧和输出积压。
 若希望允许最大编码响应，输出上限至少应为 max_frame_bytes + 4；多帧积压还需另设预算。
 

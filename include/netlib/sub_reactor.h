@@ -104,7 +104,7 @@ class SubReactor {
   void CloseConnection(std::uint64_t connection_id);
 
   std::unique_ptr<EventLoop> event_loop_;
-  ThreadPool& worker_pool_;
+  ThreadPool::Submitter request_submitter_;
   ProtocolCodecFactory codec_factory_;
   ConnectionCallbacks callbacks_;
   std::unordered_map<std::uint64_t, std::unique_ptr<Connection>> connections_;
