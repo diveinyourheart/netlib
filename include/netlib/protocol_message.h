@@ -6,6 +6,8 @@
 #include <variant>
 #include <vector>
 
+#include "netlib/rpc_message.h"
+
 namespace netlib {
 
 struct HttpHeader {
@@ -24,7 +26,8 @@ struct HttpRequestMetadata {
   bool keep_alive = false;
 };
 
-using FrameMetadata = std::variant<BinaryFrameMetadata, HttpRequestMetadata>;
+using FrameMetadata =
+    std::variant<BinaryFrameMetadata, HttpRequestMetadata, RpcFrameMetadata>;
 
 struct BinaryResponse {
   std::vector<char> payload;
@@ -38,7 +41,8 @@ struct HttpResponse {
   bool keep_alive = true;
 };
 
-using ApplicationResponse = std::variant<BinaryResponse, HttpResponse>;
+using ApplicationResponse =
+    std::variant<BinaryResponse, HttpResponse, RpcResponse>;
 
 }  // namespace netlib
 
