@@ -13,6 +13,7 @@
 - `SubReactor`：管理每连接 Codec、读写缓冲、响应队列和非阻塞就绪事件。
 - `ProtocolCodec`：负责字节流分帧和响应编码，默认实现为 4 字节长度前缀。
 - `Http1Codec`：解析 HTTP/1.0、HTTP/1.1 Header、Content-Length Body 和 keep-alive。
+- `RpcCodec`：解析带版本、请求 ID、服务/方法名称和 TLV 扩展的 RPC 二进制帧。
 - `ConnectionHandle`：Worker 回写响应的安全弱连接句柄。
 - `frame_protocol.h`：定义 4 字节大端 payload 长度和 16 MiB payload 上限。
 - `ThreadPool`：使用 moodycamel MPMC 队列消费拥有数据的 `FrameMessage`。
@@ -37,7 +38,7 @@
 
 ```text
 TCP bytes
-  -> SubReactor 按长度前缀组装完整 payload
+  -> SubReactor 按所选 Codec 组装完整帧
   -> FrameMessage（拥有 payload）
   -> moodycamel BlockingConcurrentQueue
   -> ThreadPool Worker
@@ -52,16 +53,19 @@ TCP bytes
 协议解析和业务层通过 typed variant 解耦：
 
 ```cpp
-FrameMetadata = std::variant<BinaryFrameMetadata, HttpRequestMetadata>;
+FrameMetadata =
+    std::variant<BinaryFrameMetadata, HttpRequestMetadata, RpcFrameMetadata>;
 ApplicationResponse =
-    std::variant<BinaryResponse, HttpResponse>;
+    std::variant<BinaryResponse, HttpResponse, RpcResponse>;
 ```
 
 网络层仍然只有一份非模板 SubReactor。长度前缀协议提交
 `BinaryFrameMetadata`，HTTP 提交包含 method、target、version、Headers、
 Content-Length 和 keep-alive 的 `HttpRequestMetadata`。
+RPC 头部放入 `RpcFrameMetadata`，payload 为独立二进制；格式、扩展规则和接入示例见
+[RPC 协议文档](docs/rpc_protocol.md)。protobuf 解析与压缩处理由上层 RPC 框架负责。
 
-长度字段为 4 字节网络字节序，只计算 payload，不包含长度头。payload 最大
+默认长度前缀协议使用 4 字节网络字节序长度，只计算 payload，不包含长度头。payload 最大
 16 MiB。Worker Handler 并发执行，完成顺序不固定。SubReactor 使用每条连接内的
 `sequence` 重排响应，因此业务按乱序完成也能按请求到达顺序写回网络。
 

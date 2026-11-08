@@ -494,10 +494,11 @@ int RunReactorTest() {
   std::condition_variable response_gate_condition;
   bool later_response_queued = false;
   bool pipeline_gate_timed_out = false;
+  std::array<std::string, 2> second_frames;
   netlib::ThreadPool::Handler frame_handler =
       [&first_observation, &second_observation, &response_errors,
        &response_gate_mutex, &response_gate_condition, &later_response_queued,
-       &pipeline_gate_timed_out](netlib::FrameMessage message) {
+       &pipeline_gate_timed_out, &second_frames](netlib::FrameMessage message) {
         Observation* observation = nullptr;
         if (!message.payload.empty() && message.payload.front() == 'a') {
           observation = &first_observation;
@@ -510,8 +511,17 @@ int RunReactorTest() {
 
         {
           std::lock_guard<std::mutex> lock(observation->mutex);
-          observation->data.append(message.payload.data(),
-                                   message.payload.size());
+          if (observation == &second_observation &&
+              message.sequence < second_frames.size()) {
+            // Workers may execute out of order. Observe frame assembly by
+            // request sequence; wire response order is checked separately.
+            second_frames[message.sequence].assign(message.payload.data(),
+                                                   message.payload.size());
+            observation->data = second_frames[0] + second_frames[1];
+          } else {
+            observation->data.append(message.payload.data(),
+                                     message.payload.size());
+          }
           ++observation->frame_count;
           observation->condition.notify_all();
         }

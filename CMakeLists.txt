@@ -46,6 +46,7 @@ add_library(
     src/http1_codec.cc
     src/length_prefixed_codec.cc
     src/main_reactor.cc
+    src/rpc_codec.cc
     src/sub_reactor.cc
     src/thread_pool.cc
     src/unique_fd.cc)
@@ -138,6 +139,11 @@ if(BUILD_TESTING)
   add_executable(netlib_http_codec_test tests/http_codec_test.cc)
   target_link_libraries(netlib_http_codec_test PRIVATE netlib::netlib)
   add_test(NAME netlib_http_codec_test COMMAND netlib_http_codec_test)
+  add_executable(netlib_rpc_codec_test tests/rpc_codec_test.cc)
+  target_link_libraries(netlib_rpc_codec_test PRIVATE netlib::netlib)
+  netlib_warnings(netlib_rpc_codec_test)
+  add_test(NAME netlib_rpc_codec_test COMMAND netlib_rpc_codec_test)
+  set_tests_properties(netlib_rpc_codec_test PROPERTIES TIMEOUT 30)
   set_tests_properties(netlib_platform_test netlib_reactor_test netlib_log_test
     netlib_codec_test netlib_http_codec_test PROPERTIES TIMEOUT 120)
 endif()
