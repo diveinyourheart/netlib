@@ -196,11 +196,12 @@ NETLIB_LOG_INFO(*logger, "server started on port={} workers={}", 8080, 4);
 `ColorMode::kNever`。消息中的终端控制字符会被转义。
 
 Flush() 会记录已接受日志的截止编号，等待这个范围内的日志全部写出后再刷新。
-写线程跟踪连续完成进度，不依赖不同 producer 之间的出队顺序；后续日志可继续提交。
+所有日志线程在短锁内共用一个固定 ProducerToken，写线程按序推进完成水位；后续日志可继续提交。
 Stop() 关闭提交入口、排空已接受日志并完成刷新，然后等待后台线程退出。
 默认每 1000ms 自动请求刷新，可通过 LoggerOptions::flush_interval 调整（0 表示关闭）。
 刷新仍使用 fflush()，不保证断电持久化。可复用定时器见[定时器文档](docs/timer.md)。
-多生产者、完成窗口和刷新水位的关系见[日志状态图解](docs/logging_state.md)。
+多个提交线程、单 producer 和刷新水位的关系见[日志状态图解](docs/logging_state.md)。
+常驻线程显式 token 与控制消息隐式 producer 的分工见[队列拓扑](docs/queue_topology.md)。
 
 日志宏使用固定版本 fmtlib 11.2.0，格式串在编译期检查，例如：
 

@@ -1,141 +1,94 @@
 # 日志状态与刷新水位图解
 
-本文对应 [Logger::Impl 的实现](../src/log/logging.cc)，解释多个业务线程提交日志、
-一个写线程消费时，如何判断某次 Flush 是否可以完成。
+本文对应 [Logger::Impl 的实现](../src/log/logging.cc)。当前每个 Logger 固定一个
+显式 ProducerToken，由多个业务线程在同一把锁下轮流使用；只有一个写线程消费。
+日志按受理序号写出，因此已经删除旧版用于追踪乱序缺口的 completion_。
 
-先区分两个动作：**写完**表示 `LogSink::Write()` 已返回，写线程已登记完成；
-**完成一次刷新**还需要在目标范围全部写完之后，再调用并完成 `LogSink::Flush()`。
-`completed_` 跟踪前者，不表示这些日志已经 Flush，更不表示已持久化到磁盘。
+先区分两个动作：**写完**表示 Sink::Write 已返回，写线程已登记完成；
+**完成一次刷新**还需要在目标范围全部写完之后，再调用并完成 Sink::Flush。
+completed_ 跟踪前者，不表示日志已经 Flush，也不表示已持久化到磁盘。
 
-## 1. 多个生产者，一个写线程
+## 1. 多个调用线程，一个逻辑 producer
 
 ```mermaid
 flowchart LR
-    subgraph producers["多个业务线程：生产日志"]
-        A["线程 A"]
-        B["线程 B"]
-        C["线程 C"]
-    end
-
-    G["LogOwned：短暂持有 mutex_<br/>统一分配 sequence<br/>预留 completion_ 标记并入队"]
-    A --> G
-    B --> G
-    C --> G
-
-    subgraph queue["queue_：一个 ConcurrentQueue 对象，内部有 producer 子队列"]
-        QA["A 的子队列<br/>seq 0 → 3"]
-        QB["B 的子队列<br/>seq 1 → 4"]
-        QC["C 的子队列<br/>seq 2 → 5"]
-    end
-    G -->|"A 提交"| QA
-    G -->|"B 提交"| QB
-    G -->|"C 提交"| QC
-
-    W["唯一写线程 WriterLoop<br/>从子队列中批量取日志"]
-    QA --> W
-    QB --> W
-    QC --> W
+    A["业务线程 A"] --> G
+    B["业务线程 B"] --> G
+    C["业务线程 C"] --> G
+    G["LogOwned：短暂持有 mutex_<br/>检查容量、分配 sequence、入队"]
+    G --> P["固定的 producer_<br/>唯一 ProducerToken"]
+    P --> Q["queue_：唯一 producer 子队列<br/>0 → 1 → 2 → 3"]
+    Q --> W["唯一写线程<br/>持 consumer_ 批量出队"]
     W --> S["锁外执行 Sink::Write"]
-    S --> P["短暂持有 mutex_<br/>标记 completion_ 并推进 completed_"]
-    P --> F["ServiceFlushes<br/>检查刷新目标是否达成"]
-    F -->|"目标达成"| IO["锁外执行 Sink::Flush"]
+    S --> M["短暂持有 mutex_<br/>核对 sequence 等于 completed_<br/>completed_ 加 1"]
+    M --> F["ServiceFlushes<br/>目标达成后在锁外 Flush"]
 ```
 
-`sequence` 在同一个 Logger 内统一从 0 开始分配。当前不传 ProducerToken，
-moodycamel 按调用线程获取或创建隐式 producer，并复用其子队列。
-同一个 producer 的日志保持 FIFO，跨 producer 不承诺全局 FIFO。
-即使在 `mutex_` 下依次提交 0、1、2、3、4、5，也可能按下面的顺序消费：
+ProducerToken 不与某个 OS 线程永久绑定，但不能被多个线程同时使用。这里的
+mutex_ 同时保护编号、入队和刷新快照，所以跨线程受理顺序与入队顺序一致。
+LogQueueTraits 禁用了隐式 producer，防止后续代码绕过固定 token，重新引入子队列。
+
+定时刷新和 Stop 通过状态及条件变量通知写线程，不向日志队列插入控制消息，
+因此不会为这些控制动作创建其他 producer。
+
+## 2. 用两个边界理解未完成日志
+
+假设已经接受 seq 0..4，seq 0、1 已写完：
 
 ```text
-成功提交的编号顺序：0 → 1 → 2 → 3 → 4 → 5
-一种可能的写入顺序：0 → 3 → 1 → 4 → 2 → 5
+              already written       accepted but not completed
+sequence           0   1                 2   3   4             5 (next)
+                                        ^                     ^
+                                   completed_=2          accepted_=5
+
+outstanding = accepted_ - completed_ = 3
 ```
 
-消费者 token `consumer_` 用于复用消费状态，不会将这些子队列合并成全局有序队列。
-写线程按实际出队顺序写日志；下面的状态跟踪用于保证刷新范围完整，不重排打印顺序。
+- **accepted_ 是发号位置。** 上例成功受理 5 条，下一条成功日志领取 seq 5。
+- **completed_ 是下一条应登记写完的 sequence。** 所有 [0, completed_) 已连续写完。
+  单写线程写完 seq 2 后，直接将 completed_ 从 2 推进到 3。
+- **[completed_, accepted_) 是未完成范围。** 不需要再为每个序号维护一个 bool。
+- **queued_count() 等于 accepted_ - completed_。** 它包括仍在队列、已批量取出以及
+  正在写的日志，不等于物理队列当前长度。
 
-## 2. 消息队列与完成窗口是两种结构
+例如写线程把 seq 2、3、4 一次取入批次数组 records 后，消息队列可以已经为空，
+但 completed_ 仍是 2，未完成数量仍为 3。所以不能将 completed_ 理解为物理消息
+队列当前队头的序号。
 
-| 结构 | 存放什么 | 排列或访问方式 | 谁修改 |
-| --- | --- | --- | --- |
-| `queue_` | 拥有业务消息和元信息的 `LogRecord` | 各 producer 内有序，跨 producer 可以交错 | 生产者入队，写线程出队 |
-| `completion_` | 每个已受理序号的一个 `bool`，不存放日志正文 | 严格按 sequence 从小到大排列 | 生产者在尾部添加 false；写线程标记并移除连续为 true 的队头 |
-
-一条日志已经从 `queue_` 取出，并不代表它已经写完。它可能还在写线程的批次数组
-`records` 中等待处理，或者正在执行 `Sink::Write()`；完成窗口中的标记仍为 false。
-
-## 3. 用队头、队尾理解水位
-
-假设序号 0、1 已连续写完，2 尚未完成，3、4 已经提前写完：
+在 mutex_ 下观察完成的一次状态更新，满足：
 
 ```text
-             completion_: [completed_, accepted_)
-           +---------+---------+---------+
-index      |    0    |    1    |    2    |
-sequence   |    2    |    3    |    4    |        5 (next)
-written?   |    F    |    T    |    T    |
-           +---------+---------+---------+
-                ^                             ^
-           completed_=2                  accepted_=5
+0 <= accepted_ - completed_ <= capacity_
+queued_count() = accepted_ - completed_
+全部写完：completed_ == accepted_
 ```
 
-- **`completed_` 是完成窗口队头对应日志的 sequence。** 上例队头对应 seq 2。
-  它也表示所有 `[0, completed_)` 的日志已连续写完。
-- **`accepted_` 是窗口尾部之后的下一个 sequence。** 上例已成功受理 5 条日志，
-  下一条成功日志使用 seq 5。
-- **`completion_[i]` 对应 seq `completed_ + i`。** 例如下标 2 对应 seq 4。
-- **`queued_` 数的是仍为 false 的标记数量。** 上例只有 seq 2 尚未登记写完，
-  所以 `queued_ = 1`，虽然窗口仍有 3 个元素。
+容量仍约束所有尚未登记写完的日志，包含正在执行慢 I/O 的记录。这样批量出队
+不会提前释放容量，慢 Sink 不会使待写日志无限增长。
 
-窗口为空时没有队头，此时 `completed_ == accepted_`，且 `queued_ == 0`。
-因此“completed_ 是队头日志的 sequence”需要带上“窗口非空”这个前提。
+## 3. 后续日志不延长已登记的 Flush 目标
 
-在 `mutex_` 保护下、一次状态更新完成后，可以用下面的关系核对状态：
+沿用上例，显式 Flush 记录 target=5，要求 seq 0..4 写完。随后接受 seq 5：
 
-```text
-completion_ 覆盖的序号范围 = [completed_, accepted_)
-completion_.size()        = accepted_ - completed_
-queued_                   = completion_ 中 false 的数量
-queued_ <= completion_.size() <= capacity_
-```
+| 操作 | accepted_ | completed_ | 未完成数量 | target=5 的状态 |
+| --- | ---: | ---: | ---: | --- |
+| 登记 Flush | 5 | 2 | 3 | 等待 seq 2、3、4 |
+| 新日志 seq 5 入队 | 6 | 2 | 4 | 目标仍为 5 |
+| 写完 seq 2 | 6 | 3 | 3 | 继续等待 |
+| 写完 seq 3 | 6 | 4 | 2 | 继续等待 |
+| 写完 seq 4 | 6 | 5 | 1 | 写入条件达成，可以执行 Sink::Flush |
+| Sink::Flush 返回 | 6 | 5 | 1 | done=true，唤醒调用方 |
+| 后续写完 seq 5 | 6 | 6 | 0 | 后续日志完成 |
 
-容量限制检查 `completion_.size()`。提前写完的 true 标记会一直保留到前面的缺口
-被填上，因此即使物理消息队列已经空出位置，完成窗口仍可能满；这时拒绝新日志，
-避免未完成的低序号日志让跟踪状态无限增长。
+这里每条日志写完后只执行 completed_++，不再标记和移除 completion_ 的队头。
+写线程会断言 record.sequence == completed_，核对唯一 producer 的 FIFO 约束。
 
-## 4. 填上缺口，水位才会推进
+这个例子在 seq 5 写出前完成刷新。实际运行中后续日志也可能在登记刷新前就被写出，
+或在刷新调用方醒来前继续写出。Flush 保证目标范围完整，不保证排除后续日志。
 
-沿用上例，假设当前有一次 `target = 5` 的 Flush，要求 seq 0..4 全部写完。
-随后又成功提交了 seq 5，但它不改变这次 Flush 的目标：
+## 4. Flush 的登记与完成
 
-| 时刻 | accepted_ | completed_ | completion_，括号内为对应序号 | queued_ | target=5 的状态 |
-| --- | ---: | ---: | --- | ---: | --- |
-| seq 2 未完成，3、4 已写完 | 5 | 2 | `[F, T, T]`，对应 2、3、4 | 1 | 等待 seq 2 |
-| 新日志 seq 5 入队 | 6 | 2 | `[F, T, T, F]`，对应 2、3、4、5 | 2 | 目标仍为 5 |
-| seq 2 写完，标记并推进水位 | 6 | 5 | `[F]`，只剩 seq 5 | 1 | 写入条件达成，可以执行 Sink::Flush |
-| Sink::Flush 返回 | 6 | 5 | `[F]`，只剩 seq 5 | 1 | `done=true`，唤醒这次 Flush 的调用者 |
-
-水位推进这一行，内部实际做了以下操作：
-
-```text
-标记 seq 2：completion_[2 - completed_] = true
-
-completed_=2    [T, T, T, F]    对应 2、3、4、5
-移除队头 true → completed_=3   [T, T, F]    对应 3、4、5
-移除队头 true → completed_=4   [T, F]       对应 4、5
-移除队头 true → completed_=5   [F]          对应 5
-遇到 false，停止推进。
-```
-
-这里的出队是 `completion_.pop_front()`，只移除状态标记；日志正文此前已经从
-`queue_` 出队并写过。两种出队发生在不同的结构上。
-
-这个例子中 seq 5 可以在本次 Flush 完成后再写。实际运行中它也可能提前被写出，
-因此 Flush 保证目标范围完整，不保证排除目标之后的日志。
-
-## 5. Flush 的目标如何从登记走到完成
-
-下面假设普通日志未触发逐条刷新，省略定时器和 WARN 以上级别的即时刷新：
+下面省略 WARN 以上级别和 flush_each_record 触发的即时刷新：
 
 ```mermaid
 sequenceDiagram
@@ -145,87 +98,81 @@ sequenceDiagram
     participant W as 唯一写线程
     participant S as LogSink
 
-    Note over M: accepted_=5, completed_=2<br/>completion_=[F,T,T]
+    Note over M: accepted_=5, completed_=2
     C->>M: 加锁，登记 FlushRequest(target=5)
     C->>M: work_.notify_one()
-    Note over C,M: progress_.wait 释放 mutex_，调用线程等待
-    B->>M: 提交 seq 5，accepted_=6<br/>completion_=[F,T,T,F]
-    W->>S: Write(seq 2)，锁外执行
-    S-->>W: Write 返回
-    W->>M: 加锁，queued_ 减 1<br/>标记 seq 2，移除连续 true<br/>completed_=5，剩余 [F]
-    W->>M: ServiceFlushes 检查 target 已达成<br/>取走该刷新请求并释放锁
+    Note over C,M: progress_.wait 释放锁，调用线程等待
+    B->>M: 用固定 producer 提交 seq 5，accepted_=6
+    W->>S: 依次 Write seq 2、3、4，锁外执行
+    W->>M: 每条写完后登记完成，completed_ 推进到 5
+    W->>M: ServiceFlushes 取走已达标请求并释放锁
     W->>S: Flush()，锁外执行
     S-->>W: Flush 返回
-    W->>M: 加锁，request.done=true<br/>progress_.notify_all()
+    W->>M: 加锁，request.done=true，通知 progress_
     M-->>C: 重新获得锁，Flush 返回 true
 ```
 
-`FlushRequest::target` 是受理数量快照，也是刷新范围的右开边界。
-`target <= completed_` 只说明可以刷新；`done=true` 才说明目标达到后执行的
-`Sink::Flush()` 已返回。写线程从 `requests_` 取走请求时，调用者仍通过 shared_ptr
-持有同一对象，等待其 done 状态。
+target 是 accepted_ 的快照，也是范围的右开边界。target <= completed_ 表示可以刷新；
+done=true 表示达标之后执行的 Sink::Flush 已返回。请求出队后，等待方的 shared_ptr
+仍持有该请求对象。等待条件变量会释放 mutex_，业务提交不会等待 Sink I/O 完成。
 
-“Flush 之前的日志”以受理成功为边界：在 Flush 开始前已返回 true 的提交必然
-包含在目标内；与快照并发、仍在格式化或等待提交锁的调用，以是否在快照前受理为准。
+“Flush 之前的日志”以受理成功为边界：在 Flush 开始前已返回 true 的提交必然包含
+在内；仍在格式化或与快照并发的调用，以是否在快照前受理为准。
 
-## 6. 每个状态由谁维护
+## 5. 每个状态的作用和更新位置
 
-| 状态或对象 | 形象理解与用途 | 更新位置 |
+| 状态或对象 | 形象理解与用途 | 谁更新 |
 | --- | --- | --- |
-| `accepted_` | 发号位置；每条成功日志领取当前编号，随后加 1 | LogOwned 成功入队后 |
-| `completed_` | 完成窗口队头的序号；窗口为空时等于 accepted_ | 写线程连续移除 true 队头时 |
-| `completion_` | 按编号排好的完成标记，不是日志消息队列 | LogOwned 预留 false；写线程标记 true、移除连续 true |
-| `queued_` | 仍未登记写完的日志数量，含已出队和正在写的记录 | 成功受理加 1；写线程完成登记时减 1 |
-| `capacity_` | 完成窗口最多保留多少个序号 | 构造时确定；LogOwned 检查 |
-| `requests_` | 显式 Flush 请求的等候队列，各自有固定 target | Flush 登记；ServiceFlushes 取走已达标请求 |
-| `FlushRequest::done` | 某次显式刷新已完成的回执 | Sink::Flush 返回后由写线程置为 true |
-| `periodic_target_` | 定时器留下的一张刷新目标便签 | 定时器登记；ServiceFlushes 达标后取走 |
-| `dropped_` | 累计丢弃计数 | 容量不足或预留、入队失败时调用 Drop |
-| `unreported_drops_` | 留给下一条成功日志报告的丢弃数量 | Drop 累加；附在成功入队日志上后清零 |
-| `stopping_` | 关闭提交入口，同时要求写线程收尾 | Stop 或写线程异常时置为 true |
-| `failed_` | 写线程异常标记，让 Flush 等待者可以返回失败 | WriterLoop 的异常处理 |
-| `mutex_` | 让提交编号、完成标记、刷新快照和停止状态保持一致 | 生产者、写线程、定时器、Flush/Stop 调用方短暂持有 |
-| `work_` | 给写线程的门铃 | 新日志、显式/定时刷新、Stop 发通知 |
-| `progress_` | 给 Flush 等待者的完成通知 | 显式刷新完成或写线程异常时 notify_all |
-| `stop_mutex_` | 让多个 Stop 调用串行等待同一次完整退出 | Stop 持有，直到后台线程 join 完成 |
-| `timer_` | 定期登记目标，不执行 Sink I/O | 构造时按配置启动，Stop 时停止 |
-| `writer_` | 唯一执行 Sink::Write/Flush 的线程 | WriterLoop；正常排空刷新后退出，或异常退出 |
+| accepted_ | 下一张日志编号；已成功受理总量 | LogOwned 入队成功后加 1 |
+| completed_ | 下一条应完成的编号；此前日志全已写完 | 写线程按顺序登记后加 1 |
+| capacity_ | 允许保留多少条尚未完成日志 | 构造时确定，LogOwned 检查两水位之差 |
+| queue_ | 唯一 producer 子队列，拥有 LogRecord | 业务线程在锁下入队，写线程批量出队 |
+| producer_ | 所有业务线程共用的显式生产者 token | 构造时创建；LogOwned 在 mutex_ 下使用 |
+| consumer_ | 写线程独占的显式消费者 token | WriterLoop 使用 |
+| requests_ | 显式 Flush 的目标等候队列 | Flush 登记，ServiceFlushes 取走达标请求 |
+| FlushRequest::done | 一次显式刷新的完成回执 | 目标达成且 Sink::Flush 返回后置 true |
+| periodic_target_ | 定时器留下的固定目标便签 | 定时器登记，ServiceFlushes 达标后取走 |
+| dropped_ | 累计丢弃数量 | 容量不足或入队失败时 Drop 累加 |
+| unreported_drops_ | 留给下一条成功日志报告的丢弃数量 | Drop 累加，附在成功入队日志上后清零 |
+| stopping_ | 关闭提交入口并要求写线程收尾 | Stop 或写线程异常时置 true |
+| failed_ | 让 Flush 等待者返回失败的异常标记 | WriterLoop 的异常处理 |
+| mutex_ | 统一保护编号、token 使用、完成计数和控制状态 | 提交、写线程、定时器和 Flush/Stop 短暂持有 |
+| work_ | 写线程的门铃 | 新日志、显式/定时刷新、Stop 通知 |
+| progress_ | Flush 调用方的完成门铃 | 显式刷新完成或写线程异常时通知 |
+| stop_mutex_ | 保证并发 Stop 调用都等待完整退出 | Stop 持有到 join 结束 |
+| timer_ | 只登记定时刷新目标 | 构造时按配置启动，Stop 时停止 |
+| writer_ | 唯一执行 Sink::Write/Flush 的线程 | WriterLoop |
 
-这里对 queued_ 的“写完”判断包含写线程的完成登记。若该记录还要立即刷新，
-`flush_each_record_` 或 WARN 以上级别触发的 Flush 也会在完成登记之前执行。
+旧版 completion_ 与独立 queued_ 已删除。queued_count() 直接从两个水位计算。
+WARN 以上级别或 flush_each_record 要求的即时 Flush 会在该记录登记完成前执行。
 
-## 7. LogOwned 如何避免留下永远补不上的缺口
+## 6. 提交失败、定时刷新和停止
 
-提交过程在同一个 `mutex_` 临界区中完成：
+LogOwned 先在锁外准备 LogRecord，再在 mutex_ 内执行：
 
 ```text
-检查 stopping_ 与完成窗口容量
+检查 stopping_ 和 accepted_ - completed_ 是否达到容量
     ↓
 record.sequence = accepted_
 record.dropped_messages = unreported_drops_
     ↓
-completion_.push_back(false)     先预留对应编号的标记
-    ↓
-queue_.enqueue(record)           发布消息
-    ├─ 失败：pop_back 撤销预留，记录 Drop，不增加 accepted_
-    └─ 成功：清零 unreported_drops_，accepted_++，queued_++，通知写线程
+queue_.enqueue(producer_, record)
+    ├─ 失败：Drop，accepted_ 不增加，下次可继续使用该编号
+    └─ 成功：清零 unreported_drops_，accepted_++，通知写线程
 ```
 
-如果预留 false 自身失败，同样记录 Drop 并拒绝提交；如果已经停止或日志级别被过滤，
-则直接拒绝，不计入 Drop。成功编号连续，失败提交不占编号，Flush 不会等待一条
-从未成功发布的日志。写线程完成登记也要获取同一把锁，因此无法看到提交过程的半成品。
+现在没有预留完成标记，也没有需要回滚的 completion_ 元素。日志级别过滤和停止后
+拒绝提交不计入 Drop；容量不足或入队失败才计入。成功编号连续，不会为失败提交留下缺口。
 
-## 8. 定时刷新和停止复用同一套水位
+定时器只在 periodic_target_ 没有值时记录 accepted_，待处理目标保留原值，后续 tick
+合并。目标为 0 仍是有效刷新请求，与 optional 没有值不同。
 
-定时器在 `periodic_target_` 没有值时记录 `accepted_`，有待处理目标时保留原值，
-合并后续 tick。持续提交新日志不会让这张便签的目标不断后移。
-optional 中存着 0 也表示存在一个刷新目标，与没有值不同。
+正常 Stop：关闭提交入口 → 停止定时器 → 依次写完已受理日志、完成已登记刷新 →
+最终 Sink::Flush → 写线程退出并 join。关闭入口后 accepted_ 不再增长，
+completed_ == accepted_ 就能判断全部写完。
 
-正常 Stop 的流程是：关闭提交入口 → 停止定时器 → 写线程处理完已受理日志和
-已登记的显式刷新请求 → 最终 Flush → 写线程退出，Stop 完成 join。
-关闭入口后 accepted_ 不再增长，`completed_ == accepted_` 就表示已全部写完。
-ServiceFlushes 在最终 Flush 返回后才返回 true，WriterLoop 随之退出。
+Sink 等操作抛出异常时，写线程设置 failed_、stopping_ 并通知 Flush 等待者返回失败，
+剩余日志不保证完成。标准输出 Sink 使用 fflush，不保证断电持久化，也未通过当前
+void 接口报告 FILE* I/O 返回码。
 
-如果 Sink 等操作抛出异常，写线程会设置 failed_、stopping_ 并唤醒 Flush 等待者；
-这些等待者可返回 false，剩余日志不保证完成。Stop 仍会等待线程退出。
-标准输出 Sink 使用 fflush；文件系统断电持久化和 FILE* I/O 错误上报不在当前保证内。
+请求、响应和日志三条通道的 token 分布见[队列拓扑](queue_topology.md)。

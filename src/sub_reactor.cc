@@ -54,11 +54,25 @@ struct ResponseMessage {
 
 class SubReactor::ResponseQueue {
  public:
-  ResponseQueue(std::size_t capacity, std::shared_ptr<platform::Wakeup> wake_fd)
+  ResponseQueue(std::size_t capacity, std::shared_ptr<platform::Wakeup> wake_fd,
+                ThreadPool& worker_pool)
       : capacity_(capacity),
         wake_fd_(std::move(wake_fd)),
+        worker_pool_(worker_pool.impl_),
         queue_(capacity),
-        consumer_token_(queue_) {}
+        consumer_token_(queue_) {
+    worker_producers_.reserve(worker_pool.worker_count());
+    for (std::size_t i = 0; i < worker_pool.worker_count(); ++i) {
+      worker_producers_.emplace_back(queue_);
+    }
+  }
+
+  bool valid() const {
+    return std::all_of(worker_producers_.begin(), worker_producers_.end(),
+                       [](const moodycamel::ProducerToken& producer) {
+                         return producer.valid();
+                       });
+  }
 
   bool Enqueue(ResponseMessage message) {
     return EnqueueMessage(std::move(message), true);
@@ -103,7 +117,15 @@ class SubReactor::ResponseQueue {
       queued_count_.fetch_sub(1, std::memory_order_release);
       return false;
     }
-    if (!queue_.enqueue(std::move(message))) {
+    // Each pool worker has exclusive use of its own token in this queue.
+    // Timer callbacks and external async responders keep implicit producers.
+    const std::optional<std::size_t> worker =
+        ThreadPool::CurrentWorkerIndex(worker_pool_);
+    const bool enqueued =
+        worker.has_value()
+            ? queue_.enqueue(worker_producers_[*worker], std::move(message))
+            : queue_.enqueue(std::move(message));
+    if (!enqueued) {
       queued_count_.fetch_sub(1, std::memory_order_release);
       return false;
     }
@@ -126,7 +148,12 @@ class SubReactor::ResponseQueue {
 
   const std::size_t capacity_;
   const std::shared_ptr<platform::Wakeup> wake_fd_;
+  // An in-flight external Respond may keep this queue alive after its reactor
+  // closes. Retain pool identity state instead of borrowing a ThreadPool
+  // object.
+  const std::shared_ptr<ThreadPool::Impl> worker_pool_;
   moodycamel::ConcurrentQueue<ResponseMessage> queue_;
+  std::vector<moodycamel::ProducerToken> worker_producers_;
   moodycamel::ConsumerToken consumer_token_;
   std::atomic<std::size_t> queued_count_{0};
   std::atomic<bool> accepting_{true};
@@ -536,6 +563,10 @@ std::unique_ptr<SubReactor> SubReactor::Create(
   auto reactor = std::unique_ptr<SubReactor>(new SubReactor(
       std::move(event_loop), std::move(wake_fd), options, worker_pool,
       std::move(codec_factory), std::move(callbacks), logger));
+  if (!reactor->request_submitter_.valid() ||
+      !reactor->response_queue_->valid()) {
+    return nullptr;
+  }
   SubReactor* reactor_pointer = reactor.get();
   ChannelCallbacks wake_callbacks{
       [reactor_pointer] { reactor_pointer->HandleWake(); },
@@ -565,12 +596,12 @@ SubReactor::SubReactor(std::unique_ptr<EventLoop> event_loop,
                        ProtocolCodecFactory codec_factory,
                        ConnectionCallbacks callbacks, log::Logger* logger)
     : event_loop_(std::move(event_loop)),
-      worker_pool_(worker_pool),
+      request_submitter_(worker_pool.CreateSubmitter()),
       codec_factory_(std::move(codec_factory)),
       callbacks_(std::move(callbacks)),
       wake_fd_(std::move(wake_fd)),
       response_queue_(std::make_shared<ResponseQueue>(
-          options.max_pending_responses, wake_fd_)),
+          options.max_pending_responses, wake_fd_, worker_pool)),
       options_(options),
       logger_(logger) {}
 
@@ -939,7 +970,7 @@ bool SubReactor::ProcessFrames(Connection& connection) {
         .metadata = std::move(decode_result.metadata),
         .payload = std::vector<char>(payload.begin(), payload.end()),
     };
-    if (!worker_pool_.Submit(std::move(message))) {
+    if (!request_submitter_.Submit(std::move(message))) {
       if (logger_ != nullptr) {
         NETLIB_LOG_WARN(*logger_,
                         "worker queue full for connection id={} sequence={}",
