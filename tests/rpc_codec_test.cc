@@ -16,6 +16,7 @@
 #include <variant>
 #include <vector>
 
+#include "netlib/connection_handle.h"
 #include "netlib/frame_message.h"
 #include "netlib/main_reactor.h"
 #include "netlib/platform.h"
@@ -492,12 +493,97 @@ bool TestReactorRoundTrip() {
   return Check(success, "RPC Reactor metadata/response round trip failed");
 }
 
+bool TestRequestTimeout() {
+  std::mutex mutex;
+  std::condition_variable condition;
+  std::array<netlib::ConnectionHandle, 2> handles;
+  std::size_t received_requests = 0;
+  bool handler_ok = true;
+  std::unique_ptr<netlib::ThreadPool> workers =
+      netlib::ThreadPool::Create(1, 16, [&](netlib::FrameMessage message) {
+        const netlib::RpcFrameMetadata* metadata =
+            std::get_if<netlib::RpcFrameMetadata>(&message.metadata);
+        std::lock_guard<std::mutex> lock(mutex);
+        if (metadata == nullptr || message.sequence >= handles.size() ||
+            metadata->request_id != (message.sequence == 0 ? 900 : 7)) {
+          handler_ok = false;
+        } else {
+          handles[message.sequence] = message.connection;
+        }
+        ++received_requests;
+        condition.notify_all();
+        // Leave both requests unanswered; timeout must close the connection
+        // without fabricating a response using the last decoded request's ID.
+      });
+  if (!workers) {
+    return false;
+  }
+  const netlib::SubReactorOptions options{
+      .request_timeout = std::chrono::milliseconds(100),
+  };
+  std::unique_ptr<netlib::SubReactor> sub = netlib::SubReactor::Create(
+      options, *workers, {}, [] { return netlib::CreateRpcCodec(); });
+  if (!sub) {
+    return false;
+  }
+  std::unique_ptr<netlib::MainReactor> main =
+      netlib::MainReactor::Create(0, {sub.get()});
+  if (!main) {
+    return false;
+  }
+  std::thread sub_thread([&] { sub->Run(); });
+  std::thread main_thread([&] { main->Run(); });
+
+  netlib::UniqueFd client(netlib::platform::CreateTcpSocket(false));
+  bool success = client &&
+                 netlib::platform::SetReceiveTimeout(client.get(), 3000) &&
+                 netlib::platform::ConnectLoopback(client.get(), main->port());
+  std::vector<char> requests;
+  for (std::uint64_t id : {900, 7}) {
+    netlib::RpcFrameMetadata request = RequestMetadata();
+    request.request_id = id;
+    success = netlib::EncodeRpcFrame(request, {}, &requests) && success;
+  }
+  success = success && SendAll(client.get(), requests);
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    success = success && condition.wait_for(lock, std::chrono::seconds(3), [&] {
+      return received_requests == handles.size();
+    });
+    success = success && handler_ok;
+  }
+  if (success) {
+    char byte = 0;
+    std::ptrdiff_t result = netlib::platform::Receive(client.get(), &byte, 1);
+    while (result < 0 &&
+           netlib::platform::Interrupted(netlib::platform::LastError())) {
+      result = netlib::platform::Receive(client.get(), &byte, 1);
+    }
+    success = result == 0;
+    std::lock_guard<std::mutex> lock(mutex);
+    for (std::size_t sequence = 0; sequence < handles.size(); ++sequence) {
+      success = success && !handles[sequence].valid() &&
+                !handles[sequence].Respond(sequence, netlib::RpcResponse{});
+    }
+  }
+
+  client.Reset();
+  main->Stop();
+  sub->Stop();
+  main_thread.join();
+  sub_thread.join();
+  workers->Stop();
+  return Check(success,
+               "RPC timeout did not close without an uncorrelated reply");
+}
+
 }  // namespace
 
 int main() {
   return TestWireFormatAndFragments() && TestCoalescingAndOwnership() &&
                  TestInvalidFrames() && TestLimitsAndResponses() &&
-                 TestEncodeFailureIsAtomic() && TestReactorRoundTrip()
+                 TestEncodeFailureIsAtomic() && TestReactorRoundTrip() &&
+                 TestRequestTimeout()
              ? 0
              : 1;
 }
