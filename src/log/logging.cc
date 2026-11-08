@@ -134,35 +134,50 @@ std::string FormatTimestamp(std::chrono::system_clock::time_point timestamp) {
 std::string MakePrefix(const LogRecord& record, bool color) {
   std::string prefix;
   prefix.reserve(512);
+  // Reset styles between fields too, so FATAL's bold style cannot leak into
+  // the other metadata. The business message starts after the final reset.
+  const std::string_view separator = color ? "\x1b[0;90m | " : " | ";
 
   if (color) {
-    prefix.append("\x1b[2m");
+    prefix.append("\x1b[0;90m");
   }
   prefix.append(FormatTimestamp(record.timestamp));
-  if (color) {
-    prefix.append("\x1b[0m");
-  }
 
-  prefix.append(" | ");
+  prefix.append(separator);
   if (color) {
     prefix.append(LevelColor(record.level));
   }
   prefix.append(LevelName(record.level));
-  if (color) {
-    prefix.append("\x1b[0m");
-  }
 
-  prefix.append(" | seq=");
+  prefix.append(separator);
+  if (color) {
+    prefix.append("\x1b[34m");
+  }
+  prefix.append("seq=");
   AppendUnsigned(prefix, record.sequence);
-  prefix.append(" | tid=");
+  prefix.append(separator);
+  if (color) {
+    prefix.append("\x1b[35m");
+  }
+  prefix.append("tid=");
   AppendUnsigned(prefix, record.thread_id);
   if (record.dropped_messages != 0) {
-    prefix.append(" | drops=");
+    prefix.append(separator);
+    if (color) {
+      prefix.append("\x1b[33m");
+    }
+    prefix.append("drops=");
     AppendUnsigned(prefix, record.dropped_messages);
   }
-  prefix.append(" | ");
+  prefix.append(separator);
+  if (color) {
+    prefix.append("\x1b[36m");
+  }
   prefix.append(record.logger_name);
-  prefix.append(" | ");
+  prefix.append(separator);
+  if (color) {
+    prefix.append("\x1b[94m");
+  }
   prefix.append(BaseName(record.source.file_name()));
   prefix.push_back(':');
   AppendUnsigned(prefix, record.source.line());
@@ -170,7 +185,10 @@ std::string MakePrefix(const LogRecord& record, bool color) {
     prefix.push_back(' ');
     prefix.append(record.source.function_name());
   }
-  prefix.append(" | ");
+  prefix.append(separator);
+  if (color) {
+    prefix.append("\x1b[0m");
+  }
   return prefix;
 }
 
@@ -209,7 +227,9 @@ class StdoutSink final : public LogSink {
       char character = message[i];
       if (character == '\n') {
         WriteSegment(message, segment_start, i);
-        std::fwrite("\n    | ", 1, 7, output_);
+        const std::string_view continuation =
+            color_ ? "\n\x1b[0;90m    | \x1b[0m" : "\n    | ";
+        std::fwrite(continuation.data(), 1, continuation.size(), output_);
         segment_start = i + 1;
         continue;
       }

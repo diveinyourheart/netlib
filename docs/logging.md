@@ -57,6 +57,18 @@ as visible `\xHH` text.
 - ERROR: red
 - FATAL: bold red
 
+All other metadata is colored as well:
+
+- timestamp, separators, and multi-line continuation prefixes: gray
+- sequence number (`seq`): blue
+- OS thread ID (`tid`): magenta
+- dropped-record count (`drops`), when present: yellow
+- logger name: cyan
+- source file, line, and function: bright blue
+
+Styles are reset between fields and before each business-message line, so the
+message uses the terminal's default style and never inherits the level color.
+
 `ColorMode::kAuto` enables color only when the output stream is a TTY. Use
 `kAlways` for terminal tooling and `kNever` for redirected output and tests.
 

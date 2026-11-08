@@ -103,7 +103,8 @@ int RunStdoutFormatTest() {
       colorless.find("log_test.cc") == std::string::npos ||
       colorless.find("hello world\n    | next") == std::string::npos ||
       colorless.find("count=42 name=worker") == std::string::npos ||
-      colorless.find("\\x1B[31mred") == std::string::npos) {
+      colorless.find("\\x1B[31mred") == std::string::npos ||
+      colorless.find('\x1b') != std::string::npos) {
     ReportFailure("stdout log format is incomplete or unsafe");
     return 1;
   }
@@ -122,7 +123,7 @@ int RunStdoutFormatTest() {
     ReportFailure("failed to create colored logger");
     return 1;
   }
-  NETLIB_LOG_WARN(*colored_logger, "colored {}", "message");
+  NETLIB_LOG_WARN(*colored_logger, "colored {}\nnext", "message");
   if (!colored_logger->Flush()) {
     ReportFailure("failed to flush colored logger");
     return 1;
@@ -130,9 +131,15 @@ int RunStdoutFormatTest() {
   colored_logger->Stop();
   std::string colored = ReadFile(colored_output);
   std::fclose(colored_output);
-  if (colored.find("\x1b[33mWARN ") == std::string::npos ||
-      colored.find("\x1b[0m") == std::string::npos) {
-    ReportFailure("stdout log did not contain ANSI color");
+  if (!colored.starts_with("\x1b[0;90m") ||
+      colored.find("\x1b[33mWARN ") == std::string::npos ||
+      colored.find("\x1b[34mseq=") == std::string::npos ||
+      colored.find("\x1b[35mtid=") == std::string::npos ||
+      colored.find("\x1b[36mnetlib.color") == std::string::npos ||
+      colored.find("\x1b[94mlog_test.cc:") == std::string::npos ||
+      colored.find("\x1b[0;90m | \x1b[0mcolored message\n"
+                   "\x1b[0;90m    | \x1b[0mnext\n") == std::string::npos) {
+    ReportFailure("metadata colors are missing or leak into the message");
     return 1;
   }
   return 0;
