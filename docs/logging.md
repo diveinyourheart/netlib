@@ -3,14 +3,18 @@
 `netlib::log` is a separate static library and does not depend on the Reactor or
 ThreadPool implementation.
 
+中文状态与流程图解：[日志状态与刷新水位](logging_state.md)，包含多生产者单写线程、
+`completion_` 队头与 `completed_` 的关系，以及 Flush 目标达成的过程。
+
 ## Data path
 
 ```text
 producer thread
-  -> collect timestamp, OS tid, sequence, source location
   -> level short-circuit
   -> compile-time checked fmt formatting
+  -> collect timestamp, OS tid, source location
   -> move formatted message into LogRecord
+  -> under the admission mutex: assign sequence, reserve completion, enqueue
   -> bounded moodycamel ConcurrentQueue
 
 Logger writer thread
@@ -19,9 +23,10 @@ Logger writer thread
   -> StdoutSink formatting and output
 ```
 
-The producer never waits for terminal or network I/O. A full queue drops the new
-record, increments `dropped_count()`, and reports the pending drop count on the
-next successfully queued record.
+The producer may briefly contend on the admission mutex, but does not wait for
+sink I/O or a Flush to finish. A full completion window drops the new record,
+increments `dropped_count()`, and reports the pending drop count on the next
+successfully queued record.
 
 The macros use fmtlib 11.2.0 with compile-time format checking. Formatting is
 performed on the producer thread in one pass and the resulting string is moved
