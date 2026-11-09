@@ -7,6 +7,7 @@
 
 #include "netlib/connection_handle.h"
 #include "netlib/protocol_message.h"
+#include "netlib/request_context.h"
 
 namespace netlib {
 
@@ -18,6 +19,8 @@ struct FrameMessage {
   ConnectionHandle connection;
   FrameMetadata metadata;
   std::vector<char> payload;
+  // sequence mirrors request_context.request_id for existing handlers.
+  RequestContext request_context;
 
   bool Respond(ApplicationResponse response,
                bool close_after_write = false) const {

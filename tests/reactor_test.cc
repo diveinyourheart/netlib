@@ -8,6 +8,8 @@
 #include <cstdio>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -18,6 +20,7 @@
 #include "netlib/log/logging.h"
 #include "netlib/main_reactor.h"
 #include "netlib/platform.h"
+#include "netlib/protocol_codec.h"
 #include "netlib/sub_reactor.h"
 #include "netlib/thread_pool.h"
 #include "netlib/unique_fd.h"
@@ -49,6 +52,51 @@ class CountingSink final : public netlib::log::LogSink {
 
  private:
   std::atomic<std::size_t> record_count_{0};
+};
+
+enum class ControlConsumption { kValid, kZero, kOutOfBounds, kWithPayload };
+
+class ConsumingTestCodec final : public netlib::ProtocolCodec {
+ public:
+  explicit ConsumingTestCodec(ControlConsumption mode)
+      : mode_(mode), frames_(netlib::CreateLengthPrefixedCodec(1024)) {}
+
+  netlib::DecodeResult Decode(std::span<const char> input) override {
+    if (!input.empty() && input.front() == '!') {
+      std::size_t consumed_bytes = 1;
+      if (mode_ == ControlConsumption::kZero) {
+        consumed_bytes = 0;
+      } else if (mode_ == ControlConsumption::kOutOfBounds) {
+        consumed_bytes = input.size() + 1;
+      }
+      return netlib::DecodeResult{
+          .status = netlib::DecodeStatus::kConsumed,
+          .consumed_bytes = consumed_bytes,
+          .payload_size = mode_ == ControlConsumption::kWithPayload ? 1U : 0U,
+          .metadata = netlib::BinaryFrameMetadata{},
+      };
+    }
+    return frames_->Decode(input);
+  }
+  bool Encode(const netlib::ApplicationResponse& response,
+              std::vector<char>* output) override {
+    return frames_->Encode(response, output);
+  }
+  bool ShouldCloseAfterWrite(
+      const netlib::ApplicationResponse& response) const override {
+    return frames_->ShouldCloseAfterWrite(response);
+  }
+  std::optional<netlib::ApplicationResponse> CreateTimeoutResponse()
+      const override {
+    return frames_->CreateTimeoutResponse();
+  }
+  std::size_t MaxDecodeBufferSize() const override {
+    return frames_->MaxDecodeBufferSize();
+  }
+
+ private:
+  const ControlConsumption mode_;
+  std::unique_ptr<netlib::ProtocolCodec> frames_;
 };
 
 void ReportFailure(const char* message) {
@@ -180,6 +228,66 @@ bool WaitForClosed(Observation& observation) {
   std::unique_lock<std::mutex> lock(observation.mutex);
   return observation.condition.wait_for(
       lock, kWaitTimeout, [&observation] { return observation.closed; });
+}
+
+int RunControlConsumptionTest(ControlConsumption mode) {
+  Observation observation;
+  std::atomic<std::size_t> requests{0};
+  std::atomic<bool> handler_ok{true};
+  std::unique_ptr<netlib::ThreadPool> workers =
+      netlib::ThreadPool::Create(1, 8, [&](netlib::FrameMessage message) {
+        requests.fetch_add(1);
+        if (message.sequence != 0 ||
+            message.payload != std::vector<char>{'o', 'k'} ||
+            !message.Respond(std::move(message.payload), true)) {
+          handler_ok.store(false);
+        }
+      });
+  if (!workers) {
+    return 1;
+  }
+  const netlib::SubReactorOptions options{
+      .max_pending_connections = 8,
+      .max_pending_responses = 1,
+      .max_pending_output_bytes = 1028,
+  };
+  std::unique_ptr<netlib::SubReactor> sub = netlib::SubReactor::Create(
+      options, *workers, MakeConnectionCallbacks(observation),
+      [mode] { return std::make_unique<ConsumingTestCodec>(mode); });
+  if (!sub) {
+    return 1;
+  }
+  std::unique_ptr<netlib::MainReactor> main =
+      netlib::MainReactor::Create(0, {sub.get()});
+  if (!main) {
+    return 1;
+  }
+  std::thread sub_thread([&] { sub->Run(); });
+  std::thread main_thread([&] { main->Run(); });
+  netlib::UniqueFd client;
+  std::string input(32, '!');
+  input.append(MakeFrame("ok"));
+  bool success =
+      ConnectTo(main->port(), &client) && SendAll(client.get(), input);
+  if (mode == ControlConsumption::kValid) {
+    std::string response;
+    success = success && ReadFrame(client.get(), &response) && response == "ok";
+  }
+  success = success && WaitForClosed(observation);
+  client.Reset();
+  main->Stop();
+  sub->Stop();
+  main_thread.join();
+  sub_thread.join();
+  workers->Stop();
+  const std::size_t expected_requests =
+      mode == ControlConsumption::kValid ? 1 : 0;
+  if (!success || !handler_ok.load() || requests.load() != expected_requests) {
+    ReportFailure(
+        "control consumption created a request or accepted invalid progress");
+    return 1;
+  }
+  return 0;
 }
 
 int RunPendingCapacityTest() {
@@ -907,6 +1015,13 @@ int RunReactorTest() {
 }  // namespace
 
 int main() {
+  for (ControlConsumption mode :
+       {ControlConsumption::kValid, ControlConsumption::kZero,
+        ControlConsumption::kOutOfBounds, ControlConsumption::kWithPayload}) {
+    if (RunControlConsumptionTest(mode) != 0) {
+      return 1;
+    }
+  }
   int capacity_result = RunPendingCapacityTest();
   if (capacity_result != 0) {
     return capacity_result;

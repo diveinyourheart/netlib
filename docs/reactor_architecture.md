@@ -31,11 +31,11 @@ complete Frame
 
 worker response
   -> ConnectionHandle
-  -> cancel matching timeout
   -> SubReactor response queue
-  -> per-connection sequence reorder buffer
-  -> codec encode
-  -> output buffer
+  -> trusted RequestContext lookup + timer cancellation
+  -> ProtocolSession::OnResponse
+  -> CodecSession pipeline ordering/encoding, or native protocol routing
+  -> Session output buffer
   -> send until EAGAIN
 ```
 
@@ -46,6 +46,11 @@ the descriptor owner must outlive the Channel, and the EventLoop must outlive
 both. Reactors arrange their members in that order so Channels are removed
 before descriptors close.
 
+HTTP/2 work is tracked in [HTTP2_TASKS.md](../HTTP2_TASKS.md), with the session
+and protocol-selection design in [http2_design.md](http2_design.md). T01–T04
+provide detection, input-only progress and the Session boundary wired into the
+Reactor. They do not yet negotiate or serve HTTP/2 connections.
+
 MainReactor owns the listening descriptor and its Channel, but keeps non-owning
 pointers to SubReactors. The server orchestrator must keep every SubReactor
 alive until MainReactor has stopped. A successful `accept4` creates a
@@ -53,6 +58,29 @@ alive until MainReactor has stopped. A successful `accept4` creates a
 into the selected SubReactor. If the selected queue is full, MainReactor tries
 the remaining SubReactors. When every queue is full, the descriptor closes at
 the end of the accept iteration.
+
+## Session ownership and output
+
+Session calls execute only on the owning Reactor thread. `OnInput` returns
+progress plus zero or more owned requests; controls do not consume local request
+IDs or timers. `RequestContext::request_id` mirrors FrameMessage.sequence and
+is independent of its optional HTTP/2 stream_id and any RPC wire request ID.
+The Reactor retains the context with each request timer. Worker responses use
+the saved context, and duplicates or replies after timeout are ignored.
+
+`ProduceOutput` runs at registration, after input, response or timeout, and on
+writable readiness. It can emit control bytes without waiting for a Worker.
+An empty output while waiting for peer input does not enable writable interest.
+`ConsumeOutput` advances only by successfully sent bytes. A terminal Session
+closes after its output is sent. `WantsInput=false` disables read interest;
+an empty interest set pauses Channel registration, and resuming creates a fresh
+token. Already buffered input is processed on resume before waiting for more
+socket input. Input allocation is capped even for limits smaller than 4 KiB.
+
+`BeginDrain` is currently a Session hook: CodecSession stops accepting requests
+and waits for accepted responses. It is not wired to an orchestrator shutdown
+command; `SubReactor::Stop` still stops the loop immediately. HTTP/2 GOAWAY,
+stream cancellation, flow control and drain deadlines remain later work.
 
 ## Thread handoff
 
@@ -81,8 +109,11 @@ are read before `recv` returns zero. EventLoop dispatches both readable and writ
 
 ## Framing
 
-Each connection owns a `ProtocolCodec` instance, one reusable input buffer, one
-output buffer, and one stable connection ID. The default codec wire format is:
+Each connection owns a `ProtocolSession`, one reusable transport input buffer
+and one stable connection ID. The Session owns protocol state and encoded
+output. Existing Codec factories are wrapped in `CreateCodecSession`; the old
+creation API and Codec subclasses remain compatible. Native sessions enter
+through `SubReactor::CreateWithSession`. The default codec wire format is:
 
 ```text
 +--------------------------+-------------------+
@@ -94,8 +125,14 @@ The length excludes the four-byte prefix. A payload may be empty, but its
 length cannot exceed `kMaxFramePayloadSize`, currently 16 MiB.
 
 `ProtocolCodec::Decode` returns `NeedMore`, `FrameReady`, or `ProtocolError`.
+It can also return `kConsumed`: consume a positive, bounded number of input
+bytes, with zero payload offset/size, and continue decoding without creating a
+FrameMessage, application sequence, or request timeout. This prepares for
+control input. CodecSession translates it into Session progress without a
+business request; native Sessions can independently generate protocol output.
 For a complete frame it returns consumed bytes, payload offset, and payload
-size. SubReactor consumes only the declared bytes and immediately decodes any
+size. The adapter copies payload into an owned SessionRequest. SubReactor
+consumes only the declared bytes and immediately decodes any
 remaining coalesced frame. A custom HTTP codec can therefore own its own
 request parsing state.
 
@@ -219,7 +256,9 @@ configurable through `SubReactorOptions::request_timeout`. The shared scheduler
 thread only posts a control event back through the SubReactor wakeup. It never
 touches Codec, Channel, or connection state directly.
 
-An accepted Worker response removes and cancels its sequence's timer. A timeout
+An accepted Worker response removes and cancels its sequence's timer.
+`ProtocolSession::OnTimeout` receives the saved request context. For the legacy
+Codec adapter, a timeout
 is inserted into the same per-connection sequence reorder path as a normal
 response and always carries close-after-write. This makes timeout delivery
 ordered with an HTTP pipeline and makes timeout-versus-business-response races
@@ -228,7 +267,7 @@ the ordinary response queue capacity; they are bounded by the per-connection
 in-flight request limit instead of being dropped when business responses fill
 the queue.
 
-`ProtocolCodec::CreateTimeoutResponse()` owns the protocol representation.
+For CodecSession, `ProtocolCodec::CreateTimeoutResponse()` owns the protocol representation.
 HTTP creates `504 Gateway Timeout` with a text body and `Connection: close`.
 Length-prefixed framing has no portable error envelope, so it returns nullopt
 and SubReactor closes without inventing application data. A custom protocol can

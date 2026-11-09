@@ -42,15 +42,24 @@ Channel::~Channel() {
 
 bool Channel::SetInterest(ChannelInterest interest) {
   if (!interest.read && !interest.write) {
-    NETLIB_LOG_WARN("channel interest rejected for fd={}", fd_);
-    return false;
+    // A quiescing Session may wait for Workers with neither socket interest.
+    // Remove the registration so a readable peer cannot spin the Reactor.
+    if (registered_) {
+      loop_.RemoveChannel(*this);
+      registered_ = false;
+    }
+    interest_ = interest;
+    return true;
   }
   ChannelInterest previous_interest = interest_;
   interest_ = interest;
-  if (!loop_.ModifyChannel(*this)) {
+  bool updated =
+      registered_ ? loop_.ModifyChannel(*this) : loop_.AddChannel(*this);
+  if (!updated) {
     interest_ = previous_interest;
     return false;
   }
+  registered_ = true;
   return true;
 }
 

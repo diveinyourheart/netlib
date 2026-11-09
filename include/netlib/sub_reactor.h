@@ -15,6 +15,7 @@
 #include "netlib/channel.h"
 #include "netlib/event_loop.h"
 #include "netlib/protocol_codec.h"
+#include "netlib/protocol_session.h"
 #include "netlib/thread_pool.h"
 #include "netlib/timer.h"
 #include "netlib/unique_fd.h"
@@ -34,7 +35,8 @@ struct SubReactorOptions {
   std::chrono::milliseconds request_timeout = std::chrono::minutes(10);
 };
 
-// Owns accepted connections, protocol codecs, and nonblocking read/write state.
+// Owns accepted connections, protocol sessions, and nonblocking read/write
+// state.
 class SubReactor {
  public:
   struct ConnectionCallbacks {
@@ -59,6 +61,12 @@ class SubReactor {
                                             ConnectionCallbacks callbacks,
                                             ProtocolCodecFactory codec_factory);
 
+  // Native stateful protocols can emit control output independently of Workers.
+  // The factory is called during validation and once per accepted connection.
+  static std::unique_ptr<SubReactor> CreateWithSession(
+      SubReactorOptions options, ThreadPool& worker_pool,
+      ConnectionCallbacks callbacks, ProtocolSessionFactory session_factory);
+
   SubReactor(const SubReactor&) = delete;
   SubReactor& operator=(const SubReactor&) = delete;
   SubReactor(SubReactor&&) = delete;
@@ -79,7 +87,8 @@ class SubReactor {
   SubReactor(std::unique_ptr<EventLoop> event_loop,
              std::shared_ptr<platform::Wakeup> wake_fd,
              SubReactorOptions options, ThreadPool& worker_pool,
-             ProtocolCodecFactory codec_factory, ConnectionCallbacks callbacks);
+             ProtocolSessionFactory session_factory,
+             ConnectionCallbacks callbacks);
 
   void HandleWake();
   bool DrainWake();
@@ -87,7 +96,7 @@ class SubReactor {
   void RegisterConnection(UniqueFd connection);
   void HandleReadable(std::uint64_t connection_id);
   void HandleWritable(std::uint64_t connection_id);
-  bool ProcessFrames(Connection& connection);
+  bool ProcessInput(Connection& connection);
   void HandleApplicationResponse(std::uint64_t connection_id,
                                  std::uint64_t sequence,
                                  ApplicationResponse response,
@@ -96,6 +105,9 @@ class SubReactor {
                                std::uint64_t sequence,
                                ApplicationResponse response,
                                bool close_after_write);
+  void HandleResponse(std::uint64_t connection_id, std::uint64_t sequence,
+                      ApplicationResponse response, bool close_after_write,
+                      SessionResponseMode mode);
   void HandleRequestTimeout(std::uint64_t connection_id,
                             std::uint64_t sequence);
   void FlushConnection(std::uint64_t connection_id);
@@ -104,7 +116,7 @@ class SubReactor {
 
   std::unique_ptr<EventLoop> event_loop_;
   ThreadPool::Submitter request_submitter_;
-  ProtocolCodecFactory codec_factory_;
+  ProtocolSessionFactory session_factory_;
   ConnectionCallbacks callbacks_;
   std::unordered_map<std::uint64_t, std::unique_ptr<Connection>> connections_;
   std::shared_ptr<platform::Wakeup> wake_fd_;

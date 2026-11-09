@@ -27,7 +27,9 @@ class ConnectionHandle {
   std::uint64_t id() const;
   bool valid() const;
   // sequence must equal FrameMessage::sequence. Each request must produce
-  // exactly one accepted response; the owning SubReactor restores wire order.
+  // exactly one accepted response. The owning Session applies wire ordering
+  // (legacy Codecs restore pipeline order; multiplexed protocols route
+  // streams).
   bool Respond(std::uint64_t sequence, ApplicationResponse response,
                bool close_after_write = false) const;
   bool Respond(std::uint64_t sequence, std::vector<char> payload,
@@ -35,9 +37,9 @@ class ConnectionHandle {
     return Respond(sequence, BinaryResponse{.payload = std::move(payload)},
                    close_after_write);
   }
-  // Bypasses per-connection response ordering. The request sequence is still
-  // consumed and its timeout is cancelled, but the encoded response is
-  // appended immediately by the owning SubReactor.
+  // For legacy Codecs, bypasses pipeline ordering and appends immediately. The
+  // request is still completed and its timeout cancelled. Native Sessions
+  // apply their protocol's ordering rules to this hint.
   bool RespondUnordered(std::uint64_t sequence, ApplicationResponse response,
                         bool close_after_write = false) const;
   bool RespondUnordered(std::uint64_t sequence, std::vector<char> payload,

@@ -18,6 +18,9 @@ enum class DecodeStatus : std::uint8_t {
   kNeedMore,
   kFrameReady,
   kProtocolError,
+  // Input was consumed without producing a business request (e.g. control
+  // input). consumed_bytes must be positive; payload_offset/size must be zero.
+  kConsumed,
 };
 
 struct DecodeResult {
@@ -34,8 +37,9 @@ struct DecodeResult {
 
 // One instance is owned by each connection. Decode() receives the unconsumed
 // input buffer. When a frame is ready, the caller consumes consumed_bytes and
-// may call Decode() again with the remaining bytes. Encode() appends bytes to
-// the output vector.
+// may call Decode() again with the remaining bytes. kConsumed advances input
+// without creating a FrameMessage, sequence or request timer. Encode() appends
+// bytes to the output vector.
 class ProtocolCodec {
  public:
   ProtocolCodec() = default;

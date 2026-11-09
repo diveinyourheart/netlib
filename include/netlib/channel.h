@@ -39,6 +39,8 @@ class Channel {
   Channel& operator=(Channel&&) = delete;
   ~Channel();
 
+  // Empty interests pause registration; a later nonempty update registers
+  // again with a fresh event token. Call only from the owning loop thread.
   bool SetInterest(ChannelInterest interest);
   SocketHandle fd() const;
 

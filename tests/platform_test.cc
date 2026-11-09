@@ -54,7 +54,20 @@ bool TestWakeup() {
   }
   for (auto& producer : producers) producer.join();
   if (produced != 12000 || failed || !wakeup->Drain()) return false;
-  if (poller->Wait(events, 0) != 0) return false;
+  // On Windows, Notify writes TCP bytes. Joined writers can still have bytes
+  // in flight, so Drain only guarantees that currently received bytes are
+  // consumed. Wait for quiescence instead of assuming an immediate empty poll.
+  const std::chrono::steady_clock::time_point drain_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  for (;;) {
+    int remaining = poller->Wait(events, 20);
+    if (remaining < 0) return false;
+    if (remaining == 0) break;
+    if (std::chrono::steady_clock::now() >= drain_deadline ||
+        events[0].token != 17 || !wakeup->Drain()) {
+      return false;
+    }
+  }
   // Interest changes carry the new registration token, including on epoll.
   if (!poller->Modify(wakeup->handle(), 23, true, false) || !wakeup->Notify())
     return false;
@@ -92,7 +105,8 @@ bool TestDispatch(bool remove_on_read) {
   auto probe = netlib::platform::Poller::Create();
   std::array<netlib::platform::ReadyEvent, 1> ready{};
   if (!probe || !probe->Add(wakeup->handle(), 1, true, false) ||
-      probe->Wait(ready, 1000) != 1) return false;
+      probe->Wait(ready, 1000) != 1)
+    return false;
   probe->Remove(wakeup->handle());
   loop->Run();  // CTest timeout catches lost writable readiness / stop wakeups.
   return reads == 1 && writes == (remove_on_read ? 0 : 1);
@@ -140,11 +154,24 @@ bool TestReadyBatches() {
 }  // namespace
 
 int main() {
-  if (!TestSocketOwnership() || !TestWakeup() || !TestDispatch(false) ||
-      !TestDispatch(true) || !TestIdleStop() || !TestReadyBatches()) {
-    std::fprintf(stderr, "platform regression failed: %s\n",
-                 netlib::platform::ErrorMessage().c_str());
-    return 1;
+  struct TestCase {
+    const char* name;
+    bool (*run)();
+  };
+  const TestCase tests[]{
+      {"socket ownership", TestSocketOwnership},
+      {"concurrent wakeup", TestWakeup},
+      {"read/write dispatch", [] { return TestDispatch(false); }},
+      {"removal during dispatch", [] { return TestDispatch(true); }},
+      {"idle stop", TestIdleStop},
+      {"ready batches", TestReadyBatches},
+  };
+  for (const TestCase& test : tests) {
+    if (!test.run()) {
+      std::fprintf(stderr, "platform regression failed (%s): %s\n", test.name,
+                   netlib::platform::ErrorMessage().c_str());
+      return 1;
+    }
   }
   return 0;
 }

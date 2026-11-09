@@ -10,9 +10,11 @@
 - `Channel`：把一个 fd 上的读写、错误回调注册到 `EventLoop`。
 - `UniqueFd`：表达原生 socket 句柄的唯一所有权，支持跨线程移动。
 - `MainReactor`：监听 IPv4 端口，循环调用平台 accept 接口，轮询分发给多个 `SubReactor`。
-- `SubReactor`：管理每连接 Codec、读写缓冲、响应队列和非阻塞就绪事件。
+- `SubReactor`：管理每连接 Session、输入缓冲、请求计时和非阻塞就绪事件。
+- `ProtocolSession`：处理协议输入、请求上下文、响应、超时及控制输出；现有 Codec 通过适配器接入。
 - `ProtocolCodec`：负责字节流分帧和响应编码，默认实现为 4 字节长度前缀。
 - `Http1Codec`：解析 HTTP/1.0、HTTP/1.1 Header、Content-Length Body 和 keep-alive。
+- `HttpProtocolDetector`：增量识别 HTTP/1 请求行和 HTTP/2 client preface，作为协议自适应的基础。
 - `RpcCodec`：解析带版本、请求 ID、服务/方法名称和 TLV 扩展的 RPC 二进制帧。
 - `ConnectionHandle`：Worker 回写响应的安全弱连接句柄。
 - `frame_protocol.h`：定义 4 字节大端 payload 长度和 16 MiB payload 上限。
@@ -34,23 +36,34 @@
 [平台文档](docs/platform.md)。架构和生命周期约定见
 [`docs/reactor_architecture.md`](docs/reactor_architecture.md)。
 
+HTTP/2 feature 分批推进，根目录 [HTTP2_TASKS.md](HTTP2_TASKS.md) 记录任务、验收和
+每轮总结和下一轮入口，设计见 [HTTP/2 文档](docs/http2_design.md)。目前已实现
+T01–T04，以及 T05 的可选 nghttp2 构建；Windows 开关验证通过，Linux CI 待执行。
+**当前还不能实际处理 HTTP/2 请求，也尚未把识别器接入在线自动切换**。
+`NETLIB_ENABLE_HTTP2` 默认关闭；开启后构建固定的 nghttp2 1.71.0 C 静态协议库，
+支持官方归档离线构建，详见 [HTTP/2 构建说明](docs/http2_build.md)。
+下一轮实现 HTTP/2 Session，之后接入明文 preface 选择，
+HTTPS 再通过 TLS ALPN 协商 h2/http/1.1。默认长度前缀和显式 RPC Codec 配置保持原有行为。
+
 ## 数据流程
 
 ```text
 TCP bytes
-  -> SubReactor 按所选 Codec 组装完整帧
-  -> FrameMessage（拥有 payload）
+  -> ProtocolSession::OnInput（可只处理控制输入，也可产生多个请求）
+  -> FrameMessage（拥有 payload 和 RequestContext）
   -> moodycamel BlockingConcurrentQueue
+  -> SubReactor 为已提交请求保存上下文并注册 timeout deadline
   -> ThreadPool Worker
-  -> 每请求 timeout deadline
   -> 业务 Handler
   -> ConnectionHandle::Respond
-  -> 取消对应 deadline
   -> SubReactor response queue + Wakeup
-  -> per-connection sequence reorder buffer
-  -> ProtocolCodec::Encode
+  -> 按本地 request_id 查上下文并取消 deadline
+  -> ProtocolSession::OnResponse（Codec 适配器负责原有排序和 Encode）
+  -> ProtocolSession::ProduceOutput / PendingOutput
   -> platform::Send / writable readiness
 ```
+
+协议控制输出也可直接从 Session 到发送路径，不经过 Worker。
 
 协议解析和业务层通过 typed variant 解耦：
 
@@ -69,7 +82,7 @@ RPC 头部放入 `RpcFrameMetadata`，payload 为独立二进制；格式、扩�
 
 默认长度前缀协议使用 4 字节网络字节序长度，只计算 payload，不包含长度头。payload 最大
 16 MiB。Worker Handler 并发执行，完成顺序不固定。SubReactor 使用每条连接内的
-`sequence` 重排响应，因此业务按乱序完成也能按请求到达顺序写回网络。
+`sequence` 在 Codec Session 内重排响应，因此业务按乱序完成也能按请求到达顺序写回网络。
 
 基本组装方式：
 
@@ -104,7 +117,7 @@ Sub 的生产者，再调用 `ThreadPool::Stop()` 排空消息并 join Worker。
 SubReactor 会按每条连接的 `max_pending_responses` 限制乱序缓存；溢出时关闭该
 连接。全局响应队列满或连接已经关闭时，`Respond()` 返回 false。
 
-Handler 可以选择两种回写方式：
+使用现有 Codec 时，Handler 可以选择两种回写方式：
 
 - `message.Respond(...)`：按每连接 sequence 重排，适合 HTTP/1.1 pipeline。
 - `message.RespondUnordered(...)`：立即跳过重排，由 SubReactor 下一次调度时编码
@@ -112,8 +125,8 @@ Handler 可以选择两种回写方式：
 
 两种方式仍由 SubReactor owner 线程编码和写 socket，Worker 不直接修改连接状态。
 `RespondUnordered()` 会消费对应 sequence 并取消请求超时，但可能越过尚未完成的
-前序响应；HTTP/1.1 pipeline 不应使用。它适合 WebSocket 推送、服务端主动消息或
-协议自身已经定义了独立消息关联/顺序的场景。
+前序响应；HTTP/1.1 pipeline 不应使用。它适合协议自身已经定义了独立消息关联/顺序的
+请求响应场景。原生 Session 按协议解释这两个排序提示，HTTP/2 将按 stream 寻址。
 
 `SubReactorOptions` 分别控制待注册连接数、待处理响应数和单连接输出积压字节数。
 Codec 通过 `MaxDecodeBufferSize()` 描述输入分帧缓冲上限，单次响应 payload
@@ -126,7 +139,8 @@ sequence 注册 `request_timeout`，默认 10 分钟。Worker 响应被接受后
 关闭，业务线程不会直接操作连接。`max_pending_responses` 同时限制每条连接
 尚未完成响应处理的请求数，避免超时 timer 和乱序响应无界增长。
 
-超时响应由 `ProtocolCodec::CreateTimeoutResponse()` 定义。HTTP Codec 返回
+超时由 `ProtocolSession::OnTimeout(context)` 处理；旧 Codec 的适配器调用
+`ProtocolCodec::CreateTimeoutResponse()`。HTTP Codec 返回
 `504 Gateway Timeout`、文本 body 和 `Connection: close`；长度前缀 Codec 没有
 通用错误 envelope，因此不伪造 payload，而是记录日志后直接关闭连接。其他协议
 可以实现自己的超时帧，并声明 close-after-write 语义。
@@ -136,6 +150,10 @@ Codec 在读取 4 字节长度头时返回 4，解析出 payload 长度后返回
 HTTP Codec 在寻找 `\r\n\r\n` 时可以返回 0 表示目标未知，解析出
 `Content-Length` 后再返回 Header 长度加 Body 长度。Connection 使用该值控制
 下一次读取和几何扩容，不会因为协议最大帧大小较大就一次分配整块最大缓冲。
+
+Codec 也可以返回 `kConsumed`，表示仅消费协议字节，不向 Worker 投递请求，不分配
+业务 sequence 或请求 timer。此时 consumed_bytes 必须大于 0 且不超过输入长度，
+payload_offset/payload_size 必须为 0；否则连接会按协议错误关闭。
 
 HTTP 业务处理示例：
 
@@ -162,6 +180,12 @@ if (request != nullptr && request->target == "/rpc") {
 默认 SubReactor 使用 `CreateLengthPrefixedCodec()`。自定义协议可以实现
 `ProtocolCodec` 并通过带 `ProtocolCodecFactory` 的 `SubReactor::Create`
 重载传入。每个连接拥有独立的 Codec 实例，因此可以维护自定义解析状态。
+
+原生有状态协议可以通过 `SubReactor::CreateWithSession` 和 `ProtocolSessionFactory`
+接入，详见 [会话接口与请求身份](docs/http2_design.md#t04-会话接口与请求身份)。
+`FrameMessage::request_context.request_id` 与原有 `sequence` 相同，`stream_id` 独立且可选；
+旧 Codec 的 stream_id 为空。Worker 仍通过 `message.Respond()` 回写，Reactor 使用自己
+保存的上下文路由，不信任 Worker 修改后的 stream_id。
 
 发送通过平台接口循环执行，直到缓冲区为空或 would-block。仅在输出积压时关注
 可写事件，写空后恢复为只读。Linux 保留 epoll ET，Windows 使用 WSAPoll LT。

@@ -11,6 +11,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+option(NETLIB_ENABLE_HTTP2 "Build the optional HTTP/2 protocol dependency" OFF)
+
 find_package(Threads REQUIRED)
 
 if(NOT WIN32 AND NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -44,8 +46,10 @@ add_library(
     src/connection_handle.cc
     src/event_loop.cc
     src/http1_codec.cc
+    src/http_protocol.cc
     src/length_prefixed_codec.cc
     src/main_reactor.cc
+    src/protocol_session.cc
     src/rpc_codec.cc
     src/sub_reactor.cc
     src/thread_pool.cc
@@ -107,12 +111,52 @@ target_link_libraries(netlib_log PUBLIC Threads::Threads netlib::timer)
 
 target_link_libraries(netlib PUBLIC netlib_log)
 
+include(CTest)
+
+if(NETLIB_ENABLE_HTTP2)
+  enable_language(C)
+  include(cmake/NetlibNghttp2.cmake)
+  netlib_setup_nghttp2()
+endif()
+
 add_executable(netlib_log_example examples/log_example.cc)
 target_link_libraries(netlib_log_example PRIVATE netlib::log)
 
-include(CTest)
-
 if(BUILD_TESTING)
+  add_test(NAME netlib_nghttp2_configuration_test
+    COMMAND ${CMAKE_COMMAND}
+      "-DNETLIB_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
+      "-DNETLIB_TEST_BINARY_DIR=${CMAKE_CURRENT_BINARY_DIR}/nghttp2-configuration"
+      "-DNETLIB_TEST_GENERATOR=${CMAKE_GENERATOR}"
+      "-DNETLIB_TEST_CXX_COMPILER=${CMAKE_CXX_COMPILER}"
+      "-DNETLIB_TEST_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM}"
+      -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/nghttp2_configuration_test.cmake")
+  set_tests_properties(netlib_nghttp2_configuration_test PROPERTIES TIMEOUT 210)
+  if(NETLIB_ENABLE_HTTP2)
+    add_executable(netlib_nghttp2_test tests/nghttp2_test.cc)
+    target_link_libraries(netlib_nghttp2_test PRIVATE netlib::netlib netlib_nghttp2)
+    get_target_property(nghttp2_version netlib_nghttp2 NETLIB_NGHTTP2_VERSION)
+    target_compile_definitions(netlib_nghttp2_test PRIVATE
+      "NETLIB_NGHTTP2_EXPECTED_VERSION=\"${nghttp2_version}\"")
+    netlib_warnings(netlib_nghttp2_test)
+    add_test(NAME netlib_nghttp2_test COMMAND netlib_nghttp2_test)
+    set_tests_properties(netlib_nghttp2_test PROPERTIES TIMEOUT 30)
+  endif()
+  add_executable(netlib_session_reactor_test tests/session_reactor_test.cc)
+  target_link_libraries(netlib_session_reactor_test PRIVATE netlib::netlib)
+  netlib_warnings(netlib_session_reactor_test)
+  add_test(NAME netlib_session_reactor_test COMMAND netlib_session_reactor_test)
+  set_tests_properties(netlib_session_reactor_test PROPERTIES TIMEOUT 30)
+  add_executable(netlib_protocol_session_test tests/protocol_session_test.cc)
+  target_link_libraries(netlib_protocol_session_test PRIVATE netlib::netlib)
+  netlib_warnings(netlib_protocol_session_test)
+  add_test(NAME netlib_protocol_session_test COMMAND netlib_protocol_session_test)
+  set_tests_properties(netlib_protocol_session_test PROPERTIES TIMEOUT 30)
+  add_executable(netlib_http_protocol_test tests/http_protocol_test.cc)
+  target_link_libraries(netlib_http_protocol_test PRIVATE netlib::netlib)
+  netlib_warnings(netlib_http_protocol_test)
+  add_test(NAME netlib_http_protocol_test COMMAND netlib_http_protocol_test)
+  set_tests_properties(netlib_http_protocol_test PROPERTIES TIMEOUT 30)
   add_executable(netlib_thread_pool_test tests/thread_pool_test.cc)
   target_link_libraries(netlib_thread_pool_test PRIVATE netlib::netlib)
   add_test(NAME netlib_thread_pool_test COMMAND netlib_thread_pool_test)

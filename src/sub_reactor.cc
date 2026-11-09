@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cstring>
 #include <deque>
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
@@ -175,65 +176,96 @@ class SubReactor::ResponseQueue {
 
 class SubReactor::Connection {
  public:
-  enum class ResponseStatus : std::uint8_t {
-    kQueued,
-    kStale,
-    kClosed,
-    kOverflow,
-  };
-
   Connection(UniqueFd socket, std::unique_ptr<Channel> channel,
-             std::unique_ptr<ProtocolCodec> codec, ConnectionHandle handle,
+             std::unique_ptr<ProtocolSession> session, ConnectionHandle handle,
              std::shared_ptr<std::atomic<bool>> alive,
-             std::size_t max_output_buffer_size,
-             std::size_t max_pending_responses);
+             std::size_t max_pending_responses)
+      : socket_(std::move(socket)),
+        channel_(std::move(channel)),
+        session_(std::move(session)),
+        handle_(std::move(handle)),
+        connection_id_(handle_.id()),
+        alive_(std::move(alive)),
+        max_read_buffer_size_(session_->MaxInputBufferSize()),
+        max_pending_responses_(max_pending_responses) {}
 
-  SocketHandle fd() const;
-  std::uint64_t connection_id() const;
-  const ConnectionHandle& handle() const;
-  ProtocolCodec& codec();
-  std::uint64_t NextSequence();
-  bool HasRequestTimerCapacity() const;
-  bool TrackRequestTimer(std::uint64_t sequence, TimerScheduler::TimerId id);
-  TimerScheduler::TimerId TakeRequestTimer(std::uint64_t sequence);
-  std::vector<TimerScheduler::TimerId> TakeRequestTimers();
+  SocketHandle fd() const { return socket_.get(); }
+  std::uint64_t connection_id() const { return connection_id_; }
+  const ConnectionHandle& handle() const { return handle_; }
+  ProtocolSession& session() { return *session_; }
+  bool AcceptRequestId(std::uint64_t id) {
+    if (id != next_request_id_ ||
+        id == std::numeric_limits<std::uint64_t>::max()) {
+      return false;
+    }
+    ++next_request_id_;
+    return true;
+  }
+  bool HasRequestTimerCapacity() const {
+    return request_timers_.size() < max_pending_responses_;
+  }
+  bool TrackRequestTimer(RequestContext context, TimerScheduler::TimerId id) {
+    return request_timers_
+        .emplace(context.request_id, PendingRequest{context, id})
+        .second;
+  }
+  std::optional<RequestContext> FindRequest(std::uint64_t id) const {
+    auto request = request_timers_.find(id);
+    if (request == request_timers_.end()) {
+      return std::nullopt;
+    }
+    return request->second.context;
+  }
+  TimerScheduler::TimerId TakeRequestTimer(std::uint64_t id) {
+    auto request = request_timers_.find(id);
+    if (request == request_timers_.end()) {
+      return TimerScheduler::kInvalidTimer;
+    }
+    TimerScheduler::TimerId timer_id = request->second.timer_id;
+    request_timers_.erase(request);
+    return timer_id;
+  }
+  std::vector<TimerScheduler::TimerId> TakeRequestTimers() {
+    std::vector<TimerScheduler::TimerId> ids;
+    ids.reserve(request_timers_.size());
+    for (const auto& [id, request] : request_timers_) {
+      ids.push_back(request.timer_id);
+    }
+    request_timers_.clear();
+    return ids;
+  }
 
   std::span<char> WritableBytes();
   void CommitWrite(std::size_t size);
   std::span<const char> ReadableBytes() const;
   void Consume(std::size_t size);
-
-  bool AppendResponse(const ApplicationResponse& response,
-                      bool close_after_write);
-  ResponseStatus QueueResponse(std::uint64_t sequence,
-                               ApplicationResponse response,
-                               bool close_after_write);
-  ResponseStatus QueueUnorderedResponse(std::uint64_t sequence,
-                                        ApplicationResponse response,
-                                        bool close_after_write);
-  bool HasOutput() const;
-  std::span<const char> PendingOutput() const;
-  void ConsumeOutput(std::size_t size);
-  bool close_after_write() const;
-  bool write_interest_enabled() const;
-  void set_write_interest_enabled(bool enabled);
-  bool SetInterest(ChannelInterest interest);
-  void MarkClosed();
-  void SetDecodeTarget(std::size_t target_size);
-  void ClearDecodeTarget();
+  bool read_interest_enabled() const { return read_interest_enabled_; }
+  bool UpdateInterest(bool write) {
+    bool read = session_->WantsInput();
+    if (read == read_interest_enabled_ && write == write_interest_enabled_) {
+      return true;
+    }
+    if (!channel_->SetInterest(ChannelInterest{.read = read, .write = write})) {
+      return false;
+    }
+    read_interest_enabled_ = read;
+    write_interest_enabled_ = write;
+    return true;
+  }
+  void MarkClosed() { alive_->store(false, std::memory_order_release); }
+  void SetDecodeTarget(std::size_t target) { decode_target_size_ = target; }
+  void ClearDecodeTarget() { decode_target_size_ = 0; }
 
  private:
-  struct PendingResponse {
-    std::optional<ApplicationResponse> response;
-    bool close_after_write = false;
+  struct PendingRequest {
+    RequestContext context;
+    TimerScheduler::TimerId timer_id;
   };
-
   void MakeWritable(std::size_t min_bytes);
-  void CompactOutput();
 
   UniqueFd socket_;
   std::unique_ptr<Channel> channel_;
-  std::unique_ptr<ProtocolCodec> codec_;
+  const std::unique_ptr<ProtocolSession> session_;
   const ConnectionHandle handle_;
   const std::uint64_t connection_id_;
   const std::shared_ptr<std::atomic<bool>> alive_;
@@ -241,82 +273,13 @@ class SubReactor::Connection {
   std::size_t read_offset_ = 0;
   std::size_t write_offset_ = 0;
   const std::size_t max_read_buffer_size_;
-  const std::size_t max_output_buffer_size_;
-  std::size_t decode_target_size_ = 0;
-  std::uint64_t next_request_sequence_ = 0;
-  std::vector<char> output_buffer_;
-  std::size_t output_offset_ = 0;
   const std::size_t max_pending_responses_;
-  std::uint64_t next_response_sequence_ = 0;
-  std::map<std::uint64_t, PendingResponse> pending_responses_;
-  std::map<std::uint64_t, TimerScheduler::TimerId> request_timers_;
-  bool close_after_write_ = false;
+  std::size_t decode_target_size_ = 0;
+  std::uint64_t next_request_id_ = 0;
+  std::map<std::uint64_t, PendingRequest> request_timers_;
+  bool read_interest_enabled_ = true;
   bool write_interest_enabled_ = false;
 };
-
-SubReactor::Connection::Connection(UniqueFd socket,
-                                   std::unique_ptr<Channel> channel,
-                                   std::unique_ptr<ProtocolCodec> codec,
-                                   ConnectionHandle handle,
-                                   std::shared_ptr<std::atomic<bool>> alive,
-                                   std::size_t max_output_buffer_size,
-                                   std::size_t max_pending_responses)
-    : socket_(std::move(socket)),
-      channel_(std::move(channel)),
-      codec_(std::move(codec)),
-      handle_(std::move(handle)),
-      connection_id_(handle_.id()),
-      alive_(std::move(alive)),
-      max_read_buffer_size_(codec_->MaxDecodeBufferSize()),
-      max_output_buffer_size_(max_output_buffer_size),
-      max_pending_responses_(max_pending_responses) {}
-
-SocketHandle SubReactor::Connection::fd() const { return socket_.get(); }
-
-std::uint64_t SubReactor::Connection::connection_id() const {
-  return connection_id_;
-}
-
-const ConnectionHandle& SubReactor::Connection::handle() const {
-  return handle_;
-}
-
-ProtocolCodec& SubReactor::Connection::codec() { return *codec_; }
-
-std::uint64_t SubReactor::Connection::NextSequence() {
-  return next_request_sequence_++;
-}
-
-bool SubReactor::Connection::HasRequestTimerCapacity() const {
-  return request_timers_.size() < max_pending_responses_;
-}
-
-bool SubReactor::Connection::TrackRequestTimer(std::uint64_t sequence,
-                                               TimerScheduler::TimerId id) {
-  return request_timers_.emplace(sequence, id).second;
-}
-
-TimerScheduler::TimerId SubReactor::Connection::TakeRequestTimer(
-    std::uint64_t sequence) {
-  auto timer = request_timers_.find(sequence);
-  if (timer == request_timers_.end()) {
-    return TimerScheduler::kInvalidTimer;
-  }
-  TimerScheduler::TimerId id = timer->second;
-  request_timers_.erase(timer);
-  return id;
-}
-
-std::vector<TimerScheduler::TimerId>
-SubReactor::Connection::TakeRequestTimers() {
-  std::vector<TimerScheduler::TimerId> ids;
-  ids.reserve(request_timers_.size());
-  for (const auto& [_, id] : request_timers_) {
-    ids.push_back(id);
-  }
-  request_timers_.clear();
-  return ids;
-}
 
 std::span<char> SubReactor::Connection::WritableBytes() {
   std::size_t readable_size = write_offset_ - read_offset_;
@@ -375,202 +338,9 @@ void SubReactor::Connection::MakeWritable(std::size_t min_bytes) {
   std::size_t required_size = write_offset_ + min_bytes;
   assert(required_size <= max_read_buffer_size_);
   std::size_t grown_size =
-      std::max(kInitialReadBufferSize,
-               std::min(max_read_buffer_size_, storage_.size() * 2));
+      std::min(max_read_buffer_size_,
+               std::max(kInitialReadBufferSize, storage_.size() * 2));
   storage_.resize(std::max(required_size, grown_size));
-}
-
-bool SubReactor::Connection::AppendResponse(const ApplicationResponse& response,
-                                            bool close_after_write) {
-  // Callers must reject new work once close is latched. A successful append
-  // may latch close_after_write_ from either the caller or Codec policy; a
-  // failed append must leave both encoded output and close state unchanged.
-  assert(!close_after_write_);
-  CompactOutput();
-  std::size_t old_size = output_buffer_.size();
-  if (!codec_->Encode(response, &output_buffer_)) {
-    output_buffer_.resize(old_size);
-    return false;
-  }
-  if (output_buffer_.size() > max_output_buffer_size_) {
-    output_buffer_.resize(old_size);
-    return false;
-  }
-  close_after_write_ = close_after_write_ || close_after_write ||
-                       codec_->ShouldCloseAfterWrite(response);
-  return true;
-}
-
-SubReactor::Connection::ResponseStatus SubReactor::Connection::QueueResponse(
-    std::uint64_t sequence, ApplicationResponse response,
-    bool close_after_write) {
-  if (sequence < next_response_sequence_) {
-    return ResponseStatus::kStale;
-  }
-  if (sequence >= next_request_sequence_) {
-    return ResponseStatus::kStale;
-  }
-  if (close_after_write_) {
-    return ResponseStatus::kClosed;
-  }
-  if (sequence == next_response_sequence_) {
-    if (!AppendResponse(response, close_after_write)) {
-      return ResponseStatus::kOverflow;
-    }
-    ++next_response_sequence_;
-    // AppendResponse may latch close. Drop every later pipeline response so no
-    // bytes are queued after the protocol's terminal response.
-    if (close_after_write_) {
-      pending_responses_.clear();
-      return ResponseStatus::kQueued;
-    }
-  } else {
-    if (pending_responses_.find(sequence) != pending_responses_.end()) {
-      return ResponseStatus::kStale;
-    }
-    if (pending_responses_.size() >= max_pending_responses_) {
-      return ResponseStatus::kOverflow;
-    }
-    pending_responses_.emplace(sequence,
-                               PendingResponse{
-                                   .response = std::move(response),
-                                   .close_after_write = close_after_write,
-                               });
-  }
-
-  while (true) {
-    auto current = pending_responses_.find(next_response_sequence_);
-    if (current == pending_responses_.end()) {
-      return ResponseStatus::kQueued;
-    }
-    PendingResponse pending = std::move(current->second);
-    pending_responses_.erase(current);
-    if (pending.response.has_value() &&
-        !AppendResponse(*pending.response, pending.close_after_write)) {
-      return ResponseStatus::kOverflow;
-    }
-    ++next_response_sequence_;
-    // Re-check immediately: the codec can require close based on this response.
-    if (close_after_write_) {
-      pending_responses_.clear();
-      return ResponseStatus::kQueued;
-    }
-  }
-}
-
-SubReactor::Connection::ResponseStatus
-SubReactor::Connection::QueueUnorderedResponse(std::uint64_t sequence,
-                                               ApplicationResponse response,
-                                               bool close_after_write) {
-  if (sequence < next_response_sequence_) {
-    return ResponseStatus::kStale;
-  }
-  if (sequence >= next_request_sequence_) {
-    return ResponseStatus::kStale;
-  }
-  if (close_after_write_) {
-    return ResponseStatus::kClosed;
-  }
-  if (pending_responses_.find(sequence) != pending_responses_.end()) {
-    return ResponseStatus::kStale;
-  }
-  if (sequence != next_response_sequence_ &&
-      pending_responses_.size() >= max_pending_responses_) {
-    return ResponseStatus::kOverflow;
-  }
-  if (!AppendResponse(response, close_after_write)) {
-    return ResponseStatus::kOverflow;
-  }
-
-  if (sequence == next_response_sequence_) {
-    ++next_response_sequence_;
-  } else {
-    pending_responses_.emplace(sequence, PendingResponse{
-                                             .response = std::nullopt,
-                                             .close_after_write = false,
-                                         });
-  }
-  if (close_after_write_) {
-    // Ordering placeholders are irrelevant once the encoded response is final.
-    pending_responses_.clear();
-    return ResponseStatus::kQueued;
-  }
-
-  while (true) {
-    auto current = pending_responses_.find(next_response_sequence_);
-    if (current == pending_responses_.end()) {
-      return ResponseStatus::kQueued;
-    }
-    PendingResponse pending = std::move(current->second);
-    pending_responses_.erase(current);
-    if (pending.response.has_value() &&
-        !AppendResponse(*pending.response, pending.close_after_write)) {
-      return ResponseStatus::kOverflow;
-    }
-    ++next_response_sequence_;
-    // The codec may have latched close while draining the placeholder chain.
-    if (close_after_write_) {
-      pending_responses_.clear();
-      return ResponseStatus::kQueued;
-    }
-  }
-}
-
-bool SubReactor::Connection::HasOutput() const {
-  return output_offset_ < output_buffer_.size();
-}
-
-std::span<const char> SubReactor::Connection::PendingOutput() const {
-  return std::span<const char>(output_buffer_.data() + output_offset_,
-                               output_buffer_.size() - output_offset_);
-}
-
-void SubReactor::Connection::ConsumeOutput(std::size_t size) {
-  assert(size <= output_buffer_.size() - output_offset_);
-  output_offset_ += size;
-  if (output_offset_ == output_buffer_.size()) {
-    output_buffer_.clear();
-    output_offset_ = 0;
-  }
-}
-
-bool SubReactor::Connection::close_after_write() const {
-  return close_after_write_;
-}
-
-bool SubReactor::Connection::write_interest_enabled() const {
-  return write_interest_enabled_;
-}
-
-void SubReactor::Connection::set_write_interest_enabled(bool enabled) {
-  write_interest_enabled_ = enabled;
-}
-
-bool SubReactor::Connection::SetInterest(ChannelInterest interest) {
-  return channel_->SetInterest(interest);
-}
-
-void SubReactor::Connection::MarkClosed() {
-  alive_->store(false, std::memory_order_release);
-}
-
-void SubReactor::Connection::SetDecodeTarget(std::size_t target_size) {
-  decode_target_size_ = target_size;
-}
-
-void SubReactor::Connection::ClearDecodeTarget() { decode_target_size_ = 0; }
-
-void SubReactor::Connection::CompactOutput() {
-  if (output_offset_ == 0) {
-    return;
-  }
-  std::size_t remaining = output_buffer_.size() - output_offset_;
-  if (remaining != 0) {
-    std::memmove(output_buffer_.data(), output_buffer_.data() + output_offset_,
-                 remaining);
-  }
-  output_buffer_.resize(remaining);
-  output_offset_ = 0;
 }
 
 std::unique_ptr<SubReactor> SubReactor::Create(
@@ -602,6 +372,19 @@ std::unique_ptr<SubReactor> SubReactor::Create(SubReactorOptions options,
 std::unique_ptr<SubReactor> SubReactor::Create(
     SubReactorOptions options, ThreadPool& worker_pool,
     ConnectionCallbacks callbacks, ProtocolCodecFactory codec_factory) {
+  if (!codec_factory) {
+    return nullptr;
+  }
+  return CreateWithSession(options, worker_pool, std::move(callbacks),
+                           [codec_factory = std::move(codec_factory)](
+                               ProtocolSessionOptions limits) {
+                             return CreateCodecSession(codec_factory(), limits);
+                           });
+}
+
+std::unique_ptr<SubReactor> SubReactor::CreateWithSession(
+    SubReactorOptions options, ThreadPool& worker_pool,
+    ConnectionCallbacks callbacks, ProtocolSessionFactory session_factory) {
   if (options.max_pending_connections == 0 ||
       options.max_pending_responses == 0 ||
       options.max_pending_output_bytes == 0 ||
@@ -609,13 +392,16 @@ std::unique_ptr<SubReactor> SubReactor::Create(
     NETLIB_LOG_ERROR("SubReactor option is outside its valid range");
     return nullptr;
   }
-  if (!codec_factory) {
-    NETLIB_LOG_ERROR("SubReactor requires a ProtocolCodec factory");
+  if (!session_factory) {
+    NETLIB_LOG_ERROR("SubReactor requires a ProtocolSession factory");
     return nullptr;
   }
-  std::unique_ptr<ProtocolCodec> codec_probe = codec_factory();
-  if (!codec_probe || codec_probe->MaxDecodeBufferSize() == 0) {
-    NETLIB_LOG_ERROR("SubReactor ProtocolCodec factory returned invalid codec");
+  std::unique_ptr<ProtocolSession> session_probe = session_factory(
+      {.max_pending_responses = options.max_pending_responses,
+       .max_pending_output_bytes = options.max_pending_output_bytes});
+  if (!session_probe || session_probe->MaxInputBufferSize() == 0) {
+    NETLIB_LOG_ERROR(
+        "SubReactor ProtocolSession factory returned invalid session");
     return nullptr;
   }
 
@@ -633,7 +419,7 @@ std::unique_ptr<SubReactor> SubReactor::Create(
 
   auto reactor = std::unique_ptr<SubReactor>(new SubReactor(
       std::move(event_loop), std::move(wake_fd), options, worker_pool,
-      std::move(codec_factory), std::move(callbacks)));
+      std::move(session_factory), std::move(callbacks)));
   if (!reactor->request_submitter_.valid() ||
       !reactor->response_queue_->valid()) {
     return nullptr;
@@ -661,11 +447,11 @@ std::unique_ptr<SubReactor> SubReactor::Create(
 SubReactor::SubReactor(std::unique_ptr<EventLoop> event_loop,
                        std::shared_ptr<platform::Wakeup> wake_fd,
                        SubReactorOptions options, ThreadPool& worker_pool,
-                       ProtocolCodecFactory codec_factory,
+                       ProtocolSessionFactory session_factory,
                        ConnectionCallbacks callbacks)
     : event_loop_(std::move(event_loop)),
       request_submitter_(worker_pool.CreateSubmitter()),
-      codec_factory_(std::move(codec_factory)),
+      session_factory_(std::move(session_factory)),
       callbacks_(std::move(callbacks)),
       wake_fd_(std::move(wake_fd)),
       response_queue_(std::make_shared<ResponseQueue>(
@@ -751,66 +537,46 @@ void SubReactor::HandleApplicationResponse(std::uint64_t connection_id,
                                            std::uint64_t sequence,
                                            ApplicationResponse response,
                                            bool close_after_write) {
-  auto connection = connections_.find(connection_id);
-  if (connection == connections_.end()) {
-    return;
-  }
-
-  Connection& state = *connection->second;
-  TimerScheduler::TimerId timer_id = state.TakeRequestTimer(sequence);
-  Connection::ResponseStatus status =
-      state.QueueResponse(sequence, std::move(response), close_after_write);
-  if (timer_id != TimerScheduler::kInvalidTimer) {
-    TimerScheduler::Cancel(timer_id);
-  }
-  if (status == Connection::ResponseStatus::kQueued) {
-    FlushConnection(connection_id);
-    return;
-  }
-  if (status == Connection::ResponseStatus::kOverflow) {
-    NETLIB_LOG_WARN(
-        "response buffer limit reached for connection id={} sequence={}",
-        connection_id, sequence);
-    CloseConnection(connection_id);
-    return;
-  }
-  NETLIB_LOG_DEBUG(
-      "ignored response for closed or stale connection id={} sequence={}",
-      connection_id, sequence);
+  HandleResponse(connection_id, sequence, std::move(response),
+                 close_after_write, SessionResponseMode::kOrdered);
 }
 
 void SubReactor::HandleUnorderedResponse(std::uint64_t connection_id,
                                          std::uint64_t sequence,
                                          ApplicationResponse response,
                                          bool close_after_write) {
+  HandleResponse(connection_id, sequence, std::move(response),
+                 close_after_write, SessionResponseMode::kUnordered);
+}
+
+void SubReactor::HandleResponse(std::uint64_t connection_id,
+                                std::uint64_t sequence,
+                                ApplicationResponse response,
+                                bool close_after_write,
+                                SessionResponseMode mode) {
   auto connection = connections_.find(connection_id);
   if (connection == connections_.end()) {
     return;
   }
-
   Connection& state = *connection->second;
+  std::optional<RequestContext> context = state.FindRequest(sequence);
+  if (!context.has_value()) {
+    return;
+  }
+  SessionResponseStatus status = state.session().OnResponse(
+      *context, std::move(response), mode, close_after_write);
   TimerScheduler::TimerId timer_id = state.TakeRequestTimer(sequence);
   if (timer_id != TimerScheduler::kInvalidTimer) {
     TimerScheduler::Cancel(timer_id);
   }
-  Connection::ResponseStatus status = state.QueueUnorderedResponse(
-      sequence, std::move(response), close_after_write);
-  if (status == Connection::ResponseStatus::kQueued) {
-    FlushConnection(connection_id);
-    return;
-  }
-  if (status == Connection::ResponseStatus::kOverflow) {
-    NETLIB_LOG_WARN(
-        "unordered response buffer limit reached for connection id={} "
-        "sequence={}",
-        connection_id, sequence);
+  if (status == SessionResponseStatus::kError) {
+    NETLIB_LOG_WARN("session response failed for connection id={} sequence={}",
+                    connection_id, sequence);
     CloseConnection(connection_id);
     return;
   }
-  NETLIB_LOG_DEBUG(
-      "ignored unordered response for closed or stale connection id={} "
-      "sequence={}",
-      connection_id, sequence);
+  // Even a rejected reply may cause protocol control output or closure.
+  FlushConnection(connection_id);
 }
 
 void SubReactor::HandleRequestTimeout(std::uint64_t connection_id,
@@ -819,45 +585,21 @@ void SubReactor::HandleRequestTimeout(std::uint64_t connection_id,
   if (connection == connections_.end()) {
     return;
   }
-
   Connection& state = *connection->second;
+  std::optional<RequestContext> context = state.FindRequest(sequence);
+  if (!context.has_value()) {
+    return;
+  }
   TimerScheduler::TimerId timer_id = state.TakeRequestTimer(sequence);
-  if (timer_id == TimerScheduler::kInvalidTimer) {
-    return;
-  }
   TimerScheduler::Cancel(timer_id);
-
-  std::optional<ApplicationResponse> timeout_response =
-      state.codec().CreateTimeoutResponse();
-  if (!timeout_response.has_value()) {
-    NETLIB_LOG_WARN(
-        "request timed out without a protocol error response for "
-        "connection id={} sequence={}",
-        connection_id, sequence);
+  SessionResponseStatus status = state.session().OnTimeout(*context);
+  if (status == SessionResponseStatus::kError) {
+    NETLIB_LOG_WARN("session timeout failed for connection id={} sequence={}",
+                    connection_id, sequence);
     CloseConnection(connection_id);
     return;
   }
-
-  Connection::ResponseStatus status =
-      state.QueueResponse(sequence, std::move(*timeout_response), true);
-  if (status == Connection::ResponseStatus::kQueued) {
-    NETLIB_LOG_WARN(
-        "request timeout response queued for connection id={} "
-        "sequence={}",
-        connection_id, sequence);
-    FlushConnection(connection_id);
-    return;
-  }
-  if (status == Connection::ResponseStatus::kOverflow) {
-    NETLIB_LOG_WARN(
-        "failed to encode request timeout for connection id={} sequence={}",
-        connection_id, sequence);
-    CloseConnection(connection_id);
-    return;
-  }
-  NETLIB_LOG_DEBUG(
-      "request timeout became stale for connection id={} sequence={}",
-      connection_id, sequence);
+  FlushConnection(connection_id);
 }
 
 bool SubReactor::DrainWake() { return wake_fd_->Drain(); }
@@ -883,9 +625,11 @@ void SubReactor::RegisterConnection(UniqueFd connection) {
     return;
   }
 
-  std::unique_ptr<ProtocolCodec> codec = codec_factory_();
-  if (!codec || codec->MaxDecodeBufferSize() == 0) {
-    NETLIB_LOG_ERROR("ProtocolCodec factory failed for fd={}", fd);
+  std::unique_ptr<ProtocolSession> session = session_factory_(
+      {.max_pending_responses = options_.max_pending_responses,
+       .max_pending_output_bytes = options_.max_pending_output_bytes});
+  if (!session || session->MaxInputBufferSize() == 0) {
+    NETLIB_LOG_ERROR("ProtocolSession factory failed for fd={}", fd);
     return;
   }
 
@@ -929,9 +673,8 @@ void SubReactor::RegisterConnection(UniqueFd connection) {
   }
 
   std::unique_ptr<Connection> state = std::make_unique<Connection>(
-      std::move(connection), std::move(channel), std::move(codec),
-      std::move(handle), std::move(alive), options_.max_pending_output_bytes,
-      options_.max_pending_responses);
+      std::move(connection), std::move(channel), std::move(session),
+      std::move(handle), std::move(alive), options_.max_pending_responses);
   auto inserted = connections_.emplace(connection_id, std::move(state));
   if (!inserted.second) {
     NETLIB_LOG_ERROR("duplicate connection state for id={}", connection_id);
@@ -941,20 +684,21 @@ void SubReactor::RegisterConnection(UniqueFd connection) {
   if (callbacks_.on_connected) {
     callbacks_.on_connected(fd);
   }
+  FlushConnection(connection_id);
 }
 
 void SubReactor::HandleReadable(std::uint64_t connection_id) {
-  auto connection = connections_.find(connection_id);
-  if (connection == connections_.end()) {
-    return;
-  }
-
-  Connection& state = *connection->second;
-  if (state.close_after_write()) {
-    return;
-  }
-  SocketHandle fd = state.fd();
   while (true) {
+    auto connection = connections_.find(connection_id);
+    if (connection == connections_.end()) {
+      return;
+    }
+
+    Connection& state = *connection->second;
+    if (!state.session().WantsInput()) {
+      return;
+    }
+    SocketHandle fd = state.fd();
     std::span<char> writable = state.WritableBytes();
     if (writable.empty()) {
       NETLIB_LOG_WARN("receive buffer limit reached for connection id={}",
@@ -966,10 +710,13 @@ void SubReactor::HandleReadable(std::uint64_t connection_id) {
         platform::Receive(fd, writable.data(), writable.size());
     if (result > 0) {
       state.CommitWrite(static_cast<std::size_t>(result));
-      if (!ProcessFrames(state)) {
+      if (!ProcessInput(state)) {
         CloseConnection(connection_id);
         return;
       }
+      // Input can generate control output and can close this connection. The
+      // next iteration must look it up again before touching its state.
+      FlushConnection(connection_id);
       continue;
     }
     if (result == 0) {
@@ -989,83 +736,72 @@ void SubReactor::HandleReadable(std::uint64_t connection_id) {
   }
 }
 
-bool SubReactor::ProcessFrames(Connection& connection) {
-  while (true) {
+bool SubReactor::ProcessInput(Connection& connection) {
+  while (connection.session().WantsInput()) {
     std::span<const char> readable = connection.ReadableBytes();
-    DecodeResult decode_result = connection.codec().Decode(readable);
-    if (decode_result.status == DecodeStatus::kNeedMore) {
-      if (decode_result.required_bytes >
-              connection.codec().MaxDecodeBufferSize() ||
-          (decode_result.required_bytes != 0 &&
-           decode_result.required_bytes <= readable.size())) {
-        NETLIB_LOG_WARN("invalid decode target for connection id={}",
-                        connection.connection_id());
+    SessionInputResult result = connection.session().OnInput(readable);
+    if (result.status == SessionInputStatus::kNeedMore) {
+      if (result.consumed_bytes != 0 || !result.requests.empty() ||
+          result.required_bytes > connection.session().MaxInputBufferSize() ||
+          (result.required_bytes != 0 &&
+           result.required_bytes <= readable.size())) {
         return false;
       }
-      connection.SetDecodeTarget(decode_result.required_bytes);
+      connection.SetDecodeTarget(result.required_bytes);
       return true;
     }
-    if (decode_result.status == DecodeStatus::kProtocolError ||
-        decode_result.consumed_bytes == 0 ||
-        decode_result.consumed_bytes > readable.size() ||
-        decode_result.payload_offset > decode_result.consumed_bytes ||
-        decode_result.payload_size >
-            decode_result.consumed_bytes - decode_result.payload_offset) {
-      NETLIB_LOG_WARN("protocol decode error for connection id={}",
-                      connection.connection_id());
+    if (result.status != SessionInputStatus::kProgress ||
+        result.consumed_bytes == 0 || result.consumed_bytes > readable.size() ||
+        result.required_bytes != 0) {
       return false;
     }
-
     connection.ClearDecodeTarget();
-    if (!connection.HasRequestTimerCapacity()) {
-      NETLIB_LOG_WARN("in-flight request limit reached for connection id={}",
-                      connection.connection_id());
-      return false;
+    connection.Consume(result.consumed_bytes);
+    for (SessionRequest& request : result.requests) {
+      if (!connection.HasRequestTimerCapacity() ||
+          !connection.AcceptRequestId(request.context.request_id)) {
+        return false;
+      }
+      const RequestContext context = request.context;
+      std::uint64_t connection_id = connection.connection_id();
+      std::uint64_t sequence = context.request_id;
+      FrameMessage message{
+          .connection_id = connection_id,
+          .sequence = sequence,
+          .connection = connection.handle(),
+          .metadata = std::move(request.metadata),
+          .payload = std::move(request.payload),
+          .request_context = context,
+      };
+      if (!request_submitter_.Submit(std::move(message))) {
+        NETLIB_LOG_WARN("worker queue full for connection id={} sequence={}",
+                        connection_id, sequence);
+        return false;
+      }
+      std::weak_ptr<ResponseQueue> weak_response_queue = response_queue_;
+      TimerScheduler::TimerId timer_id = TimerScheduler::ScheduleAfter(
+          options_.request_timeout,
+          [weak_response_queue, connection_id, sequence] {
+            std::shared_ptr<ResponseQueue> response_queue =
+                weak_response_queue.lock();
+            if (response_queue != nullptr) {
+              response_queue->EnqueueTimeout(connection_id, sequence);
+            }
+          });
+      if (timer_id == TimerScheduler::kInvalidTimer) {
+        NETLIB_LOG_ERROR(
+            "failed to schedule request timeout for connection id={} "
+            "sequence={}",
+            connection_id, sequence);
+        return false;
+      }
+      if (!connection.TrackRequestTimer(context, timer_id)) {
+        TimerScheduler::Cancel(timer_id);
+        return false;
+      }
     }
-    std::uint64_t connection_id = connection.connection_id();
-    std::uint64_t sequence = connection.NextSequence();
-    std::span<const char> payload = readable.subspan(
-        decode_result.payload_offset, decode_result.payload_size);
-    FrameMessage message{
-        .connection_id = connection_id,
-        .sequence = sequence,
-        .connection = connection.handle(),
-        .metadata = std::move(decode_result.metadata),
-        .payload = std::vector<char>(payload.begin(), payload.end()),
-    };
-    if (!request_submitter_.Submit(std::move(message))) {
-      NETLIB_LOG_WARN("worker queue full for connection id={} sequence={}",
-                      connection_id, sequence);
-      return false;
-    }
-
-    std::weak_ptr<ResponseQueue> weak_response_queue = response_queue_;
-    TimerScheduler::TimerId timer_id = TimerScheduler::ScheduleAfter(
-        options_.request_timeout,
-        [weak_response_queue, connection_id, sequence] {
-          std::shared_ptr<ResponseQueue> response_queue =
-              weak_response_queue.lock();
-          if (response_queue != nullptr) {
-            response_queue->EnqueueTimeout(connection_id, sequence);
-          }
-        });
-    if (timer_id == TimerScheduler::kInvalidTimer) {
-      NETLIB_LOG_ERROR(
-          "failed to schedule request timeout for connection "
-          "id={} sequence={}",
-          connection_id, sequence);
-      return false;
-    }
-    if (!connection.TrackRequestTimer(sequence, timer_id)) {
-      TimerScheduler::Cancel(timer_id);
-      NETLIB_LOG_ERROR(
-          "duplicate request timer for connection id={} "
-          "sequence={}",
-          connection_id, sequence);
-      return false;
-    }
-    connection.Consume(decode_result.consumed_bytes);
   }
+  return true;
 }
 
 void SubReactor::HandleWritable(std::uint64_t connection_id) {
@@ -1077,30 +813,40 @@ void SubReactor::FlushConnection(std::uint64_t connection_id) {
   if (connection == connections_.end()) {
     return;
   }
-
   Connection& state = *connection->second;
-  SocketHandle fd = state.fd();
-  while (state.HasOutput()) {
-    std::span<const char> output = state.PendingOutput();
-    std::ptrdiff_t result = platform::Send(fd, output.data(), output.size());
+  ProtocolSession& session = state.session();
+  // A Session can pause with a partial/coalesced request still in our buffer.
+  // Resuming socket readiness alone cannot deliver those already-read bytes.
+  if (session.WantsInput() && !state.read_interest_enabled() &&
+      !state.ReadableBytes().empty() && !ProcessInput(state)) {
+    CloseConnection(connection_id);
+    return;
+  }
+  while (true) {
+    if (!session.ProduceOutput(options_.max_pending_output_bytes)) {
+      CloseConnection(connection_id);
+      return;
+    }
+    std::span<const char> output = session.PendingOutput();
+    if (output.size() > options_.max_pending_output_bytes) {
+      CloseConnection(connection_id);
+      return;
+    }
+    if (output.empty()) {
+      break;
+    }
+    std::ptrdiff_t result =
+        platform::Send(state.fd(), output.data(), output.size());
     if (result > 0) {
-      state.ConsumeOutput(static_cast<std::size_t>(result));
+      session.ConsumeOutput(static_cast<std::size_t>(result));
       continue;
     }
     if (result < 0 && platform::Interrupted(platform::LastError())) {
       continue;
     }
-    if (result < 0 && (platform::WouldBlock(platform::LastError()))) {
-      if (!state.write_interest_enabled()) {
-        ChannelInterest write_interest{
-            .read = !state.close_after_write(),
-            .write = true,
-        };
-        if (!state.SetInterest(write_interest)) {
-          CloseConnection(connection_id);
-          return;
-        }
-        state.set_write_interest_enabled(true);
+    if (result < 0 && platform::WouldBlock(platform::LastError())) {
+      if (!state.UpdateInterest(true)) {
+        CloseConnection(connection_id);
       }
       return;
     }
@@ -1109,17 +855,8 @@ void SubReactor::FlushConnection(std::uint64_t connection_id) {
     CloseConnection(connection_id);
     return;
   }
-
-  if (state.close_after_write()) {
+  if (session.ShouldClose() || !state.UpdateInterest(false)) {
     CloseConnection(connection_id);
-    return;
-  }
-  if (state.write_interest_enabled()) {
-    if (!state.SetInterest(ChannelInterest{.read = true})) {
-      CloseConnection(connection_id);
-      return;
-    }
-    state.set_write_interest_enabled(false);
   }
 }
 
