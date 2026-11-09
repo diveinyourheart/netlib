@@ -1,4 +1,3 @@
-#include <memory>
 #include <utility>
 
 #include "netlib/log/logging.h"
@@ -11,20 +10,13 @@ int main() {
       .color_mode = netlib::log::ColorMode::kAuto,
       .flush_each_record = false,
   };
-  std::unique_ptr<netlib::log::Logger> logger =
-      netlib::log::Logger::CreateStdout(std::move(options));
-  if (!logger) {
+  if (!netlib::log::Logger::InitializeStdout(std::move(options))) {
     return 1;
   }
-  {
-    netlib::log::DefaultLoggerScope default_logger(*logger);
-    NETLIB_LOG_TRACE("trace message");
-    NETLIB_LOG_DEBUG("debug message");
-    NETLIB_LOG_INFO("server started on port={} workers={}", 8080, 4);
-    NETLIB_LOG_WARN("worker queue is above 80%");
-    NETLIB_LOG_ERROR("request failed\nretry scheduled");
-    logger->Flush();
-  }
-  logger->Stop();
-  return 0;
+  NETLIB_LOG_TRACE("trace message");
+  NETLIB_LOG_DEBUG("debug message");
+  NETLIB_LOG_INFO("server started on port={} workers={}", 8080, 4);
+  NETLIB_LOG_WARN("worker queue is above 80%");
+  NETLIB_LOG_ERROR("request failed\nretry scheduled");
+  return netlib::log::Logger::Flush() ? 0 : 1;
 }

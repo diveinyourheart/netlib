@@ -201,10 +201,10 @@ buffer drains, write interest is removed. `close_after_write` closes the
 connection only after all queued output is flushed.
 
 After a frame is accepted by the Worker pool, SubReactor schedules a one-shot
-deadline using its `TimerScheduler`. The default is ten minutes and is
-configurable through `SubReactorOptions::request_timeout`. The scheduler thread
-only posts a control event back through the SubReactor wakeup. It never touches
-Codec, Channel, or connection state directly.
+deadline on the process-wide `TimerScheduler`. The default is ten minutes and is
+configurable through `SubReactorOptions::request_timeout`. The shared scheduler
+thread only posts a control event back through the SubReactor wakeup. It never
+touches Codec, Channel, or connection state directly.
 
 An accepted Worker response removes and cancels its sequence's timer. A timeout
 is inserted into the same per-connection sequence reorder path as a normal
@@ -257,10 +257,9 @@ JSON, or application request.
 
 ## Logging
 
-Reactor and ThreadPool factories use the process-wide default `log::Logger`.
-The orchestrator installs it with `DefaultLoggerScope` or `SetDefaultLogger` and
-must keep it alive until MainReactor, every SubReactor, and the ThreadPool have
-stopped. Logs cover lifecycle transitions, epoll registration failures,
-accept/recv errors, dispatch failures, oversized frames, and worker-queue
-backpressure. Individual epoll events and successful reads stay out of INFO
-logging to protect the I/O hot path.
+Reactor and ThreadPool factories use the process-wide `log::Logger`. The
+orchestrator initializes it once; it cannot be replaced, stopped, or destroyed.
+Call `Logger::Flush()` before process exit. Logs cover lifecycle transitions,
+epoll registration failures, accept/recv errors, dispatch failures, oversized
+frames, and worker-queue backpressure. Individual epoll events and successful
+reads stay out of INFO logging to protect the I/O hot path.

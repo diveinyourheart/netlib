@@ -175,7 +175,7 @@ bool TestSubmitterLifetime() {
   return completed.load() == 1 && !retained.Submit(netlib::FrameMessage{});
 }
 
-bool TestDefaultLoggerFallback() {
+bool TestGlobalLoggerIntegration() {
   std::unique_ptr<CountingSink> sink = std::make_unique<CountingSink>();
   CountingSink* sink_pointer = sink.get();
   netlib::log::LoggerOptions options{
@@ -183,31 +183,26 @@ bool TestDefaultLoggerFallback() {
       .minimum_level = netlib::log::LogLevel::kDebug,
       .queue_capacity = 16,
       .color_mode = netlib::log::ColorMode::kNever,
+      .flush_interval = std::chrono::milliseconds::zero(),
   };
-  std::unique_ptr<netlib::log::Logger> logger =
-      netlib::log::Logger::Create(std::move(options), std::move(sink));
-  if (!logger) {
+  if (!netlib::log::Logger::Initialize(std::move(options), std::move(sink))) {
     return false;
   }
 
-  {
-    netlib::log::DefaultLoggerScope default_scope(*logger);
-    std::unique_ptr<netlib::ThreadPool> pool =
-        netlib::ThreadPool::Create(1, 8, [](netlib::FrameMessage) {});
-    if (!pool) {
-      return false;
-    }
-    pool->Stop();
+  std::unique_ptr<netlib::ThreadPool> pool =
+      netlib::ThreadPool::Create(1, 8, [](netlib::FrameMessage) {});
+  if (!pool) {
+    return false;
   }
-  logger->Stop();
-  return sink_pointer->record_count() >= 3;
+  pool->Stop();
+  return netlib::log::Logger::Flush() && sink_pointer->record_count() >= 3;
 }
 
 }  // namespace
 
 int main() {
   if (!TestMixedProducersAndConcurrentStop() || !TestSubmitStopRace() ||
-      !TestSubmitterLifetime() || !TestDefaultLoggerFallback()) {
+      !TestSubmitterLifetime() || !TestGlobalLoggerIntegration()) {
     std::fprintf(stderr, "thread pool producer/stop regression failed\n");
     return 1;
   }

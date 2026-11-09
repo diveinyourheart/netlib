@@ -108,8 +108,9 @@ SubReactor 会按每条连接的 `max_pending_responses` 限制乱序缓存；�
 Codec 通过 `MaxDecodeBufferSize()` 描述输入分帧缓冲上限，单次响应 payload
 限制由 `Encode()` 自己执行。输出积压策略不再隐式绑定到 Codec 的输入缓冲上限。
 
-Frame 成功提交给 Worker 后，SubReactor 为该 sequence 注册独立的
-`request_timeout`，默认 10 分钟。Worker 响应被接受后立即取消对应 timer。
+Frame 成功提交给 Worker 后，SubReactor 在进程级共享 `TimerScheduler` 上为该
+sequence 注册 `request_timeout`，默认 10 分钟。Worker 响应被接受后立即取消
+对应 TimerId。
 超时事件只唤醒 SubReactor，由 SubReactor 线程完成协议编码、响应排序和连接
 关闭，业务线程不会直接操作连接。`max_pending_responses` 同时限制每条连接
 尚未完成响应处理的请求数，避免超时 timer 和乱序响应无界增长。
@@ -181,13 +182,10 @@ netlib::log::LoggerOptions options{
     .flush_each_record = false,
 };
 
-auto logger = netlib::log::Logger::CreateStdout(std::move(options));
-{
-  netlib::log::DefaultLoggerScope default_logger(*logger);
-  NETLIB_LOG_INFO("server started on port={} workers={}", 8080, 4);
-  // 在这里创建、运行并停止 Reactor 和 ThreadPool。
-}
-logger->Stop();
+netlib::log::Logger::InitializeStdout(std::move(options));
+NETLIB_LOG_INFO("server started on port={} workers={}", 8080, 4);
+// 进程退出前可显式调用 Flush；Logger 本身不停止、不销毁。
+netlib::log::Logger::Flush();
 ```
 
 标准输出示例（实际输出为单行）：
@@ -202,9 +200,10 @@ logger->Stop();
 
 Flush() 会记录已接受日志的截止编号，等待这个范围内的日志全部写出后再刷新。
 所有日志线程在短锁内共用一个固定 ProducerToken，写线程按序推进完成水位；后续日志可继续提交。
-Stop() 关闭提交入口、排空已接受日志并完成刷新，然后等待后台线程退出。
+Logger 不再提供 Stop()；Writer 线程创建后 detach，进程退出前用 Flush() 等待已受理日志写出。
 默认每 1000ms 自动请求刷新，可通过 LoggerOptions::flush_interval 调整（0 表示关闭）。
-刷新仍使用 fflush()，不保证断电持久化。可复用定时器见[定时器文档](docs/timer.md)。
+Reactor 超时和日志周期刷新共用一个进程级定时器线程。刷新仍使用 fflush()，不保证
+断电持久化。共享调度器及性能边界见[定时器文档](docs/timer.md)。
 多个提交线程、单 producer 和刷新水位的关系见[日志状态图解](docs/logging_state.md)。
 常驻线程显式 token 与控制消息隐式 producer 的分工见[队列拓扑](docs/queue_topology.md)。
 
@@ -215,9 +214,9 @@ NETLIB_LOG_WARN("fd={} errno={} reason={}",
                 client_fd, error_number, reason);
 ```
 
-`NETLIB_LOG_*` 不再接收 Logger 参数，直接使用进程默认 Logger；需要显式路由时
-使用 `NETLIB_LOG_*_TO(logger, ...)`。`SetDefaultLogger` 只保存非拥有指针，必须
-在所有异步日志生产者停止后清除，再停止和销毁 Logger。
+`NETLIB_LOG_*` 直接使用进程级唯一 Logger。Logger 只能初始化一次，不可替换或
+销毁；Writer 线程创建后 detach。进程退出前建议调用 `Logger::Flush()`，但不提供
+关闭队列和 join Writer 的 Stop 流程。
 
 日志级别检查发生在参数格式化之前，因此关闭某个级别时只承担一次原子读取和
 分支判断，不执行格式化和消息分配。启用日志时，fmt 在调用线程完成一次格式化，

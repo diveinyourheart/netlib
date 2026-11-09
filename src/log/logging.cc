@@ -17,6 +17,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <deque>
@@ -35,8 +36,6 @@ namespace netlib::log {
 namespace {
 
 constexpr std::size_t kWriterBatchSize = 64;
-
-constinit std::atomic<Logger*> default_logger{nullptr};
 
 struct LogQueueTraits : moodycamel::ConcurrentQueueDefaultTraits {
   // All log submissions share one explicit producer under Logger::mutex_.
@@ -292,20 +291,18 @@ class Logger::Impl {
         sink_(std::move(sink)),
         consumer_(queue_) {
     if (options.flush_interval.count() > 0) {
-      timer_ = std::make_unique<TimerScheduler>();
-      timer_->ScheduleEvery(options.flush_interval, [this] {
+      TimerScheduler::ScheduleEvery(options.flush_interval, [this] {
         std::lock_guard<std::mutex> lock(mutex_);
         // Keep the first pending target fixed: continuous logging must not
         // postpone its completion. Coalesce ticks while a request is pending.
-        if (!stopping_ && !periodic_target_) {
+        if (!failed_ && !periodic_target_) {
           periodic_target_ = accepted_;
           work_.notify_one();
         }
       });
     }
-    writer_ = std::thread([this] { WriterLoop(); });
+    std::thread([this] { WriterLoop(); }).detach();
   }
-  ~Impl() { Stop(); }
   bool valid() const { return producer_.valid(); }
 
   bool IsEnabled(LogLevel level) const {
@@ -326,10 +323,10 @@ class Logger::Impl {
         .logger_name = logger_name_,
         .message = std::move(message),
     };
-    // Admission and publication are atomic with respect to Flush and Stop.
+    // Admission and publication are atomic with respect to Flush.
     // No sink I/O, formatting, or completion wait holds this lock.
     std::lock_guard<std::mutex> lock(mutex_);
-    if (stopping_) return false;
+    if (failed_) return false;
     if (accepted_ - completed_ >= capacity_) {
       Drop();
       return false;
@@ -352,24 +349,13 @@ class Logger::Impl {
   }
   bool Flush() {
     std::unique_lock<std::mutex> lock(mutex_);
-    if (stopping_) return false;
+    if (failed_) return false;
     std::shared_ptr<FlushRequest> request =
         std::make_shared<FlushRequest>(FlushRequest{accepted_});
     requests_.push_back(request);
     work_.notify_one();
     progress_.wait(lock, [&] { return request->done || failed_; });
     return request->done;
-  }
-  void Stop() {
-    // Serializes join, so even concurrent Stop calls wait for full shutdown.
-    std::lock_guard<std::mutex> join_lock(stop_mutex_);
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      stopping_ = true;
-      work_.notify_one();
-    }
-    if (timer_) timer_->Stop();
-    if (writer_.joinable()) writer_.join();
   }
   std::size_t queued_count() const {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -389,7 +375,6 @@ class Logger::Impl {
   bool ServiceFlushes() {
     for (;;) {
       std::shared_ptr<FlushRequest> request;
-      bool final_flush = false;
       {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!requests_.empty() && requests_.front()->target <= completed_) {
@@ -397,8 +382,6 @@ class Logger::Impl {
           requests_.pop_front();
         } else if (periodic_target_ && *periodic_target_ <= completed_) {
           periodic_target_.reset();
-        } else if (stopping_ && completed_ == accepted_) {
-          final_flush = true;
         } else {
           return false;
         }
@@ -409,7 +392,6 @@ class Logger::Impl {
         request->done = true;
         progress_.notify_all();
       }
-      if (final_flush) return true;
     }
   }
   void WriterLoop() {
@@ -421,7 +403,7 @@ class Logger::Impl {
         {
           std::unique_lock<std::mutex> lock(mutex_);
           work_.wait(lock, [&] {
-            return accepted_ != completed_ || stopping_ ||
+            return accepted_ != completed_ || failed_ ||
                    (!requests_.empty() &&
                     requests_.front()->target <= completed_) ||
                    (periodic_target_ && *periodic_target_ <= completed_);
@@ -448,7 +430,6 @@ class Logger::Impl {
       // Sink failures must wake Flush callers instead of hanging forever.
       std::lock_guard<std::mutex> lock(mutex_);
       failed_ = true;
-      stopping_ = true;
       progress_.notify_all();
     }
   }
@@ -470,79 +451,87 @@ class Logger::Impl {
   std::uint64_t completed_ = 0;
   std::uint64_t dropped_ = 0;
   std::uint64_t unreported_drops_ = 0;
-  bool stopping_ = false;
   bool failed_ = false;
-  std::mutex stop_mutex_;
-  std::unique_ptr<TimerScheduler> timer_;
-  std::thread writer_;
 };
 
-std::unique_ptr<Logger> Logger::Create(LoggerOptions options,
-                                       std::unique_ptr<LogSink> sink) {
+class Logger::Registry {
+ public:
+  static Registry& Instance() noexcept {
+    // Reachable for the process lifetime; intentionally not destroyed.
+    static Registry* registry = new Registry();
+    return *registry;
+  }
+
+  std::mutex init_mutex;
+  std::atomic<Impl*> impl{nullptr};
+};
+
+Logger::Impl* Logger::GetImpl() noexcept {
+  return Registry::Instance().impl.load(std::memory_order_acquire);
+}
+
+bool Logger::Initialize(LoggerOptions options, std::unique_ptr<LogSink> sink) {
   if (options.name.empty() || options.queue_capacity == 0 || !sink ||
       !IsValidLevel(options.minimum_level) ||
       options.flush_interval.count() < 0) {
-    return nullptr;
+    return false;
   }
 
-  std::unique_ptr<Impl> impl =
-      std::make_unique<Impl>(std::move(options), std::move(sink));
-  if (!impl->valid()) {
-    return nullptr;
+  Registry& registry = Registry::Instance();
+  std::lock_guard<std::mutex> lock(registry.init_mutex);
+  if (registry.impl.load(std::memory_order_relaxed) != nullptr) {
+    return false;
   }
-  return std::unique_ptr<Logger>(new Logger(std::move(impl)));
+  Impl* impl = new Impl(std::move(options), std::move(sink));
+  if (!impl->valid()) {
+    std::abort();
+  }
+  registry.impl.store(impl, std::memory_order_release);
+  return true;
 }
 
-std::unique_ptr<Logger> Logger::CreateStdout(LoggerOptions options,
-                                             std::FILE* output) {
+bool Logger::InitializeStdout(LoggerOptions options, std::FILE* output) {
   if (output == nullptr) {
-    return nullptr;
+    return false;
   }
   ColorMode color_mode = options.color_mode;
   std::unique_ptr<LogSink> sink =
       std::make_unique<StdoutSink>(color_mode, output);
-  return Create(std::move(options), std::move(sink));
+  return Initialize(std::move(options), std::move(sink));
 }
 
-Logger::Logger(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
+bool Logger::IsInitialized() noexcept { return GetImpl() != nullptr; }
 
-Logger::~Logger() = default;
-
-bool Logger::IsEnabled(LogLevel level) const { return impl_->IsEnabled(level); }
+bool Logger::IsEnabled(LogLevel level) noexcept {
+  const Impl* impl = GetImpl();
+  return impl != nullptr && impl->IsEnabled(level);
+}
 
 bool Logger::Log(LogLevel level, std::string_view message,
                  std::source_location source) {
-  return impl_->Log(level, message, source);
+  Impl* impl = GetImpl();
+  return impl != nullptr && impl->Log(level, message, source);
 }
 
 bool Logger::LogFormatted(LogLevel level, std::string message,
                           std::source_location source) {
-  return impl_->LogOwned(level, std::move(message), source);
+  Impl* impl = GetImpl();
+  return impl != nullptr && impl->LogOwned(level, std::move(message), source);
 }
 
-bool Logger::Flush() { return impl_->Flush(); }
-
-void Logger::Stop() { impl_->Stop(); }
-
-std::size_t Logger::queued_count() const { return impl_->queued_count(); }
-
-std::uint64_t Logger::dropped_count() const { return impl_->dropped_count(); }
-
-DefaultLoggerScope::DefaultLoggerScope(Logger& logger) noexcept
-    : previous_(DefaultLogger()) {
-  SetDefaultLogger(&logger);
+bool Logger::Flush() {
+  Impl* impl = GetImpl();
+  return impl != nullptr && impl->Flush();
 }
 
-DefaultLoggerScope::~DefaultLoggerScope() noexcept {
-  SetDefaultLogger(previous_);
+std::size_t Logger::queued_count() noexcept {
+  Impl* impl = GetImpl();
+  return impl != nullptr ? impl->queued_count() : 0;
 }
 
-void SetDefaultLogger(Logger* logger) noexcept {
-  default_logger.store(logger, std::memory_order_release);
-}
-
-Logger* DefaultLogger() noexcept {
-  return default_logger.load(std::memory_order_acquire);
+std::uint64_t Logger::dropped_count() noexcept {
+  Impl* impl = GetImpl();
+  return impl != nullptr ? impl->dropped_count() : 0;
 }
 
 }  // namespace netlib::log

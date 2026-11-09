@@ -588,14 +588,13 @@ int RunReactorTest() {
       .queue_capacity = 256,
       .color_mode = netlib::log::ColorMode::kNever,
       .flush_each_record = false,
+      .flush_interval = std::chrono::milliseconds::zero(),
   };
-  std::unique_ptr<netlib::log::Logger> logger = netlib::log::Logger::Create(
-      std::move(logger_options), std::move(log_sink));
-  if (!logger) {
+  if (!netlib::log::Logger::Initialize(std::move(logger_options),
+                                       std::move(log_sink))) {
     ReportFailure("failed to create Reactor logger");
     return 1;
   }
-  netlib::log::DefaultLoggerScope default_logger_scope(*logger);
   std::atomic<std::size_t> response_errors{0};
   std::mutex response_gate_mutex;
   std::condition_variable response_gate_condition;
@@ -789,12 +788,11 @@ int RunReactorTest() {
   first_sub_thread.join();
   second_sub_thread.join();
   worker_pool->Stop();
-  logger->Flush();
+  netlib::log::Logger::Flush();
   if (log_sink_pointer->record_count() == 0) {
     ReportFailure("Reactor lifecycle did not emit logs");
     success = false;
   }
-  logger->Stop();
   return success ? 0 : 1;
 }
 

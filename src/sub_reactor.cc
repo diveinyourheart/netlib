@@ -589,8 +589,8 @@ SubReactor::SubReactor(std::unique_ptr<EventLoop> event_loop,
       options_(options) {}
 
 SubReactor::~SubReactor() {
-  request_timer_.Stop();
   response_queue_->Shutdown();
+  CancelRequestTimers();
 }
 
 bool SubReactor::AdoptConnection(UniqueFd& connection) {
@@ -612,7 +612,10 @@ bool SubReactor::AdoptConnection(UniqueFd& connection) {
   return true;
 }
 
-void SubReactor::Run() { event_loop_->Run(); }
+void SubReactor::Run() {
+  event_loop_->Run();
+  CancelRequestTimers();
+}
 
 void SubReactor::Stop() {
   NETLIB_LOG_INFO("SubReactor stopping");
@@ -620,7 +623,6 @@ void SubReactor::Stop() {
     std::lock_guard<std::mutex> lock(pending_mutex_);
     stopping_.store(true);
   }
-  request_timer_.Stop();
   response_queue_->Shutdown();
   event_loop_->Stop();
 }
@@ -669,7 +671,7 @@ void SubReactor::HandleApplicationResponse(std::uint64_t connection_id,
   Connection::ResponseStatus status =
       state.QueueResponse(sequence, std::move(response), close_after_write);
   if (timer_id != TimerScheduler::kInvalidTimer) {
-    request_timer_.Cancel(timer_id);
+    TimerScheduler::Cancel(timer_id);
   }
   if (status == Connection::ResponseStatus::kQueued) {
     FlushConnection(connection_id);
@@ -699,7 +701,7 @@ void SubReactor::HandleRequestTimeout(std::uint64_t connection_id,
   if (timer_id == TimerScheduler::kInvalidTimer) {
     return;
   }
-  request_timer_.Cancel(timer_id);
+  TimerScheduler::Cancel(timer_id);
 
   std::optional<ApplicationResponse> timeout_response =
       state.codec().CreateTimeoutResponse();
@@ -909,7 +911,7 @@ bool SubReactor::ProcessFrames(Connection& connection) {
     }
 
     std::weak_ptr<ResponseQueue> weak_response_queue = response_queue_;
-    TimerScheduler::TimerId timer_id = request_timer_.ScheduleAfter(
+    TimerScheduler::TimerId timer_id = TimerScheduler::ScheduleAfter(
         options_.request_timeout,
         [weak_response_queue, connection_id, sequence] {
           std::shared_ptr<ResponseQueue> response_queue =
@@ -926,7 +928,7 @@ bool SubReactor::ProcessFrames(Connection& connection) {
       return false;
     }
     if (!connection.TrackRequestTimer(sequence, timer_id)) {
-      request_timer_.Cancel(timer_id);
+      TimerScheduler::Cancel(timer_id);
       NETLIB_LOG_ERROR(
           "duplicate request timer for connection id={} "
           "sequence={}",
@@ -992,6 +994,16 @@ void SubReactor::FlushConnection(std::uint64_t connection_id) {
   }
 }
 
+void SubReactor::CancelRequestTimers() {
+  for (auto& entry : connections_) {
+    std::vector<TimerScheduler::TimerId> timer_ids =
+        entry.second->TakeRequestTimers();
+    for (TimerScheduler::TimerId timer_id : timer_ids) {
+      TimerScheduler::Cancel(timer_id);
+    }
+  }
+}
+
 void SubReactor::CloseConnection(std::uint64_t connection_id) {
   auto connection = connections_.find(connection_id);
   if (connection == connections_.end()) {
@@ -1001,7 +1013,7 @@ void SubReactor::CloseConnection(std::uint64_t connection_id) {
   std::vector<TimerScheduler::TimerId> timer_ids =
       connection->second->TakeRequestTimers();
   for (TimerScheduler::TimerId timer_id : timer_ids) {
-    request_timer_.Cancel(timer_id);
+    TimerScheduler::Cancel(timer_id);
   }
   connection->second->MarkClosed();
   NETLIB_LOG_DEBUG("closing connection fd={} id={}", fd, connection_id);

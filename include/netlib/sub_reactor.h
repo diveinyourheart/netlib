@@ -95,6 +95,7 @@ class SubReactor {
   void HandleRequestTimeout(std::uint64_t connection_id,
                             std::uint64_t sequence);
   void FlushConnection(std::uint64_t connection_id);
+  void CancelRequestTimers();
   void CloseConnection(std::uint64_t connection_id);
 
   std::unique_ptr<EventLoop> event_loop_;
@@ -106,7 +107,6 @@ class SubReactor {
   std::unique_ptr<Channel> wake_channel_;
   std::shared_ptr<ResponseQueue> response_queue_;
   const SubReactorOptions options_;
-  TimerScheduler request_timer_;
   std::mutex pending_mutex_;
   std::deque<UniqueFd> pending_connections_;
   std::atomic<bool> stopping_{false};
