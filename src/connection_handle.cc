@@ -20,9 +20,9 @@ class ConnectionHandle::State {
   bool valid() const { return alive_->load(std::memory_order_acquire); }
 
   bool Respond(std::uint64_t sequence, ApplicationResponse response,
-               bool close_after_write) const {
-    return valid() &&
-           responder_(id_, sequence, std::move(response), close_after_write);
+               bool close_after_write, ResponseMode mode) const {
+    return valid() && responder_(id_, sequence, std::move(response),
+                                 close_after_write, mode);
   }
 
  private:
@@ -49,7 +49,16 @@ bool ConnectionHandle::Respond(std::uint64_t sequence,
                                ApplicationResponse response,
                                bool close_after_write) const {
   return state_ != nullptr &&
-         state_->Respond(sequence, std::move(response), close_after_write);
+         state_->Respond(sequence, std::move(response), close_after_write,
+                         ResponseMode::kOrdered);
+}
+
+bool ConnectionHandle::RespondUnordered(std::uint64_t sequence,
+                                        ApplicationResponse response,
+                                        bool close_after_write) const {
+  return state_ != nullptr &&
+         state_->Respond(sequence, std::move(response), close_after_write,
+                         ResponseMode::kUnordered);
 }
 
 }  // namespace netlib

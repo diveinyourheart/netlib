@@ -78,7 +78,7 @@ auto workers = netlib::ThreadPool::Create(
     4, 4096, [](netlib::FrameMessage message) {
       // 解码并处理完整 payload。
       std::vector<char> response = BuildResponse(message.payload);
-      message.connection.Respond(message.sequence, std::move(response));
+      message.Respond(std::move(response));
     });
 
 netlib::SubReactorOptions sub_options{
@@ -103,6 +103,17 @@ Sub 的生产者，再调用 `ThreadPool::Stop()` 排空消息并 join Worker。
 重复响应会被忽略，这些顺序错误通常表示业务 Handler 违反了响应契约。
 SubReactor 会按每条连接的 `max_pending_responses` 限制乱序缓存；溢出时关闭该
 连接。全局响应队列满或连接已经关闭时，`Respond()` 返回 false。
+
+Handler 可以选择两种回写方式：
+
+- `message.Respond(...)`：按每连接 sequence 重排，适合 HTTP/1.1 pipeline。
+- `message.RespondUnordered(...)`：立即跳过重排，由 SubReactor 下一次调度时编码
+  并追加到该连接输出缓冲，再唤醒所属 event loop。
+
+两种方式仍由 SubReactor owner 线程编码和写 socket，Worker 不直接修改连接状态。
+`RespondUnordered()` 会消费对应 sequence 并取消请求超时，但可能越过尚未完成的
+前序响应；HTTP/1.1 pipeline 不应使用。它适合 WebSocket 推送、服务端主动消息或
+协议自身已经定义了独立消息关联/顺序的场景。
 
 `SubReactorOptions` 分别控制待注册连接数、待处理响应数和单连接输出积压字节数。
 Codec 通过 `MaxDecodeBufferSize()` 描述输入分帧缓冲上限，单次响应 payload

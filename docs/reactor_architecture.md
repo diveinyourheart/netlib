@@ -194,6 +194,19 @@ queue and each connection's out-of-order buffer. Exceeding the per-connection
 bound closes that connection because its application-level ordering contract
 can no longer be maintained safely.
 
+Workers have two response submission modes:
+
+- `FrameMessage::Respond()` preserves per-connection request order and is the
+  required mode for HTTP/1.1 pipelines.
+- `FrameMessage::RespondUnordered()` consumes the sequence and cancels its
+  timeout, but appends encoded bytes immediately when the owner SubReactor
+  processes the control message.
+
+Neither mode lets a Worker mutate the connection output vector or epoll interest
+directly. Both enqueue a response message and wake the owner event loop. The
+unordered mode may overtake an earlier unfinished request; use it only for
+protocols with independent messages or their own correlation and ordering.
+
 SubReactor drains responses on its own thread, encodes them using the
 connection's `ProtocolCodec`, and appends them to the output buffer. It writes
 nonblocking until `EAGAIN`; only then does the Channel add `EPOLLOUT`. Once the

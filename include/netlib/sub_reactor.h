@@ -92,6 +92,10 @@ class SubReactor {
                                  std::uint64_t sequence,
                                  ApplicationResponse response,
                                  bool close_after_write);
+  void HandleUnorderedResponse(std::uint64_t connection_id,
+                               std::uint64_t sequence,
+                               ApplicationResponse response,
+                               bool close_after_write);
   void HandleRequestTimeout(std::uint64_t connection_id,
                             std::uint64_t sequence);
   void FlushConnection(std::uint64_t connection_id);

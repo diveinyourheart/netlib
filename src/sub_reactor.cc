@@ -41,6 +41,7 @@ std::uint64_t AllocateConnectionId() {
 
 enum class ResponseMessageKind : std::uint8_t {
   kApplication,
+  kUnordered,
   kTimeout,
 };
 
@@ -89,6 +90,19 @@ class SubReactor::ResponseQueue {
             .sequence = sequence,
         },
         false);
+  }
+
+  bool EnqueueUnordered(std::uint64_t connection_id, std::uint64_t sequence,
+                        ApplicationResponse response, bool close_after_write) {
+    return EnqueueMessage(
+        ResponseMessage{
+            .kind = ResponseMessageKind::kUnordered,
+            .connection_id = connection_id,
+            .sequence = sequence,
+            .response = std::move(response),
+            .close_after_write = close_after_write,
+        },
+        true);
   }
 
   bool TryDequeue(ResponseMessage& message) {
@@ -194,6 +208,9 @@ class SubReactor::Connection {
   ResponseStatus QueueResponse(std::uint64_t sequence,
                                ApplicationResponse response,
                                bool close_after_write);
+  ResponseStatus QueueUnorderedResponse(std::uint64_t sequence,
+                                        ApplicationResponse response,
+                                        bool close_after_write);
   bool HasOutput() const;
   std::span<const char> PendingOutput() const;
   void ConsumeOutput(std::size_t size);
@@ -207,7 +224,7 @@ class SubReactor::Connection {
 
  private:
   struct PendingResponse {
-    ApplicationResponse response = BinaryResponse{};
+    std::optional<ApplicationResponse> response;
     bool close_after_write = false;
   };
 
@@ -365,9 +382,14 @@ void SubReactor::Connection::MakeWritable(std::size_t min_bytes) {
 
 bool SubReactor::Connection::AppendResponse(const ApplicationResponse& response,
                                             bool close_after_write) {
+  // Callers must reject new work once close is latched. A successful append
+  // may latch close_after_write_ from either the caller or Codec policy; a
+  // failed append must leave both encoded output and close state unchanged.
+  assert(!close_after_write_);
   CompactOutput();
   std::size_t old_size = output_buffer_.size();
   if (!codec_->Encode(response, &output_buffer_)) {
+    output_buffer_.resize(old_size);
     return false;
   }
   if (output_buffer_.size() > max_output_buffer_size_) {
@@ -396,6 +418,8 @@ SubReactor::Connection::ResponseStatus SubReactor::Connection::QueueResponse(
       return ResponseStatus::kOverflow;
     }
     ++next_response_sequence_;
+    // AppendResponse may latch close. Drop every later pipeline response so no
+    // bytes are queued after the protocol's terminal response.
     if (close_after_write_) {
       pending_responses_.clear();
       return ResponseStatus::kQueued;
@@ -421,10 +445,70 @@ SubReactor::Connection::ResponseStatus SubReactor::Connection::QueueResponse(
     }
     PendingResponse pending = std::move(current->second);
     pending_responses_.erase(current);
-    if (!AppendResponse(pending.response, pending.close_after_write)) {
+    if (pending.response.has_value() &&
+        !AppendResponse(*pending.response, pending.close_after_write)) {
       return ResponseStatus::kOverflow;
     }
     ++next_response_sequence_;
+    // Re-check immediately: the codec can require close based on this response.
+    if (close_after_write_) {
+      pending_responses_.clear();
+      return ResponseStatus::kQueued;
+    }
+  }
+}
+
+SubReactor::Connection::ResponseStatus
+SubReactor::Connection::QueueUnorderedResponse(std::uint64_t sequence,
+                                               ApplicationResponse response,
+                                               bool close_after_write) {
+  if (sequence < next_response_sequence_) {
+    return ResponseStatus::kStale;
+  }
+  if (sequence >= next_request_sequence_) {
+    return ResponseStatus::kStale;
+  }
+  if (close_after_write_) {
+    return ResponseStatus::kClosed;
+  }
+  if (pending_responses_.find(sequence) != pending_responses_.end()) {
+    return ResponseStatus::kStale;
+  }
+  if (sequence != next_response_sequence_ &&
+      pending_responses_.size() >= max_pending_responses_) {
+    return ResponseStatus::kOverflow;
+  }
+  if (!AppendResponse(response, close_after_write)) {
+    return ResponseStatus::kOverflow;
+  }
+
+  if (sequence == next_response_sequence_) {
+    ++next_response_sequence_;
+  } else {
+    pending_responses_.emplace(sequence, PendingResponse{
+                                             .response = std::nullopt,
+                                             .close_after_write = false,
+                                         });
+  }
+  if (close_after_write_) {
+    // Ordering placeholders are irrelevant once the encoded response is final.
+    pending_responses_.clear();
+    return ResponseStatus::kQueued;
+  }
+
+  while (true) {
+    auto current = pending_responses_.find(next_response_sequence_);
+    if (current == pending_responses_.end()) {
+      return ResponseStatus::kQueued;
+    }
+    PendingResponse pending = std::move(current->second);
+    pending_responses_.erase(current);
+    if (pending.response.has_value() &&
+        !AppendResponse(*pending.response, pending.close_after_write)) {
+      return ResponseStatus::kOverflow;
+    }
+    ++next_response_sequence_;
+    // The codec may have latched close while draining the placeholder chain.
     if (close_after_write_) {
       pending_responses_.clear();
       return ResponseStatus::kQueued;
@@ -651,6 +735,12 @@ void SubReactor::HandleWake() {
       HandleRequestTimeout(response.connection_id, response.sequence);
       continue;
     }
+    if (response.kind == ResponseMessageKind::kUnordered) {
+      HandleUnorderedResponse(response.connection_id, response.sequence,
+                              std::move(response.response),
+                              response.close_after_write);
+      continue;
+    }
     HandleApplicationResponse(response.connection_id, response.sequence,
                               std::move(response.response),
                               response.close_after_write);
@@ -686,6 +776,40 @@ void SubReactor::HandleApplicationResponse(std::uint64_t connection_id,
   }
   NETLIB_LOG_DEBUG(
       "ignored response for closed or stale connection id={} sequence={}",
+      connection_id, sequence);
+}
+
+void SubReactor::HandleUnorderedResponse(std::uint64_t connection_id,
+                                         std::uint64_t sequence,
+                                         ApplicationResponse response,
+                                         bool close_after_write) {
+  auto connection = connections_.find(connection_id);
+  if (connection == connections_.end()) {
+    return;
+  }
+
+  Connection& state = *connection->second;
+  TimerScheduler::TimerId timer_id = state.TakeRequestTimer(sequence);
+  if (timer_id != TimerScheduler::kInvalidTimer) {
+    TimerScheduler::Cancel(timer_id);
+  }
+  Connection::ResponseStatus status = state.QueueUnorderedResponse(
+      sequence, std::move(response), close_after_write);
+  if (status == Connection::ResponseStatus::kQueued) {
+    FlushConnection(connection_id);
+    return;
+  }
+  if (status == Connection::ResponseStatus::kOverflow) {
+    NETLIB_LOG_WARN(
+        "unordered response buffer limit reached for connection id={} "
+        "sequence={}",
+        connection_id, sequence);
+    CloseConnection(connection_id);
+    return;
+  }
+  NETLIB_LOG_DEBUG(
+      "ignored unordered response for closed or stale connection id={} "
+      "sequence={}",
       connection_id, sequence);
 }
 
@@ -773,11 +897,16 @@ void SubReactor::RegisterConnection(UniqueFd connection) {
       connection_id, alive,
       [weak_response_queue](std::uint64_t id, std::uint64_t sequence,
                             ApplicationResponse response,
-                            bool close_after_write) {
+                            bool close_after_write,
+                            ConnectionHandle::ResponseMode mode) {
         std::shared_ptr<ResponseQueue> response_queue =
             weak_response_queue.lock();
         if (!response_queue) {
           return false;
+        }
+        if (mode == ConnectionHandle::ResponseMode::kUnordered) {
+          return response_queue->EnqueueUnordered(
+              id, sequence, std::move(response), close_after_write);
         }
         return response_queue->Enqueue(ResponseMessage{
             .connection_id = id,
