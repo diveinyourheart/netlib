@@ -78,7 +78,7 @@ auto workers = netlib::ThreadPool::Create(
     4, 4096, [](netlib::FrameMessage message) {
       // 解码并处理完整 payload。
       std::vector<char> response = BuildResponse(message.payload);
-      message.connection.Respond(message.sequence, std::move(response));
+      message.Respond(std::move(response));
     });
 
 netlib::SubReactorOptions sub_options{
@@ -104,12 +104,24 @@ Sub 的生产者，再调用 `ThreadPool::Stop()` 排空消息并 join Worker。
 SubReactor 会按每条连接的 `max_pending_responses` 限制乱序缓存；溢出时关闭该
 连接。全局响应队列满或连接已经关闭时，`Respond()` 返回 false。
 
+Handler 可以选择两种回写方式：
+
+- `message.Respond(...)`：按每连接 sequence 重排，适合 HTTP/1.1 pipeline。
+- `message.RespondUnordered(...)`：立即跳过重排，由 SubReactor 下一次调度时编码
+  并追加到该连接输出缓冲，再唤醒所属 event loop。
+
+两种方式仍由 SubReactor owner 线程编码和写 socket，Worker 不直接修改连接状态。
+`RespondUnordered()` 会消费对应 sequence 并取消请求超时，但可能越过尚未完成的
+前序响应；HTTP/1.1 pipeline 不应使用。它适合 WebSocket 推送、服务端主动消息或
+协议自身已经定义了独立消息关联/顺序的场景。
+
 `SubReactorOptions` 分别控制待注册连接数、待处理响应数和单连接输出积压字节数。
 Codec 通过 `MaxDecodeBufferSize()` 描述输入分帧缓冲上限，单次响应 payload
 限制由 `Encode()` 自己执行。输出积压策略不再隐式绑定到 Codec 的输入缓冲上限。
 
-Frame 成功提交给 Worker 后，SubReactor 为该 sequence 注册独立的
-`request_timeout`，默认 10 分钟。Worker 响应被接受后立即取消对应 timer。
+Frame 成功提交给 Worker 后，SubReactor 在进程级共享 `TimerScheduler` 上为该
+sequence 注册 `request_timeout`，默认 10 分钟。Worker 响应被接受后立即取消
+对应 TimerId。
 超时事件只唤醒 SubReactor，由 SubReactor 线程完成协议编码、响应排序和连接
 关闭，业务线程不会直接操作连接。`max_pending_responses` 同时限制每条连接
 尚未完成响应处理的请求数，避免超时 timer 和乱序响应无界增长。
@@ -154,11 +166,11 @@ if (request != nullptr && request->target == "/rpc") {
 发送通过平台接口循环执行，直到缓冲区为空或 would-block。仅在输出积压时关注
 可写事件，写空后恢复为只读。Linux 保留 epoll ET，Windows 使用 WSAPoll LT。
 
-Reactor 和 ThreadPool 的工厂函数支持可选的 `Logger*` 参数。建议由服务编排层
-创建 Logger，并作为最后一个非拥有参数传给三者。当前会记录 EventLoop 启动和
-停止、监听地址、连接派发、Channel 注册失败、accept/recv 错误、超大帧、
-Worker 队列背压及 Reactor 关闭等事件；逐 epoll 事件和每次成功 `recv` 不记录
-INFO 日志，避免热路径产生日志风暴。
+服务编排层把唯一 Logger 注册为进程默认 Logger，Reactor 和 ThreadPool 内部通过
+无参数日志宏自动使用该实例。当前会记录 EventLoop 启动和停止、监听地址、连接
+派发、Channel 注册失败、accept/recv 错误、超大帧、Worker 队列背压及 Reactor
+关闭等事件；逐 epoll 事件和每次成功 `recv` 不记录 INFO 日志，避免热路径产生
+日志风暴。
 
 EventLoop 的 Wakeup 也作为普通 Channel 注册。跨线程 Stop() 设置停止状态并唤醒
 事件等待；Linux 使用 eventfd，Windows 使用本地 TCP 连接对。当前 ready batch
@@ -181,8 +193,10 @@ netlib::log::LoggerOptions options{
     .flush_each_record = false,
 };
 
-auto logger = netlib::log::Logger::CreateStdout(std::move(options));
-NETLIB_LOG_INFO(*logger, "server started on port={} workers={}", 8080, 4);
+netlib::log::Logger::InitializeStdout(std::move(options));
+NETLIB_LOG_INFO("server started on port={} workers={}", 8080, 4);
+// 进程退出前可显式调用 Flush；Logger 本身不停止、不销毁。
+netlib::log::Logger::Flush();
 ```
 
 标准输出示例（实际输出为单行）：
@@ -197,18 +211,23 @@ NETLIB_LOG_INFO(*logger, "server started on port={} workers={}", 8080, 4);
 
 Flush() 会记录已接受日志的截止编号，等待这个范围内的日志全部写出后再刷新。
 所有日志线程在短锁内共用一个固定 ProducerToken，写线程按序推进完成水位；后续日志可继续提交。
-Stop() 关闭提交入口、排空已接受日志并完成刷新，然后等待后台线程退出。
+Logger 不再提供 Stop()；Writer 线程创建后 detach，进程退出前用 Flush() 等待已受理日志写出。
 默认每 1000ms 自动请求刷新，可通过 LoggerOptions::flush_interval 调整（0 表示关闭）。
-刷新仍使用 fflush()，不保证断电持久化。可复用定时器见[定时器文档](docs/timer.md)。
+Reactor 超时和日志周期刷新共用一个进程级定时器线程。刷新仍使用 fflush()，不保证
+断电持久化。共享调度器及性能边界见[定时器文档](docs/timer.md)。
 多个提交线程、单 producer 和刷新水位的关系见[日志状态图解](docs/logging_state.md)。
 常驻线程显式 token 与控制消息隐式 producer 的分工见[队列拓扑](docs/queue_topology.md)。
 
 日志宏使用固定版本 fmtlib 11.2.0，格式串在编译期检查，例如：
 
 ```cpp
-NETLIB_LOG_WARN(*logger, "fd={} errno={} reason={}",
+NETLIB_LOG_WARN("fd={} errno={} reason={}",
                 client_fd, error_number, reason);
 ```
+
+`NETLIB_LOG_*` 直接使用进程级唯一 Logger。Logger 只能初始化一次，不可替换或
+销毁；Writer 线程创建后 detach。进程退出前建议调用 `Logger::Flush()`，但不提供
+关闭队列和 join Writer 的 Stop 流程。
 
 日志级别检查发生在参数格式化之前，因此关闭某个级别时只承担一次原子读取和
 分支判断，不执行格式化和消息分配。启用日志时，fmt 在调用线程完成一次格式化，

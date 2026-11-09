@@ -21,10 +21,8 @@ class TimerScheduler::Impl {
   Impl() noexcept {
     heap_.reserve(64);
     positions_.reserve(64);
-    worker_ = std::thread([this] { Run(); });
-    worker_id_ = worker_.get_id();
+    std::thread([this] { Run(); }).detach();
   }
-  ~Impl() { Stop(); }
 
   TimerId Schedule(Clock::time_point deadline, Clock::duration interval,
                    Callback callback) noexcept {
@@ -36,7 +34,7 @@ class TimerScheduler::Impl {
     TimerId id = kInvalidTimer;
     {
       std::lock_guard<std::mutex> lock(mutex_);
-      if (stopping_ || next_id_ == 0) return kInvalidTimer;
+      if (next_id_ == 0) return kInvalidTimer;
       id = entry.id = next_id_++;
       wake = heap_.empty() || deadline < heap_.front().deadline;
       positions_.emplace(id, heap_.size());
@@ -64,17 +62,6 @@ class TimerScheduler::Impl {
     }
     if (wake) changed_.notify_one();
     return true;
-  }
-
-  void Stop() noexcept {
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      stopping_ = true;
-    }
-    changed_.notify_one();
-    if (std::this_thread::get_id() == worker_id_) return;
-    std::lock_guard<std::mutex> join_lock(join_mutex_);
-    if (worker_.joinable()) worker_.join();
   }
 
  private:
@@ -130,7 +117,7 @@ class TimerScheduler::Impl {
 
   void Run() noexcept {
     std::unique_lock<std::mutex> lock(mutex_);
-    while (!stopping_) {
+    while (true) {
       if (heap_.empty()) {
         changed_.wait(lock);
         continue;
@@ -146,7 +133,7 @@ class TimerScheduler::Impl {
       entry.callback();  // Contract: callbacks do not throw.
       lock.lock();
       PositionMap::iterator found = positions_.find(entry.id);
-      if (!stopping_ && found != positions_.end() &&
+      if (found != positions_.end() &&
           entry.interval > Clock::duration::zero()) {
         entry.deadline = DeadlineAfter(entry.interval);
         PushEntry(std::move(entry));  // Reuses the existing ID-index node.
@@ -157,9 +144,6 @@ class TimerScheduler::Impl {
       entry.callback = {};  // Release captures without holding mutex_.
       lock.lock();
     }
-    std::vector<Entry> pending = std::move(heap_);
-    positions_.clear();
-    lock.unlock();  // Destroy pending callback captures outside the lock.
   }
 
  public:
@@ -173,32 +157,36 @@ class TimerScheduler::Impl {
  private:
   std::mutex mutex_;
   std::condition_variable changed_;
-  bool stopping_ = false;
   TimerId next_id_ = 1;
   std::vector<Entry> heap_;
   PositionMap positions_;
-  std::mutex join_mutex_;
-  std::thread worker_;
-  std::thread::id worker_id_;
 };
 
-TimerScheduler::TimerScheduler() noexcept : impl_(std::make_unique<Impl>()) {}
-TimerScheduler::~TimerScheduler() = default;
+TimerScheduler::Impl& TimerScheduler::GetImpl() noexcept {
+  // Reachable for the process lifetime; intentionally not destroyed.
+  static Impl* impl = new Impl();
+  return *impl;
+}
+
 TimerScheduler::TimerId TimerScheduler::ScheduleAt(Clock::time_point deadline,
                                                    Callback callback) noexcept {
-  return impl_->Schedule(deadline, Clock::duration::zero(),
-                         std::move(callback));
+  return GetImpl().Schedule(deadline, Clock::duration::zero(),
+                            std::move(callback));
 }
+
 TimerScheduler::TimerId TimerScheduler::ScheduleAfter(
     Clock::duration delay, Callback callback) noexcept {
   return ScheduleAt(Impl::DeadlineAfter(delay), std::move(callback));
 }
+
 TimerScheduler::TimerId TimerScheduler::ScheduleEvery(
     Clock::duration interval, Callback callback) noexcept {
   if (interval <= Clock::duration::zero()) return kInvalidTimer;
-  return impl_->Schedule(Impl::DeadlineAfter(interval), interval,
-                         std::move(callback));
+  return GetImpl().Schedule(Impl::DeadlineAfter(interval), interval,
+                            std::move(callback));
 }
-bool TimerScheduler::Cancel(TimerId id) noexcept { return impl_->Cancel(id); }
-void TimerScheduler::Stop() noexcept { impl_->Stop(); }
+
+bool TimerScheduler::Cancel(TimerId id) noexcept {
+  return GetImpl().Cancel(id);
+}
 }  // namespace netlib

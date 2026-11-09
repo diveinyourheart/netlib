@@ -15,8 +15,25 @@
 #include <vector>
 
 #include "netlib/frame_message.h"
+#include "netlib/log/logging.h"
 
 namespace {
+
+class CountingSink final : public netlib::log::LogSink {
+ public:
+  void Write(const netlib::log::LogRecord&) override {
+    record_count_.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  void Flush() override {}
+
+  std::size_t record_count() const {
+    return record_count_.load(std::memory_order_relaxed);
+  }
+
+ private:
+  std::atomic<std::size_t> record_count_{0};
+};
 
 bool TestMixedProducersAndConcurrentStop() {
   constexpr std::size_t kExplicitProducers = 4;
@@ -148,6 +165,8 @@ bool TestSubmitterLifetime() {
   }
   netlib::ThreadPool::Submitter original = pool->CreateSubmitter();
   netlib::ThreadPool::Submitter retained = std::move(original);
+  // Moved-from validity is part of this test's contract.
+  // NOLINTNEXTLINE(clang-analyzer-cplusplus.Move)
   if (original.valid() || !retained.valid() ||
       !retained.Submit(netlib::FrameMessage{})) {
     return false;
@@ -156,11 +175,34 @@ bool TestSubmitterLifetime() {
   return completed.load() == 1 && !retained.Submit(netlib::FrameMessage{});
 }
 
+bool TestGlobalLoggerIntegration() {
+  std::unique_ptr<CountingSink> sink = std::make_unique<CountingSink>();
+  CountingSink* sink_pointer = sink.get();
+  netlib::log::LoggerOptions options{
+      .name = "netlib.thread_pool.default",
+      .minimum_level = netlib::log::LogLevel::kDebug,
+      .queue_capacity = 16,
+      .color_mode = netlib::log::ColorMode::kNever,
+      .flush_interval = std::chrono::milliseconds::zero(),
+  };
+  if (!netlib::log::Logger::Initialize(std::move(options), std::move(sink))) {
+    return false;
+  }
+
+  std::unique_ptr<netlib::ThreadPool> pool =
+      netlib::ThreadPool::Create(1, 8, [](netlib::FrameMessage) {});
+  if (!pool) {
+    return false;
+  }
+  pool->Stop();
+  return netlib::log::Logger::Flush() && sink_pointer->record_count() >= 3;
+}
+
 }  // namespace
 
 int main() {
   if (!TestMixedProducersAndConcurrentStop() || !TestSubmitStopRace() ||
-      !TestSubmitterLifetime()) {
+      !TestSubmitterLifetime() || !TestGlobalLoggerIntegration()) {
     std::fprintf(stderr, "thread pool producer/stop regression failed\n");
     return 1;
   }

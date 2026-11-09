@@ -6,7 +6,7 @@
 | --- | --- | --- | --- |
 | 请求：SubReactor → ThreadPool | 每个 SubReactor 一个 Submitter，共 m 个 | 每个 Worker 一个 ConsumerToken，共 N 个 | 通用 ThreadPool::Submit 调用、Stop 控制消息 |
 | 响应：Worker → SubReactor | 每个响应队列为 N 个 Worker 各准备一个 ProducerToken，共 m×N 个 | 每个 SubReactor 一个 ConsumerToken，共 m 个 | 定时器、外部线程或其他线程池的异步响应 |
-| 日志：业务线程 → Writer | 一个共享 ProducerToken，由现有 mutex_ 串行保护 | Logger 写线程独占一个 ConsumerToken | 禁用；定时刷新和 Stop 使用状态通知 |
+| 日志：业务线程 → Writer | 一个共享 ProducerToken，由现有 mutex_ 串行保护 | Logger 写线程独占一个 ConsumerToken | 禁用；定时刷新和 Flush 使用状态通知 |
 
 token 类型仍然隐藏在 src 内部，公开头文件不依赖 moodycamel。
 
@@ -77,7 +77,7 @@ flowchart LR
 
 日志关闭隐式 producer，避免线程数量决定子队列数量。唯一 producer 加上唯一消费者，
 使写出顺序与受理 sequence 一致，完成状态简化为 accepted_、completed_ 两个计数。
-日志的 Flush/Stop 使用现有状态和条件变量，不插入另一个 producer 的控制消息。
+日志的 Flush 使用现有状态和条件变量，不插入另一个 producer 的控制消息。
 具体状态和刷新示例见[日志状态图解](logging_state.md)。
 
 ## ThreadPool 的关闭与排空

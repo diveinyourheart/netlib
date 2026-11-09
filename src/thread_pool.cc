@@ -34,7 +34,7 @@ constexpr std::size_t kAdmissionClosed =
 class ThreadPool::Impl {
  public:
   Impl(std::size_t worker_count, std::size_t max_pending_messages,
-       Handler handler, log::Logger* logger);
+       Handler handler);
   ~Impl();
   Impl(const Impl&) = delete;
   Impl& operator=(const Impl&) = delete;
@@ -70,7 +70,6 @@ class ThreadPool::Impl {
   bool stopped_ = false;
   std::vector<std::unique_ptr<moodycamel::ConsumerToken>> consumer_tokens_;
   std::vector<std::thread> workers_;
-  log::Logger* logger_;
   static thread_local const Impl* current_pool_;
   static thread_local std::size_t current_index_;
 };
@@ -79,12 +78,10 @@ thread_local const ThreadPool::Impl* ThreadPool::Impl::current_pool_ = nullptr;
 thread_local std::size_t ThreadPool::Impl::current_index_ = 0;
 
 ThreadPool::Impl::Impl(std::size_t worker_count,
-                       std::size_t max_pending_messages, Handler handler,
-                       log::Logger* logger)
+                       std::size_t max_pending_messages, Handler handler)
     : max_pending_messages_(max_pending_messages),
       handler_(std::move(handler)),
-      queue_(max_pending_messages),
-      logger_(logger) {
+      queue_(max_pending_messages) {
   consumer_tokens_.reserve(worker_count);
   workers_.reserve(worker_count);
   for (std::size_t i = 0; i < worker_count; ++i) {
@@ -95,11 +92,8 @@ ThreadPool::Impl::Impl(std::size_t worker_count,
     workers_.emplace_back(
         [this, token_pointer, i] { WorkerLoop(*token_pointer, i); });
   }
-  if (logger_ != nullptr) {
-    NETLIB_LOG_INFO(*logger_,
-                    "ThreadPool started with {} workers and queue capacity {}",
-                    worker_count, max_pending_messages);
-  }
+  NETLIB_LOG_INFO("ThreadPool started with {} workers and queue capacity {}",
+                  worker_count, max_pending_messages);
 }
 
 ThreadPool::Impl::~Impl() { Stop(); }
@@ -154,9 +148,7 @@ void ThreadPool::Impl::Stop() {
     return;
   }
   admission_.fetch_or(kAdmissionClosed, std::memory_order_acq_rel);
-  if (logger_ != nullptr) {
-    NETLIB_LOG_INFO(*logger_, "ThreadPool stopping");
-  }
+  NETLIB_LOG_INFO("ThreadPool stopping");
   std::size_t state = admission_.load(std::memory_order_acquire);
   while (state != kAdmissionClosed) {
     admission_.wait(state, std::memory_order_acquire);
@@ -181,9 +173,7 @@ void ThreadPool::Impl::Stop() {
     worker.join();
   }
   stopped_ = true;
-  if (logger_ != nullptr) {
-    NETLIB_LOG_INFO(*logger_, "ThreadPool stopped");
-  }
+  NETLIB_LOG_INFO("ThreadPool stopped");
 }
 
 std::size_t ThreadPool::Impl::queued_count() const {
@@ -255,16 +245,13 @@ bool ThreadPool::Submitter::Submit(FrameMessage message) {
 
 std::unique_ptr<ThreadPool> ThreadPool::Create(std::size_t worker_count,
                                                std::size_t max_pending_messages,
-                                               Handler handler,
-                                               log::Logger* logger) {
+                                               Handler handler) {
   if (worker_count == 0 || max_pending_messages == 0 || !handler) {
-    if (logger != nullptr) {
-      NETLIB_LOG_ERROR(*logger, "invalid ThreadPool configuration");
-    }
+    NETLIB_LOG_ERROR("invalid ThreadPool configuration");
     return nullptr;
   }
   std::shared_ptr<Impl> impl = std::make_shared<Impl>(
-      worker_count, max_pending_messages, std::move(handler), logger);
+      worker_count, max_pending_messages, std::move(handler));
   return std::unique_ptr<ThreadPool>(new ThreadPool(std::move(impl)));
 }
 

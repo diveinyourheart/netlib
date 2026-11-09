@@ -130,11 +130,35 @@ if(BUILD_TESTING)
 
   add_executable(netlib_log_test tests/log_test.cc)
   target_link_libraries(netlib_log_test PRIVATE netlib::log)
-  add_test(NAME netlib_log_test COMMAND netlib_log_test)
+  add_test(NAME netlib_log_test_stdout_colorless
+    COMMAND netlib_log_test stdout-colorless)
+  add_test(NAME netlib_log_test_stdout_colored
+    COMMAND netlib_log_test stdout-colored)
+  add_test(NAME netlib_log_test_concurrent COMMAND netlib_log_test concurrent)
+  add_test(NAME netlib_log_test_invalid COMMAND netlib_log_test invalid)
+  add_test(NAME netlib_log_test_singleton COMMAND netlib_log_test singleton)
   add_executable(netlib_log_barrier_test tests/log_barrier_test.cc)
   target_link_libraries(netlib_log_barrier_test PRIVATE netlib::log)
-  add_test(NAME netlib_log_barrier_test COMMAND netlib_log_barrier_test)
-  set_tests_properties(netlib_log_barrier_test PROPERTIES TIMEOUT 30)
+  add_test(NAME netlib_log_barrier_test_barrier
+    COMMAND netlib_log_barrier_test barrier)
+  add_test(NAME netlib_log_barrier_test_periodic
+    COMMAND netlib_log_barrier_test periodic)
+  add_test(NAME netlib_log_barrier_test_drops
+    COMMAND netlib_log_barrier_test drops)
+  add_test(NAME netlib_log_barrier_test_failure
+    COMMAND netlib_log_barrier_test failure)
+  add_test(NAME netlib_log_barrier_test_submission_during_flush
+    COMMAND netlib_log_barrier_test submission-during-flush)
+  add_test(NAME netlib_log_barrier_test_flush_while_producing
+    COMMAND netlib_log_barrier_test flush-while-producing)
+  set_tests_properties(
+    netlib_log_barrier_test_barrier
+    netlib_log_barrier_test_periodic
+    netlib_log_barrier_test_drops
+    netlib_log_barrier_test_failure
+    netlib_log_barrier_test_submission_during_flush
+    netlib_log_barrier_test_flush_while_producing
+    PROPERTIES TIMEOUT 30)
 
   add_executable(netlib_codec_test tests/codec_test.cc)
   target_link_libraries(netlib_codec_test PRIVATE netlib::netlib)
@@ -148,6 +172,9 @@ if(BUILD_TESTING)
   netlib_warnings(netlib_rpc_codec_test)
   add_test(NAME netlib_rpc_codec_test COMMAND netlib_rpc_codec_test)
   set_tests_properties(netlib_rpc_codec_test PROPERTIES TIMEOUT 30)
-  set_tests_properties(netlib_platform_test netlib_reactor_test netlib_log_test
-    netlib_codec_test netlib_http_codec_test PROPERTIES TIMEOUT 120)
+  set_tests_properties(netlib_platform_test netlib_reactor_test
+    netlib_log_test_stdout_colorless netlib_log_test_stdout_colored
+    netlib_log_test_concurrent netlib_log_test_invalid
+    netlib_log_test_singleton netlib_codec_test netlib_http_codec_test
+    PROPERTIES TIMEOUT 120)
 endif()

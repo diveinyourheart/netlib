@@ -34,6 +34,27 @@ into the queued `LogRecord`. Disabled levels skip formatting and message
 allocation. Dynamic format strings can use `Logger::Log()` with an already
 formatted `std::string_view`.
 
+## Default Logger
+
+`Logger::Initialize` and `Logger::InitializeStdout` configure one process-wide
+Logger. Initialization succeeds at most once; attempts to replace it fail. The
+Logger state and its detached Writer thread intentionally live until process
+exit. `NETLIB_LOG_*` uses this singleton and takes no logger argument.
+
+Typical service setup:
+
+```cpp
+Logger::InitializeStdout(options);
+NETLIB_LOG_INFO("service starting");
+
+// Run the service.
+
+Logger::Flush();
+```
+
+`Flush` is a barrier for accepted records but does not close admission or destroy
+the Writer thread.
+
 ## Record fields
 
 Every standard output line contains:
@@ -87,8 +108,8 @@ lock. A Sink that stores records beyond `Write()` must copy owned data because
 ## Flush and shutdown
 
 Admission, sequence assignment and queue publication share a short mutex with
-Flush snapshots and Stop. The mutex is never held during sink I/O, formatting,
-or a completion wait. Every producer thread uses the same explicit ProducerToken
+Flush snapshots. The mutex is never held during sink I/O, formatting, or a
+completion wait. Every producer thread uses the same explicit ProducerToken
 under this mutex. The queue disables implicit producers, so the writer receives
 records in acceptance-sequence order from a single producer stream.
 
@@ -106,14 +127,15 @@ failures leave accepted_ unchanged, without creating missing sequence numbers.
 The capacity bounds accepted_ - completed_, including records already dequeued
 into a batch or currently being written. queued_count() returns this difference.
 
-Stop closes admission under the same mutex, stops the timer, drains all accepted
-logs, completes already registered Flush calls, performs a final flush and joins
-the writer. Concurrent Stop callers all wait for shutdown. No allocating stop
-message is required. Calls after Stop are rejected. Keep the Logger alive until
-all producer calls have returned; racing destruction is not supported.
+There is no Stop operation. Admission remains open for the process lifetime, and
+the detached Writer keeps consuming records. Before process exit, producers
+should stop submitting and call `Flush()` to wait for all accepted records and a
+Sink Flush. Process teardown does not join the Writer or run another implicit
+final flush.
 
-Sink exceptions stop admission and wake pending Flush callers with false.
-Stop still joins. Sink Write/Flush must not reenter this Logger's Flush/Stop.
+Sink exceptions mark the shared Logger failed, reject later logs, and wake
+pending Flush callers with false. The detached Writer exits; no join is
+performed. Sink Write/Flush must not reenter Logger::Flush.
 The built-in StdoutSink uses fflush, not fsync/FlushFileBuffers; successful
 completion is not a power-loss durability guarantee. Its existing void Flush
 interface also does not report FILE* write/fflush return codes.
@@ -121,10 +143,11 @@ interface also does not report FILE* write/fflush return codes.
 ## Periodic flushing
 
 LoggerOptions::flush_interval defaults to 1000 milliseconds. Zero disables it;
-negative intervals are rejected. Each enabled logger owns a TimerScheduler
-thread in addition to its writer. The timer only registers a nonblocking flush
-request; all sink operations still run serially on the writer. At most one
-unserviced periodic request is retained, with its first target kept fixed.
+negative intervals are rejected. The singleton Logger registers a periodic
+TimerId on the process-wide `TimerScheduler`. The timer only registers a
+nonblocking flush request; all sink operations still run serially on the
+Writer. At most one unserviced periodic request is retained, with its first
+target kept fixed.
 
 WARN and higher levels, and flush_each_record, retain their immediate writer-side
 flush behavior. A periodic interval is a scheduling target, not a maximum

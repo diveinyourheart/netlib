@@ -35,13 +35,28 @@ class ConnectionHandle {
     return Respond(sequence, BinaryResponse{.payload = std::move(payload)},
                    close_after_write);
   }
+  // Bypasses per-connection response ordering. The request sequence is still
+  // consumed and its timeout is cancelled, but the encoded response is
+  // appended immediately by the owning SubReactor.
+  bool RespondUnordered(std::uint64_t sequence, ApplicationResponse response,
+                        bool close_after_write = false) const;
+  bool RespondUnordered(std::uint64_t sequence, std::vector<char> payload,
+                        bool close_after_write = false) const {
+    return RespondUnordered(sequence,
+                            BinaryResponse{.payload = std::move(payload)},
+                            close_after_write);
+  }
 
  private:
   class State;
   friend class SubReactor;
 
-  using Responder = std::function<bool(std::uint64_t, std::uint64_t,
-                                       ApplicationResponse, bool)>;
+  enum class ResponseMode : std::uint8_t {
+    kOrdered,
+    kUnordered,
+  };
+  using Responder = std::function<bool(
+      std::uint64_t, std::uint64_t, ApplicationResponse, bool, ResponseMode)>;
 
   ConnectionHandle(std::uint64_t id,
                    std::shared_ptr<const std::atomic<bool>> alive,

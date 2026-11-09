@@ -194,6 +194,19 @@ queue and each connection's out-of-order buffer. Exceeding the per-connection
 bound closes that connection because its application-level ordering contract
 can no longer be maintained safely.
 
+Workers have two response submission modes:
+
+- `FrameMessage::Respond()` preserves per-connection request order and is the
+  required mode for HTTP/1.1 pipelines.
+- `FrameMessage::RespondUnordered()` consumes the sequence and cancels its
+  timeout, but appends encoded bytes immediately when the owner SubReactor
+  processes the control message.
+
+Neither mode lets a Worker mutate the connection output vector or epoll interest
+directly. Both enqueue a response message and wake the owner event loop. The
+unordered mode may overtake an earlier unfinished request; use it only for
+protocols with independent messages or their own correlation and ordering.
+
 SubReactor drains responses on its own thread, encodes them using the
 connection's `ProtocolCodec`, and appends them to the output buffer. It writes
 nonblocking until `EAGAIN`; only then does the Channel add `EPOLLOUT`. Once the
@@ -201,10 +214,10 @@ buffer drains, write interest is removed. `close_after_write` closes the
 connection only after all queued output is flushed.
 
 After a frame is accepted by the Worker pool, SubReactor schedules a one-shot
-deadline using its `TimerScheduler`. The default is ten minutes and is
-configurable through `SubReactorOptions::request_timeout`. The scheduler thread
-only posts a control event back through the SubReactor wakeup. It never touches
-Codec, Channel, or connection state directly.
+deadline on the process-wide `TimerScheduler`. The default is ten minutes and is
+configurable through `SubReactorOptions::request_timeout`. The shared scheduler
+thread only posts a control event back through the SubReactor wakeup. It never
+touches Codec, Channel, or connection state directly.
 
 An accepted Worker response removes and cancels its sequence's timer. A timeout
 is inserted into the same per-connection sequence reorder path as a normal
@@ -257,9 +270,9 @@ JSON, or application request.
 
 ## Logging
 
-Reactor and ThreadPool factories accept an optional non-owning `log::Logger*`.
-The orchestrator must keep the Logger alive until MainReactor, every
-SubReactor, and the ThreadPool have stopped. Logs cover lifecycle transitions,
+Reactor and ThreadPool factories use the process-wide `log::Logger`. The
+orchestrator initializes it once; it cannot be replaced, stopped, or destroyed.
+Call `Logger::Flush()` before process exit. Logs cover lifecycle transitions,
 epoll registration failures, accept/recv errors, dispatch failures, oversized
 frames, and worker-queue backpressure. Individual epoll events and successful
 reads stay out of INFO logging to protect the I/O hot path.

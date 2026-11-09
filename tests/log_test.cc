@@ -1,10 +1,13 @@
-
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdio>
+#include <cstring>
 #include <memory>
 #include <mutex>
+#include <source_location>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -62,83 +65,65 @@ std::string ReadFile(std::FILE* file) {
   return content;
 }
 
-int RunStdoutFormatTest() {
-  std::FILE* colorless_output = std::tmpfile();
-  std::FILE* colored_output = std::tmpfile();
-  if (colorless_output == nullptr || colored_output == nullptr) {
+int RunStdoutTest(bool colored) {
+  std::FILE* output = std::tmpfile();
+  if (output == nullptr) {
     ReportFailure("failed to create temporary log output");
     return 1;
   }
 
-  netlib::log::LoggerOptions colorless_options{
-      .name = "netlib.test",
+  netlib::log::LoggerOptions options{
+      .name = colored ? "netlib.color" : "netlib.test",
       .minimum_level = netlib::log::LogLevel::kTrace,
       .queue_capacity = 128,
-      .color_mode = netlib::log::ColorMode::kNever,
-      .flush_each_record = true,
+      .color_mode = colored ? netlib::log::ColorMode::kAlways
+                            : netlib::log::ColorMode::kNever,
+      .flush_each_record = false,
+      .flush_interval = std::chrono::milliseconds::zero(),
   };
-  std::unique_ptr<netlib::log::Logger> colorless_logger =
-      netlib::log::Logger::CreateStdout(std::move(colorless_options),
-                                        colorless_output);
-  if (!colorless_logger) {
-    ReportFailure("failed to create colorless logger");
+  if (!netlib::log::Logger::InitializeStdout(std::move(options), output)) {
+    std::fclose(output);
+    ReportFailure("failed to initialize stdout logger");
     return 1;
   }
 
-  NETLIB_LOG_INFO(*colorless_logger, "hello {}", "world\nnext");
-  NETLIB_LOG_INFO(*colorless_logger, "count={} name={}", 42, "worker");
-  NETLIB_LOG_ERROR(*colorless_logger, "escape:\x1b[31mred");
-  if (!colorless_logger->Flush()) {
-    ReportFailure("failed to flush colorless logger");
+  if (colored) {
+    NETLIB_LOG_WARN("colored {}\nnext", "message");
+  } else {
+    NETLIB_LOG_INFO("hello {}", "world\nnext");
+    NETLIB_LOG_INFO("count={} name={}", 42, "worker");
+    NETLIB_LOG_ERROR("escape:\x1b[31mred");
+  }
+  if (!netlib::log::Logger::Flush()) {
+    std::fclose(output);
+    ReportFailure("failed to flush stdout logger");
     return 1;
   }
-  colorless_logger->Stop();
-  std::string colorless = ReadFile(colorless_output);
-  std::fclose(colorless_output);
+  std::string content = ReadFile(output);
+  std::fclose(output);
 
-  if (colorless.find("INFO ") == std::string::npos ||
-      colorless.find("seq=") == std::string::npos ||
-      colorless.find("tid=") == std::string::npos ||
-      colorless.find("netlib.test") == std::string::npos ||
-      colorless.find("log_test.cc") == std::string::npos ||
-      colorless.find("hello world\n    | next") == std::string::npos ||
-      colorless.find("count=42 name=worker") == std::string::npos ||
-      colorless.find("\\x1B[31mred") == std::string::npos ||
-      colorless.find('\x1b') != std::string::npos) {
+  if (!colored &&
+      (content.find("INFO ") == std::string::npos ||
+       content.find("seq=") == std::string::npos ||
+       content.find("tid=") == std::string::npos ||
+       content.find("netlib.test") == std::string::npos ||
+       content.find("log_test.cc") == std::string::npos ||
+       content.find("hello world\n    | next") == std::string::npos ||
+       content.find("count=42 name=worker") == std::string::npos ||
+       content.find("\\x1B[31mred") == std::string::npos ||
+       content.find('\x1b') != std::string::npos)) {
     ReportFailure("stdout log format is incomplete or unsafe");
     return 1;
   }
-
-  netlib::log::LoggerOptions colored_options{
-      .name = "netlib.color",
-      .minimum_level = netlib::log::LogLevel::kTrace,
-      .queue_capacity = 128,
-      .color_mode = netlib::log::ColorMode::kAlways,
-      .flush_each_record = true,
-  };
-  std::unique_ptr<netlib::log::Logger> colored_logger =
-      netlib::log::Logger::CreateStdout(std::move(colored_options),
-                                        colored_output);
-  if (!colored_logger) {
-    ReportFailure("failed to create colored logger");
-    return 1;
-  }
-  NETLIB_LOG_WARN(*colored_logger, "colored {}\nnext", "message");
-  if (!colored_logger->Flush()) {
-    ReportFailure("failed to flush colored logger");
-    return 1;
-  }
-  colored_logger->Stop();
-  std::string colored = ReadFile(colored_output);
-  std::fclose(colored_output);
-  if (!colored.starts_with("\x1b[0;90m") ||
-      colored.find("\x1b[33mWARN ") == std::string::npos ||
-      colored.find("\x1b[34mseq=") == std::string::npos ||
-      colored.find("\x1b[35mtid=") == std::string::npos ||
-      colored.find("\x1b[36mnetlib.color") == std::string::npos ||
-      colored.find("\x1b[94mlog_test.cc:") == std::string::npos ||
-      colored.find("\x1b[0;90m | \x1b[0mcolored message\n"
-                   "\x1b[0;90m    | \x1b[0mnext\n") == std::string::npos) {
+  if (colored &&
+      (!content.starts_with("\x1b[0;90m") ||
+       content.find("\x1b[33mWARN ") == std::string::npos ||
+       content.find("\x1b[34mseq=") == std::string::npos ||
+       content.find("\x1b[35mtid=") == std::string::npos ||
+       content.find("\x1b[36mnetlib.color") == std::string::npos ||
+       content.find("\x1b[94mlog_test.cc:") == std::string::npos ||
+       content.find("\x1b[0;90m | \x1b[0mcolored message\n"
+                    "\x1b[0;90m    | \x1b[0mnext\n") == std::string::npos)) {
     ReportFailure("metadata colors are missing or leak into the message");
     return 1;
   }
@@ -158,11 +143,10 @@ int RunConcurrentLoggerTest() {
       .queue_capacity = kThreadCount * kMessagesPerThread,
       .color_mode = netlib::log::ColorMode::kNever,
       .flush_each_record = false,
+      .flush_interval = std::chrono::milliseconds::zero(),
   };
-  std::unique_ptr<netlib::log::Logger> logger =
-      netlib::log::Logger::Create(std::move(options), std::move(sink));
-  if (!logger) {
-    ReportFailure("failed to create concurrent logger");
+  if (!netlib::log::Logger::Initialize(std::move(options), std::move(sink))) {
+    ReportFailure("failed to initialize concurrent logger");
     return 1;
   }
 
@@ -171,18 +155,17 @@ int RunConcurrentLoggerTest() {
   producers.reserve(kThreadCount);
   for (std::size_t thread_index = 0; thread_index < kThreadCount;
        ++thread_index) {
-    producers.emplace_back(
-        [logger_pointer = logger.get(), &enqueued, thread_index] {
-          for (std::size_t message_index = 0;
-               message_index < kMessagesPerThread; ++message_index) {
-            if (logger_pointer->Logf(netlib::log::LogLevel::kInfo,
-                                     std::source_location::current(),
-                                     "concurrent thread={} message={}",
-                                     thread_index, message_index)) {
-              enqueued.fetch_add(1, std::memory_order_relaxed);
-            }
-          }
-        });
+    producers.emplace_back([&enqueued, thread_index] {
+      for (std::size_t message_index = 0; message_index < kMessagesPerThread;
+           ++message_index) {
+        if (netlib::log::Logger::Logf(netlib::log::LogLevel::kInfo,
+                                      std::source_location::current(),
+                                      "concurrent thread={} message={}",
+                                      thread_index, message_index)) {
+          enqueued.fetch_add(1, std::memory_order_relaxed);
+        }
+      }
+    });
   }
   for (std::thread& producer : producers) {
     producer.join();
@@ -192,8 +175,8 @@ int RunConcurrentLoggerTest() {
   std::vector<std::thread> flushers;
   flushers.reserve(kFlushCount);
   for (std::size_t i = 0; i < kFlushCount; ++i) {
-    flushers.emplace_back([logger_pointer = logger.get(), &successful_flushes] {
-      if (logger_pointer->Flush()) {
+    flushers.emplace_back([&successful_flushes] {
+      if (netlib::log::Logger::Flush()) {
         successful_flushes.fetch_add(1, std::memory_order_relaxed);
       }
     });
@@ -205,16 +188,16 @@ int RunConcurrentLoggerTest() {
     ReportFailure("concurrent flush calls did not complete");
     return 1;
   }
-  logger->Stop();
   if (enqueued.load(std::memory_order_relaxed) !=
           kThreadCount * kMessagesPerThread ||
       sink_pointer->record_count() != kThreadCount * kMessagesPerThread ||
-      logger->dropped_count() != 0 || logger->queued_count() != 0) {
+      netlib::log::Logger::dropped_count() != 0 ||
+      netlib::log::Logger::queued_count() != 0) {
     ReportFailure("concurrent logger lost messages");
     return 1;
   }
-  if (sink_pointer->flush_count() < kFlushCount + 1) {
-    ReportFailure("concurrent explicit and stop flushes were not delivered");
+  if (sink_pointer->flush_count() < kFlushCount) {
+    ReportFailure("concurrent explicit flushes were not delivered");
     return 1;
   }
   return 0;
@@ -223,14 +206,46 @@ int RunConcurrentLoggerTest() {
 int RunInvalidConfigurationTest() {
   netlib::log::LoggerOptions options{
       .name = "",
-      .minimum_level = netlib::log::LogLevel::kInfo,
       .queue_capacity = 1,
-      .color_mode = netlib::log::ColorMode::kNever,
-      .flush_each_record = false,
+      .flush_interval = std::chrono::milliseconds::zero(),
   };
-  if (netlib::log::Logger::Create(std::move(options),
-                                  std::make_unique<CapturingSink>())) {
-    ReportFailure("logger accepted an empty name");
+  if (netlib::log::Logger::Initialize(std::move(options),
+                                      std::make_unique<CapturingSink>()) ||
+      netlib::log::Logger::IsInitialized()) {
+    ReportFailure("logger accepted an invalid configuration");
+    return 1;
+  }
+  return 0;
+}
+
+int RunSingleInitializationTest() {
+  std::unique_ptr<CapturingSink> first = std::make_unique<CapturingSink>();
+  CapturingSink* first_pointer = first.get();
+  netlib::log::LoggerOptions options{
+      .name = "netlib.singleton",
+      .queue_capacity = 16,
+      .flush_interval = std::chrono::milliseconds::zero(),
+  };
+  if (!netlib::log::Logger::Initialize(std::move(options), std::move(first))) {
+    ReportFailure("failed to initialize singleton logger");
+    return 1;
+  }
+
+  std::unique_ptr<CapturingSink> second = std::make_unique<CapturingSink>();
+  netlib::log::LoggerOptions duplicate_options{
+      .name = "netlib.duplicate",
+      .queue_capacity = 16,
+      .flush_interval = std::chrono::milliseconds::zero(),
+  };
+  if (netlib::log::Logger::Initialize(std::move(duplicate_options),
+                                      std::move(second))) {
+    ReportFailure("logger was replaced after initialization");
+    return 1;
+  }
+
+  NETLIB_LOG_INFO("single {}", 1);
+  if (!netlib::log::Logger::Flush() || first_pointer->record_count() != 1) {
+    ReportFailure("singleton logger routing was incorrect");
     return 1;
   }
   return 0;
@@ -238,14 +253,25 @@ int RunInvalidConfigurationTest() {
 
 }  // namespace
 
-int main() {
-  int format_result = RunStdoutFormatTest();
-  if (format_result != 0) {
-    return format_result;
+int main(int argc, char** argv) {
+  if (argc != 2) {
+    return 2;
   }
-  int concurrent_result = RunConcurrentLoggerTest();
-  if (concurrent_result != 0) {
-    return concurrent_result;
+  std::string_view mode = argv[1];
+  if (mode == "stdout-colorless") {
+    return RunStdoutTest(false);
   }
-  return RunInvalidConfigurationTest();
+  if (mode == "stdout-colored") {
+    return RunStdoutTest(true);
+  }
+  if (mode == "concurrent") {
+    return RunConcurrentLoggerTest();
+  }
+  if (mode == "invalid") {
+    return RunInvalidConfigurationTest();
+  }
+  if (mode == "singleton") {
+    return RunSingleInitializationTest();
+  }
+  return 2;
 }

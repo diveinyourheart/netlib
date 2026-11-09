@@ -28,7 +28,7 @@ ProducerToken 不与某个 OS 线程永久绑定，但不能被多个线程同�
 mutex_ 同时保护编号、入队和刷新快照，所以跨线程受理顺序与入队顺序一致。
 LogQueueTraits 禁用了隐式 producer，防止后续代码绕过固定 token，重新引入子队列。
 
-定时刷新和 Stop 通过状态及条件变量通知写线程，不向日志队列插入控制消息，
+定时刷新和显式 Flush 通过状态及条件变量通知写线程，不向日志队列插入控制消息，
 因此不会为这些控制动作创建其他 producer。
 
 ## 2. 用两个边界理解未完成日志
@@ -134,14 +134,11 @@ done=true 表示达标之后执行的 Sink::Flush 已返回。请求出队后，
 | periodic_target_ | 定时器留下的固定目标便签 | 定时器登记，ServiceFlushes 达标后取走 |
 | dropped_ | 累计丢弃数量 | 容量不足或入队失败时 Drop 累加 |
 | unreported_drops_ | 留给下一条成功日志报告的丢弃数量 | Drop 累加，附在成功入队日志上后清零 |
-| stopping_ | 关闭提交入口并要求写线程收尾 | Stop 或写线程异常时置 true |
 | failed_ | 让 Flush 等待者返回失败的异常标记 | WriterLoop 的异常处理 |
-| mutex_ | 统一保护编号、token 使用、完成计数和控制状态 | 提交、写线程、定时器和 Flush/Stop 短暂持有 |
-| work_ | 写线程的门铃 | 新日志、显式/定时刷新、Stop 通知 |
+| mutex_ | 统一保护编号、token 使用、完成计数和控制状态 | 提交、写线程、定时器和 Flush 短暂持有 |
+| work_ | 写线程的门铃 | 新日志、显式/定时刷新 |
 | progress_ | Flush 调用方的完成门铃 | 显式刷新完成或写线程异常时通知 |
-| stop_mutex_ | 保证并发 Stop 调用都等待完整退出 | Stop 持有到 join 结束 |
-| timer_ | 只登记定时刷新目标 | 构造时按配置启动，Stop 时停止 |
-| writer_ | 唯一执行 Sink::Write/Flush 的线程 | WriterLoop |
+| detached Writer | 唯一执行 Sink::Write/Flush 的线程 | WriterLoop，进程结束时由 OS 回收 |
 
 旧版 completion_ 与独立 queued_ 已删除。queued_count() 直接从两个水位计算。
 WARN 以上级别或 flush_each_record 要求的即时 Flush 会在该记录登记完成前执行。
@@ -151,7 +148,7 @@ WARN 以上级别或 flush_each_record 要求的即时 Flush 会在该记录登�
 LogOwned 先在锁外准备 LogRecord，再在 mutex_ 内执行：
 
 ```text
-检查 stopping_ 和 accepted_ - completed_ 是否达到容量
+检查 failed_ 和 accepted_ - completed_ 是否达到容量
     ↓
 record.sequence = accepted_
 record.dropped_messages = unreported_drops_
@@ -167,12 +164,11 @@ queue_.enqueue(producer_, record)
 定时器只在 periodic_target_ 没有值时记录 accepted_，待处理目标保留原值，后续 tick
 合并。目标为 0 仍是有效刷新请求，与 optional 没有值不同。
 
-正常 Stop：关闭提交入口 → 停止定时器 → 依次写完已受理日志、完成已登记刷新 →
-最终 Sink::Flush → 写线程退出并 join。关闭入口后 accepted_ 不再增长，
-completed_ == accepted_ 就能判断全部写完。
+正常退出：生产者停止提交 → Flush 等待目标前日志完成并执行最终 Sink::Flush →
+进程退出。Logger 不关闭提交入口、不 join Writer，也不执行隐式最终 Flush。
 
-Sink 等操作抛出异常时，写线程设置 failed_、stopping_ 并通知 Flush 等待者返回失败，
-剩余日志不保证完成。标准输出 Sink 使用 fflush，不保证断电持久化，也未通过当前
-void 接口报告 FILE* I/O 返回码。
+Sink 等操作抛出异常时，写线程设置 failed_ 并通知 Flush 等待者返回失败，剩余日志
+不保证完成。标准输出 Sink 使用 fflush，不保证断电持久化，也未通过当前 void 接口
+报告 FILE* I/O 返回码。
 
 请求、响应和日志三条通道的 token 分布见[队列拓扑](queue_topology.md)。

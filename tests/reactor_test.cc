@@ -577,6 +577,114 @@ int RunRequestTimeoutTest() {
   return success ? 0 : 1;
 }
 
+int RunUnorderedResponseTest() {
+  Observation observation;
+  std::mutex gate_mutex;
+  std::condition_variable gate_condition;
+  bool release_ordered = false;
+  bool unordered_queued = false;
+  std::atomic<std::size_t> response_errors{0};
+
+  netlib::ThreadPool::Handler handler = [&gate_mutex, &gate_condition,
+                                         &release_ordered, &unordered_queued,
+                                         &response_errors](
+                                            netlib::FrameMessage message) {
+    if (message.sequence == 0) {
+      std::unique_lock<std::mutex> lock(gate_mutex);
+      gate_condition.wait(lock, [&release_ordered] { return release_ordered; });
+      if (!message.Respond(std::vector<char>{'o', 'r', 'd', 'e', 'r'})) {
+        response_errors.fetch_add(1, std::memory_order_relaxed);
+      }
+      return;
+    }
+
+    bool accepted = message.RespondUnordered(
+        std::vector<char>{'u', 'n', 'o', 'r', 'd', 'e', 'r', 'e', 'd'});
+    if (!accepted) {
+      response_errors.fetch_add(1, std::memory_order_relaxed);
+    }
+    {
+      std::lock_guard<std::mutex> lock(gate_mutex);
+      unordered_queued = accepted;
+      gate_condition.notify_all();
+    }
+  };
+
+  std::unique_ptr<netlib::ThreadPool> worker_pool =
+      netlib::ThreadPool::Create(2, 8, std::move(handler));
+  if (!worker_pool) {
+    ReportFailure("failed to create unordered-response ThreadPool");
+    return 1;
+  }
+  std::unique_ptr<netlib::SubReactor> sub_reactor = netlib::SubReactor::Create(
+      8, *worker_pool, MakeConnectionCallbacks(observation));
+  if (!sub_reactor) {
+    ReportFailure("failed to create unordered-response SubReactor");
+    return 1;
+  }
+  std::unique_ptr<netlib::MainReactor> main_reactor =
+      netlib::MainReactor::Create(0, {sub_reactor.get()});
+  if (!main_reactor) {
+    ReportFailure("failed to create unordered-response MainReactor");
+    return 1;
+  }
+
+  std::thread sub_thread([&sub_reactor] { sub_reactor->Run(); });
+  std::thread main_thread([&main_reactor] { main_reactor->Run(); });
+
+  bool success = true;
+  netlib::UniqueFd client;
+  std::string requests = MakeFrame("ordered-request");
+  requests.append(MakeFrame("unordered-request"));
+  if (!ConnectTo(main_reactor->port(), &client) ||
+      !SendAll(client.get(), requests)) {
+    ReportFailure("failed to send unordered-response requests");
+    success = false;
+  }
+
+  std::string first_response;
+  std::string second_response;
+  if (success && !ReadFrame(client.get(), &first_response)) {
+    ReportFailure("failed to read unordered response");
+    success = false;
+  }
+  {
+    std::lock_guard<std::mutex> lock(gate_mutex);
+    release_ordered = true;
+    gate_condition.notify_all();
+  }
+  if (success && !ReadFrame(client.get(), &second_response)) {
+    ReportFailure("failed to read ordered response after unordered response");
+    success = false;
+  }
+  if (success && (first_response != "unordered" || second_response != "order" ||
+                  response_errors.load(std::memory_order_relaxed) != 0)) {
+    std::fprintf(stderr, "first=%s second=%s errors=%zu\n",
+                 first_response.c_str(), second_response.c_str(),
+                 response_errors.load(std::memory_order_relaxed));
+    ReportFailure("unordered response path did not bypass pipeline ordering");
+    success = false;
+  }
+  {
+    std::lock_guard<std::mutex> lock(gate_mutex);
+    if (!unordered_queued) {
+      ReportFailure("unordered response was not accepted");
+      success = false;
+    }
+  }
+
+  if (client) {
+    netlib::platform::ShutdownWrite(client.get());
+  }
+  client.Reset();
+  main_reactor->Stop();
+  sub_reactor->Stop();
+  main_thread.join();
+  sub_thread.join();
+  worker_pool->Stop();
+  return success ? 0 : 1;
+}
+
 int RunReactorTest() {
   Observation first_observation;
   Observation second_observation;
@@ -588,10 +696,10 @@ int RunReactorTest() {
       .queue_capacity = 256,
       .color_mode = netlib::log::ColorMode::kNever,
       .flush_each_record = false,
+      .flush_interval = std::chrono::milliseconds::zero(),
   };
-  std::unique_ptr<netlib::log::Logger> logger = netlib::log::Logger::Create(
-      std::move(logger_options), std::move(log_sink));
-  if (!logger) {
+  if (!netlib::log::Logger::Initialize(std::move(logger_options),
+                                       std::move(log_sink))) {
     ReportFailure("failed to create Reactor logger");
     return 1;
   }
@@ -662,7 +770,7 @@ int RunReactorTest() {
         }
       };
   std::unique_ptr<netlib::ThreadPool> worker_pool =
-      netlib::ThreadPool::Create(2, 32, std::move(frame_handler), logger.get());
+      netlib::ThreadPool::Create(2, 32, std::move(frame_handler));
   if (!worker_pool) {
     ReportFailure("failed to create Reactor ThreadPool");
     return 1;
@@ -676,11 +784,11 @@ int RunReactorTest() {
       netlib::SubReactor::Create(
           first_sub_options, *worker_pool,
           MakeConnectionCallbacks(first_observation),
-          [] { return netlib::CreateLengthPrefixedCodec(); }, logger.get());
+          [] { return netlib::CreateLengthPrefixedCodec(); });
   std::unique_ptr<netlib::SubReactor> second_sub_reactor =
       netlib::SubReactor::Create(
           16, *worker_pool, MakeConnectionCallbacks(second_observation),
-          [] { return netlib::CreateLengthPrefixedCodec(); }, logger.get());
+          [] { return netlib::CreateLengthPrefixedCodec(); });
   if (!first_sub_reactor || !second_sub_reactor) {
     ReportFailure("failed to create SubReactors");
     return 1;
@@ -688,7 +796,7 @@ int RunReactorTest() {
 
   std::unique_ptr<netlib::MainReactor> main_reactor =
       netlib::MainReactor::Create(
-          0, {first_sub_reactor.get(), second_sub_reactor.get()}, logger.get());
+          0, {first_sub_reactor.get(), second_sub_reactor.get()});
   if (!main_reactor) {
     ReportFailure("failed to create MainReactor");
     return 1;
@@ -788,12 +896,11 @@ int RunReactorTest() {
   first_sub_thread.join();
   second_sub_thread.join();
   worker_pool->Stop();
-  logger->Flush();
+  netlib::log::Logger::Flush();
   if (log_sink_pointer->record_count() == 0) {
     ReportFailure("Reactor lifecycle did not emit logs");
     success = false;
   }
-  logger->Stop();
   return success ? 0 : 1;
 }
 
@@ -823,6 +930,10 @@ int main() {
   int timeout_result = RunRequestTimeoutTest();
   if (timeout_result != 0) {
     return timeout_result;
+  }
+  int unordered_result = RunUnorderedResponseTest();
+  if (unordered_result != 0) {
+    return unordered_result;
   }
   int foreign_response_result = RunForeignWorkerResponseTest();
   if (foreign_response_result != 0) {
