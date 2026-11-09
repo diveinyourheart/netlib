@@ -36,6 +36,8 @@ namespace {
 
 constexpr std::size_t kWriterBatchSize = 64;
 
+constinit std::atomic<Logger*> default_logger{nullptr};
+
 struct LogQueueTraits : moodycamel::ConcurrentQueueDefaultTraits {
   // All log submissions share one explicit producer under Logger::mutex_.
   static constexpr std::size_t INITIAL_IMPLICIT_PRODUCER_HASH_SIZE = 0;
@@ -525,5 +527,22 @@ void Logger::Stop() { impl_->Stop(); }
 std::size_t Logger::queued_count() const { return impl_->queued_count(); }
 
 std::uint64_t Logger::dropped_count() const { return impl_->dropped_count(); }
+
+DefaultLoggerScope::DefaultLoggerScope(Logger& logger) noexcept
+    : previous_(DefaultLogger()) {
+  SetDefaultLogger(&logger);
+}
+
+DefaultLoggerScope::~DefaultLoggerScope() noexcept {
+  SetDefaultLogger(previous_);
+}
+
+void SetDefaultLogger(Logger* logger) noexcept {
+  default_logger.store(logger, std::memory_order_release);
+}
+
+Logger* DefaultLogger() noexcept {
+  return default_logger.load(std::memory_order_acquire);
+}
 
 }  // namespace netlib::log

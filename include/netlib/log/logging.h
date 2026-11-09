@@ -111,27 +111,75 @@ class Logger {
   std::unique_ptr<Impl> impl_;
 };
 
+// Installs a Logger for the current scope and restores the previous default.
+// The Logger must outlive the scope. Nested or concurrent scopes are not
+// supported.
+class DefaultLoggerScope {
+ public:
+  explicit DefaultLoggerScope(Logger& logger) noexcept;
+  ~DefaultLoggerScope() noexcept;
+
+  DefaultLoggerScope(const DefaultLoggerScope&) = delete;
+  DefaultLoggerScope& operator=(const DefaultLoggerScope&) = delete;
+  DefaultLoggerScope(DefaultLoggerScope&&) = delete;
+  DefaultLoggerScope& operator=(DefaultLoggerScope&&) = delete;
+
+ private:
+  Logger* previous_;
+};
+
+// Sets the process-wide non-owning fallback Logger. The caller must clear or
+// replace it before destroying the Logger. Safe to call concurrently with
+// logging; an explicit NETLIB_LOG_*_TO target always takes precedence.
+void SetDefaultLogger(Logger* logger) noexcept;
+Logger* DefaultLogger() noexcept;
+
+inline Logger* ResolveLogger(Logger* logger) noexcept {
+  return logger != nullptr ? logger : DefaultLogger();
+}
+inline Logger* ResolveLogger(Logger& logger) noexcept { return &logger; }
+inline Logger* ResolveLogger(std::nullptr_t) noexcept {
+  return DefaultLogger();
+}
+
 }  // namespace netlib::log
 
-#define NETLIB_LOG(logger, level, format, ...)                \
-  do {                                                        \
-    if ((logger).IsEnabled(level)) {                          \
-      (logger).Logf(level, ::std::source_location::current(), \
-                    format __VA_OPT__(, __VA_ARGS__));        \
-    }                                                         \
+#define NETLIB_LOG_TO(logger, level, format, ...)                   \
+  do {                                                              \
+    auto* netlib_log_target = ::netlib::log::ResolveLogger(logger); \
+    if (netlib_log_target != nullptr &&                             \
+        (netlib_log_target)->IsEnabled(level)) {                    \
+      (netlib_log_target)                                           \
+          ->Logf(level, ::std::source_location::current(),          \
+                 format __VA_OPT__(, __VA_ARGS__));                 \
+    }                                                               \
   } while (false)
 
-#define NETLIB_LOG_TRACE(logger, ...) \
-  NETLIB_LOG(logger, ::netlib::log::LogLevel::kTrace, __VA_ARGS__)
-#define NETLIB_LOG_DEBUG(logger, ...) \
-  NETLIB_LOG(logger, ::netlib::log::LogLevel::kDebug, __VA_ARGS__)
-#define NETLIB_LOG_INFO(logger, ...) \
-  NETLIB_LOG(logger, ::netlib::log::LogLevel::kInfo, __VA_ARGS__)
-#define NETLIB_LOG_WARN(logger, ...) \
-  NETLIB_LOG(logger, ::netlib::log::LogLevel::kWarn, __VA_ARGS__)
-#define NETLIB_LOG_ERROR(logger, ...) \
-  NETLIB_LOG(logger, ::netlib::log::LogLevel::kError, __VA_ARGS__)
-#define NETLIB_LOG_FATAL(logger, ...) \
-  NETLIB_LOG(logger, ::netlib::log::LogLevel::kFatal, __VA_ARGS__)
+#define NETLIB_LOG_TRACE_TO(logger, ...) \
+  NETLIB_LOG_TO(logger, ::netlib::log::LogLevel::kTrace, __VA_ARGS__)
+#define NETLIB_LOG_DEBUG_TO(logger, ...) \
+  NETLIB_LOG_TO(logger, ::netlib::log::LogLevel::kDebug, __VA_ARGS__)
+#define NETLIB_LOG_INFO_TO(logger, ...) \
+  NETLIB_LOG_TO(logger, ::netlib::log::LogLevel::kInfo, __VA_ARGS__)
+#define NETLIB_LOG_WARN_TO(logger, ...) \
+  NETLIB_LOG_TO(logger, ::netlib::log::LogLevel::kWarn, __VA_ARGS__)
+#define NETLIB_LOG_ERROR_TO(logger, ...) \
+  NETLIB_LOG_TO(logger, ::netlib::log::LogLevel::kError, __VA_ARGS__)
+#define NETLIB_LOG_FATAL_TO(logger, ...) \
+  NETLIB_LOG_TO(logger, ::netlib::log::LogLevel::kFatal, __VA_ARGS__)
+
+#define NETLIB_LOG(level, ...) NETLIB_LOG_TO(nullptr, level, __VA_ARGS__)
+#define NETLIB_LOG_TRACE(...) \
+  NETLIB_LOG(::netlib::log::LogLevel::kTrace, __VA_ARGS__)
+#define NETLIB_LOG_DEBUG(...) \
+  NETLIB_LOG(::netlib::log::LogLevel::kDebug, __VA_ARGS__)
+#define NETLIB_LOG_INFO(...) \
+  NETLIB_LOG(::netlib::log::LogLevel::kInfo, __VA_ARGS__)
+#define NETLIB_LOG_WARN(...) \
+  NETLIB_LOG(::netlib::log::LogLevel::kWarn, __VA_ARGS__)
+#define NETLIB_LOG_ERROR(...) \
+  NETLIB_LOG(::netlib::log::LogLevel::kError, __VA_ARGS__)
+#define NETLIB_LOG_FATAL(...) \
+  NETLIB_LOG(::netlib::log::LogLevel::kFatal, __VA_ARGS__)
 
 #endif  // NETLIB_INCLUDE_NETLIB_LOG_LOGGING_H_

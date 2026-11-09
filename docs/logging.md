@@ -34,6 +34,36 @@ into the queued `LogRecord`. Disabled levels skip formatting and message
 allocation. Dynamic format strings can use `Logger::Log()` with an already
 formatted `std::string_view`.
 
+## Default Logger
+
+`SetDefaultLogger(Logger*)` stores a process-wide, non-owning fallback.
+`NETLIB_LOG_*` uses that fallback and does not take a logger argument.
+`NETLIB_LOG_*_TO(logger, ...)` is available for explicit routing. Reactor and
+ThreadPool factories no longer carry logger pointers.
+
+The default pointer is implemented as a constant-initialized atomic and does not
+add a dynamically destructed global Logger. The pointer is not ownership:
+quiesce all async producers and clear or replace the pointer before stopping and
+destroying its Logger. Setting the default while producers are already running
+is safe only when the pointed-to Logger remains alive for every concurrent log
+call.
+
+Typical service setup:
+
+```cpp
+auto logger = netlib::log::Logger::CreateStdout(options);
+{
+  netlib::log::DefaultLoggerScope default_logger(*logger);
+  NETLIB_LOG_INFO("service starting");
+
+  // Create, run, and stop MainReactor, SubReactors, and ThreadPools here.
+}
+logger->Stop();
+```
+
+`DefaultLoggerScope` restores the previous default on scope exit. The scope is
+not movable and does not support nested concurrent scopes.
+
 ## Record fields
 
 Every standard output line contains:

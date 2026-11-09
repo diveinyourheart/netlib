@@ -12,12 +12,8 @@ std::unique_ptr<Channel> Channel::Create(EventLoop& loop, SocketHandle fd,
                                          ChannelInterest interest,
                                          ChannelCallbacks callbacks) {
   if (fd == kInvalidSocket || (!interest.read && !interest.write)) {
-    if (loop.logger_ != nullptr) {
-      NETLIB_LOG_WARN(*loop.logger_,
-                      "channel creation rejected for fd={} "
-                      "without valid interest",
-                      fd);
-    }
+    NETLIB_LOG_WARN(
+        "channel creation rejected for fd={} without valid interest", fd);
     return nullptr;
   }
 
@@ -27,9 +23,7 @@ std::unique_ptr<Channel> Channel::Create(EventLoop& loop, SocketHandle fd,
     return nullptr;
   }
   channel->registered_ = true;
-  if (loop.logger_ != nullptr) {
-    NETLIB_LOG_DEBUG(*loop.logger_, "channel registered fd={}", fd);
-  }
+  NETLIB_LOG_DEBUG("channel registered fd={}", fd);
   return channel;
 }
 
@@ -48,10 +42,7 @@ Channel::~Channel() {
 
 bool Channel::SetInterest(ChannelInterest interest) {
   if (!interest.read && !interest.write) {
-    if (loop_.logger_ != nullptr) {
-      NETLIB_LOG_WARN(*loop_.logger_, "channel interest rejected for fd={}",
-                      fd_);
-    }
+    NETLIB_LOG_WARN("channel interest rejected for fd={}", fd_);
     return false;
   }
   ChannelInterest previous_interest = interest_;

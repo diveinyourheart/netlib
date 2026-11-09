@@ -257,9 +257,10 @@ JSON, or application request.
 
 ## Logging
 
-Reactor and ThreadPool factories accept an optional non-owning `log::Logger*`.
-The orchestrator must keep the Logger alive until MainReactor, every
-SubReactor, and the ThreadPool have stopped. Logs cover lifecycle transitions,
-epoll registration failures, accept/recv errors, dispatch failures, oversized
-frames, and worker-queue backpressure. Individual epoll events and successful
-reads stay out of INFO logging to protect the I/O hot path.
+Reactor and ThreadPool factories use the process-wide default `log::Logger`.
+The orchestrator installs it with `DefaultLoggerScope` or `SetDefaultLogger` and
+must keep it alive until MainReactor, every SubReactor, and the ThreadPool have
+stopped. Logs cover lifecycle transitions, epoll registration failures,
+accept/recv errors, dispatch failures, oversized frames, and worker-queue
+backpressure. Individual epoll events and successful reads stay out of INFO
+logging to protect the I/O hot path.

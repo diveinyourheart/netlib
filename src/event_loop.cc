@@ -7,17 +7,16 @@
 #include "netlib/log/logging.h"
 
 namespace netlib {
-std::unique_ptr<EventLoop> EventLoop::Create(log::Logger* logger) {
+std::unique_ptr<EventLoop> EventLoop::Create() {
   auto poller = platform::Poller::Create();
   auto wakeup = platform::Wakeup::Create();
   if (!poller || !wakeup) {
-    if (logger)
-      NETLIB_LOG_ERROR(*logger, "event loop creation failed: {}",
-                       platform::ErrorMessage());
+    NETLIB_LOG_ERROR("event loop creation failed: {}",
+                     platform::ErrorMessage());
     return nullptr;
   }
   auto loop = std::unique_ptr<EventLoop>(
-      new EventLoop(std::move(poller), std::move(wakeup), logger));
+      new EventLoop(std::move(poller), std::move(wakeup)));
   auto* pointer = loop.get();
   loop->stop_channel_ = Channel::Create(
       *loop, loop->wakeup_->handle(), ChannelInterest{.read = true},
@@ -28,28 +27,25 @@ std::unique_ptr<EventLoop> EventLoop::Create(log::Logger* logger) {
   return loop;
 }
 EventLoop::EventLoop(std::unique_ptr<platform::Poller> poller,
-                     std::unique_ptr<platform::Wakeup> wakeup,
-                     log::Logger* logger)
-    : poller_(std::move(poller)), wakeup_(std::move(wakeup)), logger_(logger) {}
+                     std::unique_ptr<platform::Wakeup> wakeup)
+    : poller_(std::move(poller)), wakeup_(std::move(wakeup)) {}
 EventLoop::~EventLoop() {
   // Unregister while the channel map and poller are still alive.
   stop_channel_.reset();
 }
 void EventLoop::Run() {
-  if (logger_) NETLIB_LOG_DEBUG(*logger_, "event loop started");
+  NETLIB_LOG_DEBUG("event loop started");
   std::array<platform::ReadyEvent, 64> events{};
   while (!stopping_.load()) {
     int count = poller_->Wait(events);
     if (count < 0) {
       if (platform::Interrupted(platform::LastError())) continue;
-      if (logger_)
-        NETLIB_LOG_ERROR(*logger_, "event wait failed: {}",
-                         platform::ErrorMessage());
+      NETLIB_LOG_ERROR("event wait failed: {}", platform::ErrorMessage());
       break;
     }
     for (int i = 0; i < count; ++i) Dispatch(events[i].token, events[i].events);
   }
-  if (logger_) NETLIB_LOG_DEBUG(*logger_, "event loop stopped");
+  NETLIB_LOG_DEBUG("event loop stopped");
 }
 void EventLoop::Stop() {
   if (!stopping_.exchange(true)) WakeForStop();
@@ -92,8 +88,8 @@ void EventLoop::DrainStopEvent() {
   if (!wakeup_->Drain()) Stop();
 }
 void EventLoop::WakeForStop() {
-  if (!wakeup_->Notify() && logger_)
-    NETLIB_LOG_ERROR(*logger_, "stop notification failed: {}",
-                     platform::ErrorMessage());
+  if (!wakeup_->Notify()) {
+    NETLIB_LOG_ERROR("stop notification failed: {}", platform::ErrorMessage());
+  }
 }
 }  // namespace netlib

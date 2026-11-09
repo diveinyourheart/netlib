@@ -154,11 +154,11 @@ if (request != nullptr && request->target == "/rpc") {
 发送通过平台接口循环执行，直到缓冲区为空或 would-block。仅在输出积压时关注
 可写事件，写空后恢复为只读。Linux 保留 epoll ET，Windows 使用 WSAPoll LT。
 
-Reactor 和 ThreadPool 的工厂函数支持可选的 `Logger*` 参数。建议由服务编排层
-创建 Logger，并作为最后一个非拥有参数传给三者。当前会记录 EventLoop 启动和
-停止、监听地址、连接派发、Channel 注册失败、accept/recv 错误、超大帧、
-Worker 队列背压及 Reactor 关闭等事件；逐 epoll 事件和每次成功 `recv` 不记录
-INFO 日志，避免热路径产生日志风暴。
+服务编排层把唯一 Logger 注册为进程默认 Logger，Reactor 和 ThreadPool 内部通过
+无参数日志宏自动使用该实例。当前会记录 EventLoop 启动和停止、监听地址、连接
+派发、Channel 注册失败、accept/recv 错误、超大帧、Worker 队列背压及 Reactor
+关闭等事件；逐 epoll 事件和每次成功 `recv` 不记录 INFO 日志，避免热路径产生
+日志风暴。
 
 EventLoop 的 Wakeup 也作为普通 Channel 注册。跨线程 Stop() 设置停止状态并唤醒
 事件等待；Linux 使用 eventfd，Windows 使用本地 TCP 连接对。当前 ready batch
@@ -182,7 +182,12 @@ netlib::log::LoggerOptions options{
 };
 
 auto logger = netlib::log::Logger::CreateStdout(std::move(options));
-NETLIB_LOG_INFO(*logger, "server started on port={} workers={}", 8080, 4);
+{
+  netlib::log::DefaultLoggerScope default_logger(*logger);
+  NETLIB_LOG_INFO("server started on port={} workers={}", 8080, 4);
+  // 在这里创建、运行并停止 Reactor 和 ThreadPool。
+}
+logger->Stop();
 ```
 
 标准输出示例（实际输出为单行）：
@@ -206,9 +211,13 @@ Stop() 关闭提交入口、排空已接受日志并完成刷新，然后等待�
 日志宏使用固定版本 fmtlib 11.2.0，格式串在编译期检查，例如：
 
 ```cpp
-NETLIB_LOG_WARN(*logger, "fd={} errno={} reason={}",
+NETLIB_LOG_WARN("fd={} errno={} reason={}",
                 client_fd, error_number, reason);
 ```
+
+`NETLIB_LOG_*` 不再接收 Logger 参数，直接使用进程默认 Logger；需要显式路由时
+使用 `NETLIB_LOG_*_TO(logger, ...)`。`SetDefaultLogger` 只保存非拥有指针，必须
+在所有异步日志生产者停止后清除，再停止和销毁 Logger。
 
 日志级别检查发生在参数格式化之前，因此关闭某个级别时只承担一次原子读取和
 分支判断，不执行格式化和消息分配。启用日志时，fmt 在调用线程完成一次格式化，

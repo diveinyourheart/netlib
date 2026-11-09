@@ -595,6 +595,7 @@ int RunReactorTest() {
     ReportFailure("failed to create Reactor logger");
     return 1;
   }
+  netlib::log::DefaultLoggerScope default_logger_scope(*logger);
   std::atomic<std::size_t> response_errors{0};
   std::mutex response_gate_mutex;
   std::condition_variable response_gate_condition;
@@ -662,7 +663,7 @@ int RunReactorTest() {
         }
       };
   std::unique_ptr<netlib::ThreadPool> worker_pool =
-      netlib::ThreadPool::Create(2, 32, std::move(frame_handler), logger.get());
+      netlib::ThreadPool::Create(2, 32, std::move(frame_handler));
   if (!worker_pool) {
     ReportFailure("failed to create Reactor ThreadPool");
     return 1;
@@ -676,11 +677,11 @@ int RunReactorTest() {
       netlib::SubReactor::Create(
           first_sub_options, *worker_pool,
           MakeConnectionCallbacks(first_observation),
-          [] { return netlib::CreateLengthPrefixedCodec(); }, logger.get());
+          [] { return netlib::CreateLengthPrefixedCodec(); });
   std::unique_ptr<netlib::SubReactor> second_sub_reactor =
       netlib::SubReactor::Create(
           16, *worker_pool, MakeConnectionCallbacks(second_observation),
-          [] { return netlib::CreateLengthPrefixedCodec(); }, logger.get());
+          [] { return netlib::CreateLengthPrefixedCodec(); });
   if (!first_sub_reactor || !second_sub_reactor) {
     ReportFailure("failed to create SubReactors");
     return 1;
@@ -688,7 +689,7 @@ int RunReactorTest() {
 
   std::unique_ptr<netlib::MainReactor> main_reactor =
       netlib::MainReactor::Create(
-          0, {first_sub_reactor.get(), second_sub_reactor.get()}, logger.get());
+          0, {first_sub_reactor.get(), second_sub_reactor.get()});
   if (!main_reactor) {
     ReportFailure("failed to create MainReactor");
     return 1;

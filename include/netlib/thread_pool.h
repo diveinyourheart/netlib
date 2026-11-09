@@ -7,7 +7,6 @@
 #include <optional>
 
 #include "netlib/frame_message.h"
-#include "netlib/log/logger_fwd.h"
 
 namespace netlib {
 
@@ -42,11 +41,9 @@ class ThreadPool {
     std::unique_ptr<State> state_;
   };
 
-  // logger is optional and must outlive the ThreadPool when non-null.
   static std::unique_ptr<ThreadPool> Create(std::size_t worker_count,
                                             std::size_t max_pending_messages,
-                                            Handler handler,
-                                            log::Logger* logger = nullptr);
+                                            Handler handler);
 
   ThreadPool(const ThreadPool&) = delete;
   ThreadPool& operator=(const ThreadPool&) = delete;

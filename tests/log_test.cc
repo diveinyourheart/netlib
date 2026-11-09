@@ -85,9 +85,9 @@ int RunStdoutFormatTest() {
     return 1;
   }
 
-  NETLIB_LOG_INFO(*colorless_logger, "hello {}", "world\nnext");
-  NETLIB_LOG_INFO(*colorless_logger, "count={} name={}", 42, "worker");
-  NETLIB_LOG_ERROR(*colorless_logger, "escape:\x1b[31mred");
+  NETLIB_LOG_INFO_TO(*colorless_logger, "hello {}", "world\nnext");
+  NETLIB_LOG_INFO_TO(*colorless_logger, "count={} name={}", 42, "worker");
+  NETLIB_LOG_ERROR_TO(*colorless_logger, "escape:\x1b[31mred");
   if (!colorless_logger->Flush()) {
     ReportFailure("failed to flush colorless logger");
     return 1;
@@ -123,7 +123,7 @@ int RunStdoutFormatTest() {
     ReportFailure("failed to create colored logger");
     return 1;
   }
-  NETLIB_LOG_WARN(*colored_logger, "colored {}\nnext", "message");
+  NETLIB_LOG_WARN_TO(*colored_logger, "colored {}\nnext", "message");
   if (!colored_logger->Flush()) {
     ReportFailure("failed to flush colored logger");
     return 1;
@@ -236,6 +236,64 @@ int RunInvalidConfigurationTest() {
   return 0;
 }
 
+int RunDefaultLoggerTest() {
+  std::unique_ptr<CapturingSink> default_sink =
+      std::make_unique<CapturingSink>();
+  CapturingSink* default_sink_pointer = default_sink.get();
+  netlib::log::LoggerOptions default_options{
+      .name = "netlib.default",
+      .minimum_level = netlib::log::LogLevel::kTrace,
+      .queue_capacity = 16,
+      .color_mode = netlib::log::ColorMode::kNever,
+  };
+  std::unique_ptr<netlib::log::Logger> default_logger =
+      netlib::log::Logger::Create(std::move(default_options),
+                                  std::move(default_sink));
+  if (!default_logger) {
+    ReportFailure("failed to create default logger");
+    return 1;
+  }
+
+  std::unique_ptr<CapturingSink> explicit_sink =
+      std::make_unique<CapturingSink>();
+  CapturingSink* explicit_sink_pointer = explicit_sink.get();
+  netlib::log::LoggerOptions explicit_options{
+      .name = "netlib.explicit",
+      .minimum_level = netlib::log::LogLevel::kTrace,
+      .queue_capacity = 16,
+      .color_mode = netlib::log::ColorMode::kNever,
+  };
+  std::unique_ptr<netlib::log::Logger> explicit_logger =
+      netlib::log::Logger::Create(std::move(explicit_options),
+                                  std::move(explicit_sink));
+  if (!explicit_logger) {
+    ReportFailure("failed to create explicit logger");
+    return 1;
+  }
+
+  {
+    netlib::log::DefaultLoggerScope default_scope(*default_logger);
+    if (netlib::log::DefaultLogger() != default_logger.get()) {
+      ReportFailure("default logger pointer was not installed");
+      return 1;
+    }
+    NETLIB_LOG_INFO("default {}", 1);
+    NETLIB_LOG_WARN_TO(nullptr, "null fallback {}", 2);
+    NETLIB_LOG_INFO_TO(explicit_logger.get(), "explicit {}", 3);
+    NETLIB_LOG_DEBUG_TO(*explicit_logger, "explicit reference {}", 4);
+  }
+  NETLIB_LOG_INFO("ignored without a default logger");
+
+  default_logger->Stop();
+  explicit_logger->Stop();
+  if (default_sink_pointer->record_count() != 2 ||
+      explicit_sink_pointer->record_count() != 2) {
+    ReportFailure("default or explicit logger routing was incorrect");
+    return 1;
+  }
+  return 0;
+}
+
 }  // namespace
 
 int main() {
@@ -246,6 +304,10 @@ int main() {
   int concurrent_result = RunConcurrentLoggerTest();
   if (concurrent_result != 0) {
     return concurrent_result;
+  }
+  int default_result = RunDefaultLoggerTest();
+  if (default_result != 0) {
+    return default_result;
   }
   return RunInvalidConfigurationTest();
 }

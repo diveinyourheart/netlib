@@ -16,13 +16,15 @@ int main() {
   if (!logger) {
     return 1;
   }
-
-  NETLIB_LOG_TRACE(*logger, "trace message");
-  NETLIB_LOG_DEBUG(*logger, "debug message");
-  NETLIB_LOG_INFO(*logger, "server started on port={} workers={}", 8080, 4);
-  NETLIB_LOG_WARN(*logger, "worker queue is above 80%");
-  NETLIB_LOG_ERROR(*logger, "request failed\nretry scheduled");
-  logger->Flush();
+  {
+    netlib::log::DefaultLoggerScope default_logger(*logger);
+    NETLIB_LOG_TRACE("trace message");
+    NETLIB_LOG_DEBUG("debug message");
+    NETLIB_LOG_INFO("server started on port={} workers={}", 8080, 4);
+    NETLIB_LOG_WARN("worker queue is above 80%");
+    NETLIB_LOG_ERROR("request failed\nretry scheduled");
+    logger->Flush();
+  }
   logger->Stop();
   return 0;
 }

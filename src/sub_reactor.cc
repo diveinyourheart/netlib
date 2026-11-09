@@ -491,78 +491,65 @@ void SubReactor::Connection::CompactOutput() {
 
 std::unique_ptr<SubReactor> SubReactor::Create(
     std::size_t max_pending_connections, ThreadPool& worker_pool,
-    ConnectionCallbacks callbacks, log::Logger* logger) {
+    ConnectionCallbacks callbacks) {
   SubReactorOptions options;
   options.max_pending_connections = max_pending_connections;
   options.max_pending_responses = max_pending_connections;
-  return Create(options, worker_pool, std::move(callbacks), logger);
+  return Create(options, worker_pool, std::move(callbacks));
 }
 
 std::unique_ptr<SubReactor> SubReactor::Create(
     std::size_t max_pending_connections, ThreadPool& worker_pool,
-    ConnectionCallbacks callbacks, ProtocolCodecFactory codec_factory,
-    log::Logger* logger) {
+    ConnectionCallbacks callbacks, ProtocolCodecFactory codec_factory) {
   SubReactorOptions options;
   options.max_pending_connections = max_pending_connections;
   options.max_pending_responses = max_pending_connections;
   return Create(options, worker_pool, std::move(callbacks),
-                std::move(codec_factory), logger);
+                std::move(codec_factory));
 }
 
 std::unique_ptr<SubReactor> SubReactor::Create(SubReactorOptions options,
                                                ThreadPool& worker_pool,
-                                               ConnectionCallbacks callbacks,
-                                               log::Logger* logger) {
-  return Create(
-      options, worker_pool, std::move(callbacks),
-      [] { return CreateLengthPrefixedCodec(); }, logger);
+                                               ConnectionCallbacks callbacks) {
+  return Create(options, worker_pool, std::move(callbacks),
+                [] { return CreateLengthPrefixedCodec(); });
 }
 
 std::unique_ptr<SubReactor> SubReactor::Create(
     SubReactorOptions options, ThreadPool& worker_pool,
-    ConnectionCallbacks callbacks, ProtocolCodecFactory codec_factory,
-    log::Logger* logger) {
+    ConnectionCallbacks callbacks, ProtocolCodecFactory codec_factory) {
   if (options.max_pending_connections == 0 ||
       options.max_pending_responses == 0 ||
       options.max_pending_output_bytes == 0 ||
       options.request_timeout <= std::chrono::milliseconds::zero()) {
-    if (logger != nullptr) {
-      NETLIB_LOG_ERROR(*logger, "SubReactor option is outside its valid range");
-    }
+    NETLIB_LOG_ERROR("SubReactor option is outside its valid range");
     return nullptr;
   }
   if (!codec_factory) {
-    if (logger != nullptr) {
-      NETLIB_LOG_ERROR(*logger, "SubReactor requires a ProtocolCodec factory");
-    }
+    NETLIB_LOG_ERROR("SubReactor requires a ProtocolCodec factory");
     return nullptr;
   }
   std::unique_ptr<ProtocolCodec> codec_probe = codec_factory();
   if (!codec_probe || codec_probe->MaxDecodeBufferSize() == 0) {
-    if (logger != nullptr) {
-      NETLIB_LOG_ERROR(
-          *logger, "SubReactor ProtocolCodec factory returned invalid codec");
-    }
+    NETLIB_LOG_ERROR("SubReactor ProtocolCodec factory returned invalid codec");
     return nullptr;
   }
 
-  std::unique_ptr<EventLoop> event_loop = EventLoop::Create(logger);
+  std::unique_ptr<EventLoop> event_loop = EventLoop::Create();
   if (!event_loop) {
     return nullptr;
   }
 
   std::shared_ptr<platform::Wakeup> wake_fd = platform::Wakeup::Create();
   if (!wake_fd) {
-    if (logger != nullptr) {
-      NETLIB_LOG_ERROR(*logger, "SubReactor notification failed: {}",
-                       platform::ErrorMessage());
-    }
+    NETLIB_LOG_ERROR("SubReactor notification failed: {}",
+                     platform::ErrorMessage());
     return nullptr;
   }
 
   auto reactor = std::unique_ptr<SubReactor>(new SubReactor(
       std::move(event_loop), std::move(wake_fd), options, worker_pool,
-      std::move(codec_factory), std::move(callbacks), logger));
+      std::move(codec_factory), std::move(callbacks)));
   if (!reactor->request_submitter_.valid() ||
       !reactor->response_queue_->valid()) {
     return nullptr;
@@ -579,14 +566,11 @@ std::unique_ptr<SubReactor> SubReactor::Create(
   if (!reactor->wake_channel_) {
     return nullptr;
   }
-  if (logger != nullptr) {
-    NETLIB_LOG_INFO(
-        *logger,
-        "SubReactor created with connection capacity={}, "
-        "response capacity={}, output bytes={}, timeout_ms={}",
-        options.max_pending_connections, options.max_pending_responses,
-        options.max_pending_output_bytes, options.request_timeout.count());
-  }
+  NETLIB_LOG_INFO(
+      "SubReactor created with connection capacity={}, "
+      "response capacity={}, output bytes={}, timeout_ms={}",
+      options.max_pending_connections, options.max_pending_responses,
+      options.max_pending_output_bytes, options.request_timeout.count());
   return reactor;
 }
 
@@ -594,7 +578,7 @@ SubReactor::SubReactor(std::unique_ptr<EventLoop> event_loop,
                        std::shared_ptr<platform::Wakeup> wake_fd,
                        SubReactorOptions options, ThreadPool& worker_pool,
                        ProtocolCodecFactory codec_factory,
-                       ConnectionCallbacks callbacks, log::Logger* logger)
+                       ConnectionCallbacks callbacks)
     : event_loop_(std::move(event_loop)),
       request_submitter_(worker_pool.CreateSubmitter()),
       codec_factory_(std::move(codec_factory)),
@@ -602,8 +586,7 @@ SubReactor::SubReactor(std::unique_ptr<EventLoop> event_loop,
       wake_fd_(std::move(wake_fd)),
       response_queue_(std::make_shared<ResponseQueue>(
           options.max_pending_responses, wake_fd_, worker_pool)),
-      options_(options),
-      logger_(logger) {}
+      options_(options) {}
 
 SubReactor::~SubReactor() {
   request_timer_.Stop();
@@ -632,9 +615,7 @@ bool SubReactor::AdoptConnection(UniqueFd& connection) {
 void SubReactor::Run() { event_loop_->Run(); }
 
 void SubReactor::Stop() {
-  if (logger_ != nullptr) {
-    NETLIB_LOG_INFO(*logger_, "SubReactor stopping");
-  }
+  NETLIB_LOG_INFO("SubReactor stopping");
   {
     std::lock_guard<std::mutex> lock(pending_mutex_);
     stopping_.store(true);
@@ -646,9 +627,7 @@ void SubReactor::Stop() {
 
 void SubReactor::HandleWake() {
   if (!DrainWake()) {
-    if (logger_ != nullptr) {
-      NETLIB_LOG_ERROR(*logger_, "SubReactor wake notification drain failed");
-    }
+    NETLIB_LOG_ERROR("SubReactor wake notification drain failed");
     Stop();
     return;
   }
@@ -697,21 +676,15 @@ void SubReactor::HandleApplicationResponse(std::uint64_t connection_id,
     return;
   }
   if (status == Connection::ResponseStatus::kOverflow) {
-    if (logger_ != nullptr) {
-      NETLIB_LOG_WARN(
-          *logger_,
-          "response buffer limit reached for connection id={} sequence={}",
-          connection_id, sequence);
-    }
+    NETLIB_LOG_WARN(
+        "response buffer limit reached for connection id={} sequence={}",
+        connection_id, sequence);
     CloseConnection(connection_id);
     return;
   }
-  if (logger_ != nullptr) {
-    NETLIB_LOG_DEBUG(
-        *logger_,
-        "ignored response for closed or stale connection id={} sequence={}",
-        connection_id, sequence);
-  }
+  NETLIB_LOG_DEBUG(
+      "ignored response for closed or stale connection id={} sequence={}",
+      connection_id, sequence);
 }
 
 void SubReactor::HandleRequestTimeout(std::uint64_t connection_id,
@@ -731,12 +704,10 @@ void SubReactor::HandleRequestTimeout(std::uint64_t connection_id,
   std::optional<ApplicationResponse> timeout_response =
       state.codec().CreateTimeoutResponse();
   if (!timeout_response.has_value()) {
-    if (logger_ != nullptr) {
-      NETLIB_LOG_WARN(*logger_,
-                      "request timed out without a protocol error response for "
-                      "connection id={} sequence={}",
-                      connection_id, sequence);
-    }
+    NETLIB_LOG_WARN(
+        "request timed out without a protocol error response for "
+        "connection id={} sequence={}",
+        connection_id, sequence);
     CloseConnection(connection_id);
     return;
   }
@@ -744,31 +715,23 @@ void SubReactor::HandleRequestTimeout(std::uint64_t connection_id,
   Connection::ResponseStatus status =
       state.QueueResponse(sequence, std::move(*timeout_response), true);
   if (status == Connection::ResponseStatus::kQueued) {
-    if (logger_ != nullptr) {
-      NETLIB_LOG_WARN(*logger_,
-                      "request timeout response queued for connection id={} "
-                      "sequence={}",
-                      connection_id, sequence);
-    }
+    NETLIB_LOG_WARN(
+        "request timeout response queued for connection id={} "
+        "sequence={}",
+        connection_id, sequence);
     FlushConnection(connection_id);
     return;
   }
   if (status == Connection::ResponseStatus::kOverflow) {
-    if (logger_ != nullptr) {
-      NETLIB_LOG_WARN(
-          *logger_,
-          "failed to encode request timeout for connection id={} sequence={}",
-          connection_id, sequence);
-    }
+    NETLIB_LOG_WARN(
+        "failed to encode request timeout for connection id={} sequence={}",
+        connection_id, sequence);
     CloseConnection(connection_id);
     return;
   }
-  if (logger_ != nullptr) {
-    NETLIB_LOG_DEBUG(
-        *logger_,
-        "request timeout became stale for connection id={} sequence={}",
-        connection_id, sequence);
-  }
+  NETLIB_LOG_DEBUG(
+      "request timeout became stale for connection id={} sequence={}",
+      connection_id, sequence);
 }
 
 bool SubReactor::DrainWake() { return wake_fd_->Drain(); }
@@ -777,35 +740,26 @@ bool SubReactor::Wake() {
   if (wake_fd_ != nullptr && wake_fd_->Notify()) {
     return true;
   }
-  if (logger_ != nullptr) {
-    NETLIB_LOG_ERROR(*logger_, "SubReactor notification write failed");
-  }
+  NETLIB_LOG_ERROR("SubReactor notification write failed");
   return false;
 }
 
 void SubReactor::RegisterConnection(UniqueFd connection) {
   SocketHandle fd = connection.get();
   if (!platform::SetNonBlocking(fd)) {
-    if (logger_ != nullptr) {
-      NETLIB_LOG_ERROR(*logger_, "failed to set nonblocking mode for fd={}: {}",
-                       fd, platform::ErrorMessage());
-    }
+    NETLIB_LOG_ERROR("failed to set nonblocking mode for fd={}: {}", fd,
+                     platform::ErrorMessage());
     return;
   }
   if (!platform::SetCloseOnExec(fd)) {
-    if (logger_ != nullptr) {
-      NETLIB_LOG_ERROR(*logger_,
-                       "failed to set non-inheritable mode for fd={}: {}", fd,
-                       platform::ErrorMessage());
-    }
+    NETLIB_LOG_ERROR("failed to set non-inheritable mode for fd={}: {}", fd,
+                     platform::ErrorMessage());
     return;
   }
 
   std::unique_ptr<ProtocolCodec> codec = codec_factory_();
   if (!codec || codec->MaxDecodeBufferSize() == 0) {
-    if (logger_ != nullptr) {
-      NETLIB_LOG_ERROR(*logger_, "ProtocolCodec factory failed for fd={}", fd);
-    }
+    NETLIB_LOG_ERROR("ProtocolCodec factory failed for fd={}", fd);
     return;
   }
 
@@ -849,16 +803,10 @@ void SubReactor::RegisterConnection(UniqueFd connection) {
       options_.max_pending_responses);
   auto inserted = connections_.emplace(connection_id, std::move(state));
   if (!inserted.second) {
-    if (logger_ != nullptr) {
-      NETLIB_LOG_ERROR(*logger_, "duplicate connection state for id={}",
-                       connection_id);
-    }
+    NETLIB_LOG_ERROR("duplicate connection state for id={}", connection_id);
     return;
   }
-  if (logger_ != nullptr) {
-    NETLIB_LOG_DEBUG(*logger_, "registered connection fd={} id={}", fd,
-                     connection_id);
-  }
+  NETLIB_LOG_DEBUG("registered connection fd={} id={}", fd, connection_id);
   if (callbacks_.on_connected) {
     callbacks_.on_connected(fd);
   }
@@ -878,11 +826,8 @@ void SubReactor::HandleReadable(std::uint64_t connection_id) {
   while (true) {
     std::span<char> writable = state.WritableBytes();
     if (writable.empty()) {
-      if (logger_ != nullptr) {
-        NETLIB_LOG_WARN(*logger_,
-                        "receive buffer limit reached for connection id={}",
-                        connection_id);
-      }
+      NETLIB_LOG_WARN("receive buffer limit reached for connection id={}",
+                      connection_id);
       CloseConnection(connection_id);
       return;
     }
@@ -897,9 +842,7 @@ void SubReactor::HandleReadable(std::uint64_t connection_id) {
       continue;
     }
     if (result == 0) {
-      if (logger_ != nullptr) {
-        NETLIB_LOG_DEBUG(*logger_, "peer closed fd={}", fd);
-      }
+      NETLIB_LOG_DEBUG("peer closed fd={}", fd);
       CloseConnection(connection_id);
       return;
     }
@@ -909,10 +852,7 @@ void SubReactor::HandleReadable(std::uint64_t connection_id) {
     if (platform::WouldBlock(platform::LastError())) {
       return;
     }
-    if (logger_ != nullptr) {
-      NETLIB_LOG_WARN(*logger_, "recv failed for fd={}: {}", fd,
-                      platform::ErrorMessage());
-    }
+    NETLIB_LOG_WARN("recv failed for fd={}: {}", fd, platform::ErrorMessage());
     CloseConnection(connection_id);
     return;
   }
@@ -927,11 +867,8 @@ bool SubReactor::ProcessFrames(Connection& connection) {
               connection.codec().MaxDecodeBufferSize() ||
           (decode_result.required_bytes != 0 &&
            decode_result.required_bytes <= readable.size())) {
-        if (logger_ != nullptr) {
-          NETLIB_LOG_WARN(*logger_,
-                          "invalid decode target for connection id={}",
-                          connection.connection_id());
-        }
+        NETLIB_LOG_WARN("invalid decode target for connection id={}",
+                        connection.connection_id());
         return false;
       }
       connection.SetDecodeTarget(decode_result.required_bytes);
@@ -943,20 +880,15 @@ bool SubReactor::ProcessFrames(Connection& connection) {
         decode_result.payload_offset > decode_result.consumed_bytes ||
         decode_result.payload_size >
             decode_result.consumed_bytes - decode_result.payload_offset) {
-      if (logger_ != nullptr) {
-        NETLIB_LOG_WARN(*logger_, "protocol decode error for connection id={}",
-                        connection.connection_id());
-      }
+      NETLIB_LOG_WARN("protocol decode error for connection id={}",
+                      connection.connection_id());
       return false;
     }
 
     connection.ClearDecodeTarget();
     if (!connection.HasRequestTimerCapacity()) {
-      if (logger_ != nullptr) {
-        NETLIB_LOG_WARN(*logger_,
-                        "in-flight request limit reached for connection id={}",
-                        connection.connection_id());
-      }
+      NETLIB_LOG_WARN("in-flight request limit reached for connection id={}",
+                      connection.connection_id());
       return false;
     }
     std::uint64_t connection_id = connection.connection_id();
@@ -971,11 +903,8 @@ bool SubReactor::ProcessFrames(Connection& connection) {
         .payload = std::vector<char>(payload.begin(), payload.end()),
     };
     if (!request_submitter_.Submit(std::move(message))) {
-      if (logger_ != nullptr) {
-        NETLIB_LOG_WARN(*logger_,
-                        "worker queue full for connection id={} sequence={}",
-                        connection_id, sequence);
-      }
+      NETLIB_LOG_WARN("worker queue full for connection id={} sequence={}",
+                      connection_id, sequence);
       return false;
     }
 
@@ -990,22 +919,18 @@ bool SubReactor::ProcessFrames(Connection& connection) {
           }
         });
     if (timer_id == TimerScheduler::kInvalidTimer) {
-      if (logger_ != nullptr) {
-        NETLIB_LOG_ERROR(*logger_,
-                         "failed to schedule request timeout for connection "
-                         "id={} sequence={}",
-                         connection_id, sequence);
-      }
+      NETLIB_LOG_ERROR(
+          "failed to schedule request timeout for connection "
+          "id={} sequence={}",
+          connection_id, sequence);
       return false;
     }
     if (!connection.TrackRequestTimer(sequence, timer_id)) {
       request_timer_.Cancel(timer_id);
-      if (logger_ != nullptr) {
-        NETLIB_LOG_ERROR(*logger_,
-                         "duplicate request timer for connection id={} "
-                         "sequence={}",
-                         connection_id, sequence);
-      }
+      NETLIB_LOG_ERROR(
+          "duplicate request timer for connection id={} "
+          "sequence={}",
+          connection_id, sequence);
       return false;
     }
     connection.Consume(decode_result.consumed_bytes);
@@ -1048,10 +973,8 @@ void SubReactor::FlushConnection(std::uint64_t connection_id) {
       }
       return;
     }
-    if (logger_ != nullptr) {
-      NETLIB_LOG_WARN(*logger_, "send failed for connection id={}: {}",
-                      connection_id, platform::ErrorMessage());
-    }
+    NETLIB_LOG_WARN("send failed for connection id={}: {}", connection_id,
+                    platform::ErrorMessage());
     CloseConnection(connection_id);
     return;
   }
@@ -1081,10 +1004,7 @@ void SubReactor::CloseConnection(std::uint64_t connection_id) {
     request_timer_.Cancel(timer_id);
   }
   connection->second->MarkClosed();
-  if (logger_ != nullptr) {
-    NETLIB_LOG_DEBUG(*logger_, "closing connection fd={} id={}", fd,
-                     connection_id);
-  }
+  NETLIB_LOG_DEBUG("closing connection fd={} id={}", fd, connection_id);
   if (callbacks_.on_closed) {
     callbacks_.on_closed(fd);
   }

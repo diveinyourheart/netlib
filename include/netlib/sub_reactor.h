@@ -14,7 +14,6 @@
 
 #include "netlib/channel.h"
 #include "netlib/event_loop.h"
-#include "netlib/log/logger_fwd.h"
 #include "netlib/protocol_codec.h"
 #include "netlib/thread_pool.h"
 #include "netlib/timer.h"
@@ -44,25 +43,21 @@ class SubReactor {
   };
 
   // Compatibility overload with the same capacity for connections and
-  // responses. The ThreadPool and optional logger must outlive SubReactor.
+  // responses. The ThreadPool must outlive SubReactor.
+  static std::unique_ptr<SubReactor> Create(std::size_t max_pending_connections,
+                                            ThreadPool& worker_pool,
+                                            ConnectionCallbacks callbacks);
   static std::unique_ptr<SubReactor> Create(std::size_t max_pending_connections,
                                             ThreadPool& worker_pool,
                                             ConnectionCallbacks callbacks,
-                                            log::Logger* logger = nullptr);
-  static std::unique_ptr<SubReactor> Create(std::size_t max_pending_connections,
+                                            ProtocolCodecFactory codec_factory);
+  static std::unique_ptr<SubReactor> Create(SubReactorOptions options,
                                             ThreadPool& worker_pool,
-                                            ConnectionCallbacks callbacks,
-                                            ProtocolCodecFactory codec_factory,
-                                            log::Logger* logger = nullptr);
+                                            ConnectionCallbacks callbacks);
   static std::unique_ptr<SubReactor> Create(SubReactorOptions options,
                                             ThreadPool& worker_pool,
                                             ConnectionCallbacks callbacks,
-                                            log::Logger* logger = nullptr);
-  static std::unique_ptr<SubReactor> Create(SubReactorOptions options,
-                                            ThreadPool& worker_pool,
-                                            ConnectionCallbacks callbacks,
-                                            ProtocolCodecFactory codec_factory,
-                                            log::Logger* logger = nullptr);
+                                            ProtocolCodecFactory codec_factory);
 
   SubReactor(const SubReactor&) = delete;
   SubReactor& operator=(const SubReactor&) = delete;
@@ -84,8 +79,7 @@ class SubReactor {
   SubReactor(std::unique_ptr<EventLoop> event_loop,
              std::shared_ptr<platform::Wakeup> wake_fd,
              SubReactorOptions options, ThreadPool& worker_pool,
-             ProtocolCodecFactory codec_factory, ConnectionCallbacks callbacks,
-             log::Logger* logger);
+             ProtocolCodecFactory codec_factory, ConnectionCallbacks callbacks);
 
   void HandleWake();
   bool DrainWake();
@@ -116,7 +110,6 @@ class SubReactor {
   std::mutex pending_mutex_;
   std::deque<UniqueFd> pending_connections_;
   std::atomic<bool> stopping_{false};
-  log::Logger* logger_;
 };
 
 }  // namespace netlib
