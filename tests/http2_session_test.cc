@@ -62,10 +62,10 @@ class Client {
     int result = nghttp2_session_client_new2(&session, callbacks, this, option);
     nghttp2_option_del(option);
     nghttp2_session_callbacks_del(callbacks);
-    nghttp2_settings_entry settings{NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE,
-                                    window};
+    nghttp2_settings_entry settings_entry{NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE,
+                                          window};
     return result == 0 && nghttp2_submit_settings(session, NGHTTP2_FLAG_NONE,
-                                                  &settings, 1) == 0;
+                                                  &settings_entry, 1) == 0;
   }
   std::int32_t Request(std::string path, std::string body = {},
                        bool defer = false, std::string large_header = {},
@@ -111,9 +111,15 @@ class Client {
     return false;
   }
   bool Receive(std::span<const char> bytes) {
-    return nghttp2_session_mem_recv2(
-               session, reinterpret_cast<const std::uint8_t*>(bytes.data()),
-               bytes.size()) == static_cast<nghttp2_ssize>(bytes.size());
+    nghttp2_ssize consumed = nghttp2_session_mem_recv2(
+        session, reinterpret_cast<const std::uint8_t*>(bytes.data()),
+        bytes.size());
+    if (consumed != static_cast<nghttp2_ssize>(bytes.size())) {
+      std::fprintf(stderr, "client decode consumed=%td expected=%zu\n",
+                   static_cast<std::ptrdiff_t>(consumed), bytes.size());
+      return false;
+    }
+    return true;
   }
 
   nghttp2_session* session = nullptr;
@@ -358,16 +364,22 @@ bool SendClient(Client& client, netlib::SocketHandle socket) {
   while (offset < bytes.size()) {
     std::ptrdiff_t size = netlib::platform::Send(socket, bytes.data() + offset,
                                                  bytes.size() - offset);
-    if (size <= 0) return false;
+    if (size <= 0) {
+      std::fprintf(stderr, "client send failed: error=%d pending=%zu\n",
+                   netlib::platform::LastError(), bytes.size() - offset);
+      return false;
+    }
     offset += static_cast<std::size_t>(size);
   }
   return true;
 }
 
-bool RunTcpTest(bool cancel, bool timeout, bool drain = false) {
+bool RunTcpTest(bool cancel, bool timeout, bool drain = false,
+                std::size_t read_chunk = 4096) {
   std::mutex mutex;
   std::condition_variable condition;
   std::vector<netlib::FrameMessage> requests;
+  bool closed = false;
   bool stopped = false;
   std::unique_ptr<netlib::ThreadPool> workers =
       netlib::ThreadPool::Create(1, 8, [&](netlib::FrameMessage message) {
@@ -382,9 +394,16 @@ bool RunTcpTest(bool cancel, bool timeout, bool drain = false) {
       .max_pending_responses = cancel ? 1U : 2U,
       .request_timeout = timeout ? std::chrono::milliseconds(150)
                                  : std::chrono::milliseconds(5000)};
+  netlib::SubReactor::ConnectionCallbacks callbacks;
+  callbacks.on_closed = [&](netlib::SocketHandle) {
+    std::lock_guard<std::mutex> lock(mutex);
+    closed = true;
+    condition.notify_all();
+  };
   std::unique_ptr<netlib::SubReactor> reactor =
       netlib::SubReactor::CreateWithSession(
-          options, *workers, {}, [](netlib::ProtocolSessionOptions limits) {
+          options, *workers, std::move(callbacks),
+          [](netlib::ProtocolSessionOptions limits) {
             return netlib::CreateHttp2Session(limits);
           });
   if (!reactor) return false;
@@ -454,24 +473,33 @@ bool RunTcpTest(bool cancel, bool timeout, bool drain = false) {
                                     : expired.Respond(Reply("first")));
     if (cancel) success = success && expired.IsCancelled();
   }
+  // Hold the SETTINGS ACK until after FIN, and fragment every frame. A full
+  // server close would reset TCP when this delayed control finally arrives.
+  const bool delayed_ack = drain && read_chunk == 1;
   std::array<char, 4096> bytes{};
-  for (int i = 0; success && i != 100 && !client.replies[3].complete; ++i) {
+  for (int i = 0; success && i != 4096 && !client.replies[3].complete; ++i) {
     std::ptrdiff_t count =
-        netlib::platform::Receive(socket.get(), bytes.data(), bytes.size());
+        netlib::platform::Receive(socket.get(), bytes.data(), read_chunk);
+    if (count <= 0)
+      std::fprintf(stderr, "client receive failed: result=%td error=%d\n",
+                   count, netlib::platform::LastError());
     success = count > 0 &&
               client.Receive(std::span<const char>(bytes).first(
                   static_cast<std::size_t>(count))) &&
-              SendClient(client, socket.get());
+              (delayed_ack || SendClient(client, socket.get()));
   }
   if (success && !cancel && !timeout) {
-    for (int i = 0; success && i != 100 && !client.replies[first].complete;
+    for (int i = 0; success && i != 4096 && !client.replies[first].complete;
          ++i) {
       std::ptrdiff_t count =
-          netlib::platform::Receive(socket.get(), bytes.data(), bytes.size());
+          netlib::platform::Receive(socket.get(), bytes.data(), read_chunk);
+      if (count <= 0)
+        std::fprintf(stderr, "client receive failed: result=%td error=%d\n",
+                     count, netlib::platform::LastError());
       success = count > 0 &&
                 client.Receive(std::span<const char>(bytes).first(
                     static_cast<std::size_t>(count))) &&
-                SendClient(client, socket.get());
+                (delayed_ack || SendClient(client, socket.get()));
     }
     success = success && client.replies[first].body == "first" &&
               !client.completion_order.empty() &&
@@ -481,11 +509,38 @@ bool RunTcpTest(bool cancel, bool timeout, bool drain = false) {
             client.replies[3].body == "done" && replacement.sequence == 1 &&
             replacement.request_context.stream_id == 3;
   if (success && drain) {
+    std::ptrdiff_t count =
+        netlib::platform::Receive(socket.get(), bytes.data(), bytes.size());
+    success = count == 0;
+    if (!success)
+      std::fprintf(stderr, "expected server FIN: result=%td error=%d\n", count,
+                   netlib::platform::LastError());
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      // FIN is a half-close: the descriptor remains registered for late input.
+      success = success && !closed;
+    }
+    if (delayed_ack)
+      success = success && nghttp2_session_want_write(client.session) != 0;
+    success = success && SendClient(client, socket.get()) &&
+              netlib::platform::ShutdownWrite(socket.get());
     std::unique_lock<std::mutex> lock(mutex);
-    success = condition.wait_for(lock, std::chrono::seconds(2),
+    success = success &&
+              condition.wait_for(lock, std::chrono::seconds(2),
                                  [&] { return stopped; }) &&
-              client.goaways == 1 && client.last_goaway_stream == 3 &&
+              closed && client.goaways == 1 && client.last_goaway_stream == 3 &&
               !expired.IsCancelled() && !replacement.IsCancelled();
+  }
+  if (!success) {
+    std::lock_guard<std::mutex> lock(mutex);
+    std::fprintf(stderr,
+                 "TCP state: cancel=%d timeout=%d drain=%d chunk=%zu "
+                 "requests=%zu stopped=%d goaways=%d last_stream=%d "
+                 "first_complete=%d second_complete=%d cancelled=%d/%d\n",
+                 cancel, timeout, drain, read_chunk, requests.size(), stopped,
+                 client.goaways, client.last_goaway_stream,
+                 client.replies[first].complete, client.replies[3].complete,
+                 expired.IsCancelled(), replacement.IsCancelled());
   }
   socket.Reset();
   main->Stop();
@@ -500,6 +555,7 @@ bool TestTcpRouting() { return RunTcpTest(false, false); }
 bool TestTcpCancellation() { return RunTcpTest(true, false); }
 bool TestTcpTimeout() { return RunTcpTest(false, true); }
 bool TestTcpDrain() { return RunTcpTest(false, false, true); }
+bool TestTcpDrainDelayedAck() { return RunTcpTest(false, false, true, 1); }
 
 bool TestPhaseDeadlines() {
   std::unique_ptr<netlib::ProtocolSession> preface =
@@ -735,6 +791,7 @@ int main() {
       {"phase deadlines", TestPhaseDeadlines},
       {"drain boundary/expiry", TestDrainBoundaryAndExpiry},
       {"TCP graceful drain", TestTcpDrain},
+      {"TCP graceful drain with delayed SETTINGS ACK", TestTcpDrainDelayedAck},
       {"TCP handshake deadline", TestTcpHandshakeDeadline},
   };
   for (const Test& test : tests) {

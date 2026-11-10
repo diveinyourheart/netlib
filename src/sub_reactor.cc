@@ -1,6 +1,7 @@
 #include "netlib/sub_reactor.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cassert>
 #include <cerrno>
@@ -267,7 +268,7 @@ class SubReactor::Connection {
   void Consume(std::size_t size);
   bool read_interest_enabled() const { return read_interest_enabled_; }
   bool UpdateInterest(bool write) {
-    bool read = session_->WantsInput();
+    bool read = close_deadline_.has_value() || session_->WantsInput();
     if (read == read_interest_enabled_ && write == write_interest_enabled_) {
       return true;
     }
@@ -308,6 +309,8 @@ class SubReactor::Connection {
   std::map<std::uint64_t, PendingRequest> request_timers_;
   std::optional<TimerScheduler::Clock::time_point> alarm_deadline_;
   std::optional<TimerScheduler::Clock::time_point> write_deadline_;
+  std::optional<TimerScheduler::Clock::time_point> close_deadline_;
+  std::size_t close_bytes_ = 0;
   TimerScheduler::TimerId alarm_timer_ = TimerScheduler::kInvalidTimer;
   std::uint64_t alarm_generation_ = 0;
   bool read_interest_enabled_ = true;
@@ -424,7 +427,9 @@ std::unique_ptr<SubReactor> SubReactor::CreateWithSession(
       options.request_timeout <= std::chrono::milliseconds::zero() ||
       options.request_timeout > std::chrono::hours(24) ||
       options.write_timeout <= std::chrono::milliseconds::zero() ||
-      options.write_timeout > std::chrono::hours(24)) {
+      options.write_timeout > std::chrono::hours(24) ||
+      options.close_timeout <= std::chrono::milliseconds::zero() ||
+      options.close_timeout > std::chrono::hours(24)) {
     NETLIB_LOG_ERROR("SubReactor option is outside its valid range");
     return nullptr;
   }
@@ -732,7 +737,8 @@ void SubReactor::RefreshSessionTimer(std::uint64_t connection_id) {
   if (connection == connections_.end()) return;
   Connection& state = *connection->second;
   std::optional<TimerScheduler::Clock::time_point> deadline =
-      state.session().NextDeadline();
+      state.close_deadline_ ? state.close_deadline_
+                            : state.session().NextDeadline();
   if (state.write_deadline_ &&
       (!deadline || *state.write_deadline_ < *deadline)) {
     deadline = state.write_deadline_;
@@ -765,6 +771,14 @@ void SubReactor::HandleSessionDeadline(std::uint64_t connection_id,
   if (generation != state.alarm_generation_) return;
   state.alarm_timer_ = TimerScheduler::kInvalidTimer;
   TimerScheduler::Clock::time_point now = TimerScheduler::Clock::now();
+  if (state.close_deadline_) {
+    if (now >= *state.close_deadline_) {
+      CloseConnection(connection_id);
+    } else {
+      RefreshSessionTimer(connection_id);
+    }
+    return;
+  }
   if (state.write_deadline_ && now >= *state.write_deadline_) {
     CloseConnection(connection_id);
     return;
@@ -873,6 +887,10 @@ void SubReactor::HandleReadable(std::uint64_t connection_id) {
     }
 
     Connection& state = *connection->second;
+    if (state.close_deadline_) {
+      DrainConnectionInput(connection_id);
+      return;
+    }
     if (!state.session().WantsInput()) {
       return;
     }
@@ -1005,6 +1023,7 @@ void SubReactor::FlushConnection(std::uint64_t connection_id) {
     return;
   }
   Connection& state = *connection->second;
+  if (state.close_deadline_) return;
   ProtocolSession& session = state.session();
   // A Session can pause with a partial/coalesced request still in our buffer.
   // Resuming socket readiness alone cannot deliver those already-read bytes.
@@ -1062,11 +1081,73 @@ void SubReactor::FlushConnection(std::uint64_t connection_id) {
     CloseConnection(connection_id);
     return;
   }
-  if (session.ShouldClose() || !state.UpdateInterest(false)) {
+  if (session.ShouldClose()) {
+    if (session.ShouldHalfClose()) {
+      ShutdownConnection(connection_id);
+    } else {
+      CloseConnection(connection_id);
+    }
+  } else if (!state.UpdateInterest(false)) {
     CloseConnection(connection_id);
   } else {
     RefreshSessionTimer(connection_id);
   }
+}
+
+void SubReactor::ShutdownConnection(std::uint64_t connection_id) {
+  auto connection = connections_.find(connection_id);
+  if (connection == connections_.end()) return;
+  Connection& state = *connection->second;
+  if (state.close_deadline_) return;
+  // A full close can reset TCP when a delayed SETTINGS ACK or other control
+  // arrives, discarding the peer's unread response. Send FIN first and retain
+  // read interest without parsing or dispatching any more protocol input.
+  state.MarkClosed();
+  if (!platform::ShutdownWrite(state.fd())) {
+    CloseConnection(connection_id);
+    return;
+  }
+  state.close_deadline_ = TimerScheduler::Clock::now() + options_.close_timeout;
+  std::optional<TimerScheduler::Clock::time_point> protocol_deadline =
+      state.session().NextDeadline();
+  if (protocol_deadline && *protocol_deadline < *state.close_deadline_)
+    state.close_deadline_ = protocol_deadline;
+  state.close_bytes_ = state.ReadableBytes().size();
+  state.Consume(state.close_bytes_);
+  if (!state.UpdateInterest(false)) {
+    CloseConnection(connection_id);
+    return;
+  }
+  RefreshSessionTimer(connection_id);
+  // Read immediately: epoll ET may already have reported these queued bytes.
+  DrainConnectionInput(connection_id);
+}
+
+void SubReactor::DrainConnectionInput(std::uint64_t connection_id) {
+  auto connection = connections_.find(connection_id);
+  if (connection == connections_.end()) return;
+  Connection& state = *connection->second;
+  assert(state.close_deadline_.has_value());
+  // Bound even a peer that continuously sends after FIN. This deadline never
+  // extends with incoming bytes, and external Drain/Stop can still close
+  // sooner.
+  constexpr std::size_t kMaxCloseDrainBytes = 64 * 1024;
+  std::array<char, 4096> discarded{};
+  while (state.close_bytes_ < kMaxCloseDrainBytes &&
+         TimerScheduler::Clock::now() < *state.close_deadline_) {
+    std::ptrdiff_t count = platform::Receive(
+        state.fd(), discarded.data(),
+        std::min(discarded.size(), kMaxCloseDrainBytes - state.close_bytes_));
+    if (count > 0) {
+      state.close_bytes_ += static_cast<std::size_t>(count);
+      continue;
+    }
+    if (count < 0 && platform::Interrupted(platform::LastError())) continue;
+    if (count < 0 && platform::WouldBlock(platform::LastError())) return;
+    CloseConnection(connection_id);
+    return;
+  }
+  CloseConnection(connection_id);
 }
 
 void SubReactor::CancelRequestTimers() {

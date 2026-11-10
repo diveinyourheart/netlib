@@ -15,6 +15,7 @@ MainReactor/SubReactor 的外部 Drain 入口。相同的外部排空、业务�
 | 应用响应已被 owner 接受，等待协议发送 | response_timeout，30 秒，绝对期限 | 包含等待 peer 窗口；到期 RST_STREAM，不改写已开始的响应 |
 | 用户态已有编码输出但 socket 无进展 | SubReactorOptions.write_timeout，30 秒空闲 | 仅成功 Send 刷新；到期关闭连接，不能从流中间丢弃传输字节 |
 | 会话内部 GOAWAY 排空 | Http2SessionOptions.drain_timeout，30 秒 | 保留已接受的流；超时强制关闭连接 |
+| HTTP/2 正常排空后的 TCP 半关闭 | SubReactorOptions.close_timeout，5 秒，绝对期限 | 先 shutdown 写方向，再丢弃尾部输入；peer EOF、累计 64 KiB 或到期时释放连接 |
 | 外部服务排空 | MainReactor/SubReactor::Drain(timeout)，默认 30 秒 | 停止新连接，完成既有流或到期关闭；最后一个连接结束后 SubReactor 自动退出 |
 
 以上可配置期限都必须大于 0 且不超过 24 小时。未收到任何新请求的普通 keep-alive
@@ -80,6 +81,20 @@ HTTP/2 的 GOAWAY 固定最后接受的 stream ID，后续新流不投递业务�
 和响应继续处理，因此不会关闭 DATA/WINDOW_UPDATE 的读兴趣。peer GOAWAY 也会进入
 有期限的本地排空。旧 Codec 停止接受新请求，等待已经派发的响应，再写完输出。
 
+HTTP/2 的最后一个响应和 GOAWAY 写完后，不能立即完全关闭 socket：对端可能还没读到
+服务端 SETTINGS，随后回写 SETTINGS ACK，触发 TCP reset，影响尚未读完的响应。
+因此正常完成的 HTTP/2 Session 通过 ShouldHalfClose 选择 TCP 半关闭；Reactor 先作废
+业务回写句柄并 shutdown 写方向，让对端收到 FIN，再保留只读兴趣，丢弃迟到的控制帧，
+不再调用 Session 解码或派发业务。即使 epoll ET 已报告过可读，也会立即排空现有输入。
+这个分阶段关闭方法对应 [RFC 9112 §9.6](https://www.rfc-editor.org/rfc/rfc9112.html#section-9.6)
+描述的 TCP reset 问题；相同 TCP 行为也影响 HTTP/2。
+
+close_timeout 从 shutdown 开始计算，收到尾部字节不会延长期限；会话排空期限或外部
+Drain 可以更早终止，Stop 仍立即退出。丢弃输入累计达到 64 KiB 时也释放连接，限制
+持续发送的对端占用 owner。on_closed 在最终释放描述符时通知，可能晚于业务句柄失效。
+ShouldHalfClose 默认返回 false，旧 Session/Codec 保持原来的关闭策略，错误路径仍可
+直接关闭；此阶段不保证对端应用已处理响应，也不承诺强制期限到达后的可靠送达。
+
 ## owner 闹钟与性能
 
 ProtocolSession 提供默认无期限的 NextDeadline/OnDeadline，旧子类无需实现新增纯虚函数。
@@ -87,7 +102,7 @@ Http2Session 使用有序期限表及 stream 中的迭代器，更新为 O(log N
 最早时间为 O(1)，不定期扫描全部 stream。轻量帧边界计数覆盖不足 9 字节的帧头和未收完
 的帧，不重复解析 HPACK。Body 空闲计时只在实际数据到达时刷新。
 
-每个连接至多挂一个协议/写停滞闹钟，另外保留已有的每请求业务 timer。只有最早期限变化
+每个连接至多挂一个协议/写停滞/半关闭闹钟，另外保留已有的每请求业务 timer。只有最早期限变化
 才取消并重挂；每个 SubReactor 再有一个外部排空闹钟。TimerScheduler 的回调只经弱队列
 投递控制命令，不访问 Session、Channel 或 socket。控制命令不受普通响应容量限制。
 
@@ -118,6 +133,9 @@ Timer/stop_source 在任务投递前登记，避免 Worker 已开始而失败清
 [http2_session_test.cc](../tests/http2_session_test.cc) 覆盖各阶段确定性期限、正文续传后
 旧期限不误杀、零窗口响应超时、GOAWAY 最后 stream ID 与新流边界、真实 TCP 排空和
 握手超时，并继续检查 RST/业务超时后的迟到回写。
+TCP 排空增加 FIN 后才回写 SETTINGS ACK、按单字节接收的确定性场景，检查全部响应、
+GOAWAY 和 EOF；通用排空测试验证半关闭后的 peer EOF、close_timeout、外部期限、Stop
+及尾部输入上限。这些用例不靠延长睡眠或忽略 socket 错误规避竞争。
 
 T08 仍需补齐全链路字节预算、Worker 满时的单流拒绝和每轮处理公平性；当前 Submit 失败
 仍关闭整连接。T09 才做 HTTP/1/2 自动选择，TLS/ALPN 和流式业务仍属后续阶段。

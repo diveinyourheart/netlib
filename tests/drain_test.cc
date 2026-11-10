@@ -26,9 +26,11 @@ namespace {
 // without depending on Winsock accepting one oversized send into kernel memory.
 class ChunkedSession final : public netlib::ProtocolSession {
  public:
-  explicit ChunkedSession(netlib::ProtocolSessionOptions limits)
+  explicit ChunkedSession(netlib::ProtocolSessionOptions limits,
+                          bool half_close)
       : codec_(netlib::CreateCodecSession(netlib::CreateLengthPrefixedCodec(),
-                                          limits)) {}
+                                          limits)),
+        half_close_(half_close) {}
   netlib::SessionInputResult OnInput(std::span<const char> input) override {
     return codec_->OnInput(input);
   }
@@ -53,12 +55,16 @@ class ChunkedSession final : public netlib::ProtocolSession {
   void ConsumeOutput(std::size_t size) override { codec_->ConsumeOutput(size); }
   bool WantsInput() const override { return codec_->WantsInput(); }
   bool ShouldClose() const override { return codec_->ShouldClose(); }
+  bool ShouldHalfClose() const override {
+    return half_close_ && codec_->ShouldClose();
+  }
   std::size_t MaxInputBufferSize() const override {
     return codec_->MaxInputBufferSize();
   }
 
  private:
   std::unique_ptr<netlib::ProtocolSession> codec_;
+  const bool half_close_;
 };
 
 class Server {
@@ -70,7 +76,8 @@ class Server {
     if (sub_thread.joinable()) sub_thread.join();
     if (workers) workers->Stop();
   }
-  bool Start(netlib::SubReactorOptions options = {}, int send_buffer = 0) {
+  bool Start(netlib::SubReactorOptions options = {}, int send_buffer = 0,
+             bool half_close = false) {
     workers =
         netlib::ThreadPool::Create(1, 8, [this](netlib::FrameMessage message) {
           std::lock_guard<std::mutex> lock(mutex);
@@ -91,8 +98,8 @@ class Server {
     };
     sub = netlib::SubReactor::CreateWithSession(
         options, *workers, std::move(callbacks),
-        [](netlib::ProtocolSessionOptions limits) {
-          return std::make_unique<ChunkedSession>(limits);
+        [half_close](netlib::ProtocolSessionOptions limits) {
+          return std::make_unique<ChunkedSession>(limits, half_close);
         });
     if (!sub) return false;
     main = netlib::MainReactor::Create(0, {sub.get()});
@@ -171,6 +178,64 @@ bool TestGracefulDrain() {
   return response == std::array<char, 6>{0, 0, 0, 2, 'o', 'k'} &&
          server.WaitStopped() && !request.IsCancelled() &&
          !request.connection.valid();
+}
+
+enum class HalfCloseFinish {
+  kPeerEof,
+  kTimeout,
+  kDrainDeadline,
+  kStop,
+  kByteLimit
+};
+
+bool TestHalfClose(HalfCloseFinish finish) {
+  Server server;
+  netlib::SubReactorOptions options{.close_timeout =
+                                        finish == HalfCloseFinish::kTimeout
+                                            ? std::chrono::milliseconds(80)
+                                            : std::chrono::milliseconds(5000)};
+  if (!server.Start(options, 0, true)) return false;
+  netlib::FrameMessage request = server.Request();
+  std::chrono::milliseconds drain_timeout =
+      finish == HalfCloseFinish::kDrainDeadline
+          ? std::chrono::milliseconds(80)
+          : std::chrono::milliseconds(5000);
+  if (!server.main->Drain(drain_timeout) ||
+      !request.Respond(std::vector<char>{'o', 'k'}))
+    return false;
+  std::array<char, 7> response{};
+  std::size_t size = 0;
+  while (size != response.size()) {
+    std::ptrdiff_t count = netlib::platform::Receive(
+        server.socket.get(), response.data() + size, response.size() - size);
+    if (count < 0) return false;
+    if (count == 0) break;
+    size += static_cast<std::size_t>(count);
+  }
+  // The final recv must observe FIN, with every response byte before it.
+  if (size != 6 || response != std::array<char, 7>{0, 0, 0, 2, 'o', 'k', 0} ||
+      request.connection.valid())
+    return false;
+  if (finish == HalfCloseFinish::kPeerEof ||
+      finish == HalfCloseFinish::kByteLimit) {
+    // Trailing bytes must be discarded rather than decoded as new requests.
+    std::vector<char> trailing(
+        finish == HalfCloseFinish::kByteLimit ? 64 * 1024 : 37, 'x');
+    std::size_t offset = 0;
+    while (offset < trailing.size()) {
+      std::ptrdiff_t count =
+          netlib::platform::Send(server.socket.get(), trailing.data() + offset,
+                                 trailing.size() - offset);
+      if (count <= 0) return false;
+      offset += static_cast<std::size_t>(count);
+    }
+    if (finish == HalfCloseFinish::kPeerEof &&
+        !netlib::platform::ShutdownWrite(server.socket.get()))
+      return false;
+  } else if (finish == HalfCloseFinish::kStop) {
+    server.sub->Stop();
+  }
+  return server.WaitStopped() && !request.IsCancelled();
 }
 
 bool TestForcedDrainAndStop(bool drain) {
@@ -260,6 +325,16 @@ int main() {
   if (!TestGracefulDrain()) {
     std::fprintf(stderr, "graceful drain failed\n");
     return 1;
+  }
+  for (HalfCloseFinish finish :
+       {HalfCloseFinish::kPeerEof, HalfCloseFinish::kTimeout,
+        HalfCloseFinish::kDrainDeadline, HalfCloseFinish::kStop,
+        HalfCloseFinish::kByteLimit}) {
+    if (!TestHalfClose(finish)) {
+      std::fprintf(stderr, "TCP half-close failed: finish=%d\n",
+                   static_cast<int>(finish));
+      return 1;
+    }
   }
   if (!TestForcedDrainAndStop(true)) {
     std::fprintf(stderr, "forced drain/cancellation failed\n");

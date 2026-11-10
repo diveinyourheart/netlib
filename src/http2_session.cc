@@ -61,6 +61,9 @@ class Http2Session final : public ProtocolSession {
     return failed_ || (!nghttp2_session_want_read(session_) &&
                        !nghttp2_session_want_write(session_));
   }
+  bool ShouldHalfClose() const override {
+    return draining_ && !failed_ && ShouldClose();
+  }
   std::size_t MaxInputBufferSize() const override {
     return options_.max_input_chunk_bytes;
   }

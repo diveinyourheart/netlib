@@ -455,3 +455,30 @@ git diff --check 已检查。本轮改动保留在工作区，未自动提交或
 按用户要求，将第四、第五轮的 T06/T07 实现、测试与文档统一提交到
 codex/http2-support 并推送远端，今天到此结束。下一轮先核对该提交的 CI，
 再从上面的 T08 入口继续；本机验证结果已记录，尚未取得该提交的 Linux CI 结果。
+
+## T07 后续：修复 Linux CI 的 TCP 排空竞争（2026-11-11）
+
+用户反馈 [4746f82 的 CI](https://github.com/diveinyourheart/netlib/actions/runs/42851763154)
+在 Ubuntu Debug/Release HTTP2=ON 的 TCP graceful drain 用例失败。Windows 原收包方式
+通过不能说明跨平台关闭安全：让服务端先完成关闭，再让客户端按单字节收包并回写
+SETTINGS ACK，本机也复现了连接重置（WSAECONNABORTED 10053）。
+
+原因是 GOAWAY 和响应写完后直接 close socket，迟到的客户端控制帧与全关闭竞争。
+这可能使客户端未读完的响应被 TCP reset 中断。修复采用有期限的 TCP 半关闭：
+
+- ProtocolSession 新增默认 false 的 ShouldHalfClose，正常排空的 HTTP/2 Session 选择
+  半关闭，旧 Codec/Session 保持原策略。输出全部交给 socket 后作废回写句柄，再 shutdown
+  写方向；保留读兴趣并立即读取，丢弃尾部输入，不再解码或投递新请求。
+- SubReactorOptions.close_timeout 默认 5 秒，从 shutdown 起算且不因接收延长；继续
+  复用每连接最早期限闹钟。peer EOF、累计 64 KiB、关闭期限到达、外部 Drain/Stop
+  都能释放连接，会话内部排空期限也能提前终止。
+- 测试保留正常 SETTINGS ACK 收发，另加单字节接收、FIN 后才回写 ACK 的场景；检查
+  完整响应、GOAWAY、正常 EOF、最终关闭和业务取消状态。通用 ON/OFF 测试覆盖 peer EOF、
+  半关闭超时、外部排空期限、立即 Stop 与尾部输入上限；失败会输出具体收发及 TCP 状态。
+
+本机完整回归：MinGW Debug HTTP2=OFF 为 24/24，MinGW Debug/Release 与 MSVC Debug
+HTTP2=ON 均为 26/26；MinGW Debug 的两个相关测试各重复 20 次也全部通过。
+CI 的 Ubuntu Debug/Release HTTP2=ON 在全量测试后，还会对
+HTTP/2 和排空测试各重复 20 次，验证该关闭竞争；Linux 结果应查看对应修复提交的
+[Build and test](https://github.com/diveinyourheart/netlib/actions/workflows/build.yml)。
+文档链接、代码格式和 actionlint 已检查。下一轮仍从 T08 开始。

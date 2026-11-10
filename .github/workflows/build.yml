@@ -32,6 +32,12 @@ jobs:
         run: cmake --build build/ci --config ${{ matrix.config }} --parallel 2
       - name: Test
         run: ctest --test-dir build/ci -C ${{ matrix.config }} --output-on-failure --no-tests=error
+      - name: Repeat HTTP/2 shutdown tests
+        if: runner.os == 'Linux' && matrix.http2 == 'ON'
+        run: >-
+          ctest --test-dir build/ci -C ${{ matrix.config }}
+          -R '^netlib_(http2_session|drain)_test$'
+          --repeat until-fail:20 --output-on-failure --no-tests=error
 
   mingw:
     name: MinGW UCRT64 HTTP2=${{ matrix.http2 }}

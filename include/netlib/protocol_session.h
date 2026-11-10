@@ -101,6 +101,10 @@ class ProtocolSession {
   virtual bool WantsInput() const = 0;
   // Reactor closes only after PendingOutput has been sent completely.
   virtual bool ShouldClose() const = 0;
+  // Opt in to TCP half-close after ShouldClose and all output is sent. Reactor
+  // discards trailing input until peer EOF, a byte limit, or a fixed deadline.
+  // Fatal/legacy Sessions retain immediate close by default.
+  virtual bool ShouldHalfClose() const { return false; }
   // Positive and constant throughout this Session's lifetime.
   virtual std::size_t MaxInputBufferSize() const = 0;
 };

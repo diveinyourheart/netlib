@@ -107,7 +107,8 @@ Header/正文超过限制时重置对应 stream，不投递不完整请求。
 
 业务响应等待超时发送单流 504；T07 增加 Header/Body 接收、响应发送、socket 写停滞与
 排空期限。Worker 获得 stop_token 取消通知；BeginDrain/外部 Drain 在保留既有流读写的
-同时提交 GOAWAY，正常排空后退出或到期强制关闭。详见 [http2_lifecycle.md](http2_lifecycle.md)。
+同时提交 GOAWAY；正常排空后先 shutdown 写方向，限时接收尾部输入，peer EOF 后退出
+或到期强制关闭。详见 [http2_lifecycle.md](http2_lifecycle.md)。
 
 SubReactor::Stop 仍为立即停止接口，Drain 是有期限的优雅退出入口。T08 还需完善 Worker 饱和时的单流拒绝、
 跨队列字节预算和每轮处理公平性。T09 才接入 HTTP/1/2 在线自动选择。

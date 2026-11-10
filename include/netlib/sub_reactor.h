@@ -36,6 +36,9 @@ struct SubReactorOptions {
   std::chrono::milliseconds request_timeout = std::chrono::minutes(10);
   // Idle time while encoded socket output remains unsent (0 < timeout <= 24h).
   std::chrono::milliseconds write_timeout = std::chrono::seconds(30);
+  // Fixed wait for peer EOF after graceful TCP write shutdown (0 < time <=
+  // 24h).
+  std::chrono::milliseconds close_timeout = std::chrono::seconds(5);
 };
 
 // Owns accepted connections, protocol sessions, and nonblocking read/write
@@ -118,6 +121,8 @@ class SubReactor {
   void HandleRequestTimeout(std::uint64_t connection_id,
                             std::uint64_t sequence);
   void FlushConnection(std::uint64_t connection_id);
+  void ShutdownConnection(std::uint64_t connection_id);
+  void DrainConnectionInput(std::uint64_t connection_id);
   void CancelRequestTimers();
   void CloseConnection(std::uint64_t connection_id);
   void ApplyDrain();
