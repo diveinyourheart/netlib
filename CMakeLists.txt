@@ -46,6 +46,7 @@ add_library(
     src/connection_handle.cc
     src/event_loop.cc
     src/http1_codec.cc
+    src/http2_session.cc
     src/http_protocol.cc
     src/length_prefixed_codec.cc
     src/main_reactor.cc
@@ -117,12 +118,25 @@ if(NETLIB_ENABLE_HTTP2)
   enable_language(C)
   include(cmake/NetlibNghttp2.cmake)
   netlib_setup_nghttp2()
+  target_compile_definitions(netlib PRIVATE NETLIB_HAS_HTTP2=1)
 endif()
 
 add_executable(netlib_log_example examples/log_example.cc)
 target_link_libraries(netlib_log_example PRIVATE netlib::log)
 
 if(BUILD_TESTING)
+  add_executable(netlib_drain_test tests/drain_test.cc)
+  target_link_libraries(netlib_drain_test PRIVATE netlib::netlib)
+  netlib_warnings(netlib_drain_test)
+  add_test(NAME netlib_drain_test COMMAND netlib_drain_test)
+  set_tests_properties(netlib_drain_test PROPERTIES TIMEOUT 30)
+  add_executable(netlib_http2_factory_test tests/http2_factory_test.cc)
+  target_link_libraries(netlib_http2_factory_test PRIVATE netlib::netlib)
+  target_compile_definitions(netlib_http2_factory_test PRIVATE
+    NETLIB_TEST_HTTP2=$<BOOL:${NETLIB_ENABLE_HTTP2}>)
+  netlib_warnings(netlib_http2_factory_test)
+  add_test(NAME netlib_http2_factory_test COMMAND netlib_http2_factory_test)
+  set_tests_properties(netlib_http2_factory_test PROPERTIES TIMEOUT 30)
   add_test(NAME netlib_nghttp2_configuration_test
     COMMAND ${CMAKE_COMMAND}
       "-DNETLIB_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
@@ -133,6 +147,11 @@ if(BUILD_TESTING)
       -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/nghttp2_configuration_test.cmake")
   set_tests_properties(netlib_nghttp2_configuration_test PROPERTIES TIMEOUT 210)
   if(NETLIB_ENABLE_HTTP2)
+    add_executable(netlib_http2_session_test tests/http2_session_test.cc)
+    target_link_libraries(netlib_http2_session_test PRIVATE netlib::netlib netlib_nghttp2)
+    netlib_warnings(netlib_http2_session_test)
+    add_test(NAME netlib_http2_session_test COMMAND netlib_http2_session_test)
+    set_tests_properties(netlib_http2_session_test PROPERTIES TIMEOUT 40)
     add_executable(netlib_nghttp2_test tests/nghttp2_test.cc)
     target_link_libraries(netlib_nghttp2_test PRIVATE netlib::netlib netlib_nghttp2)
     get_target_property(nghttp2_version netlib_nghttp2 NETLIB_NGHTTP2_VERSION)

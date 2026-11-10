@@ -24,6 +24,9 @@ struct HttpRequestMetadata {
   std::vector<HttpHeader> headers;
   std::uint64_t content_length = 0;
   bool keep_alive = false;
+  // HTTP/2 request pseudo-fields. Empty for existing HTTP/1 Codec requests.
+  std::string scheme{};
+  std::string authority{};
 };
 
 using FrameMetadata =

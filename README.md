@@ -38,12 +38,16 @@
 
 HTTP/2 feature 分批推进，根目录 [HTTP2_TASKS.md](HTTP2_TASKS.md) 记录任务、验收和
 每轮总结和下一轮入口，设计见 [HTTP/2 文档](docs/http2_design.md)。目前已实现
-T01–T04，以及 T05 的可选 nghttp2 构建；Windows 开关验证通过，Linux CI 待执行。
-**当前还不能实际处理 HTTP/2 请求，也尚未把识别器接入在线自动切换**。
+T01–T07：会话基础、可选依赖、显式 HTTP/2 多流与基本流控，以及阶段超时、取消和有期限排空。
+T05 的 Linux/Windows CI 已全部通过。当前支持明文 prior-knowledge HTTP/2，
+**尚未把识别器接入 HTTP/1/2 在线自动切换，也没有 TLS/ALPN**。
 `NETLIB_ENABLE_HTTP2` 默认关闭；开启后构建固定的 nghttp2 1.71.0 C 静态协议库，
 支持官方归档离线构建，详见 [HTTP/2 构建说明](docs/http2_build.md)。
-下一轮实现 HTTP/2 Session，之后接入明文 preface 选择，
-HTTPS 再通过 TLS ALPN 协商 h2/http/1.1。默认长度前缀和显式 RPC Codec 配置保持原有行为。
+通过 `CreateWithSession` 和 `CreateHttp2Session` 显式接入，见
+[HTTP/2 会话与流控说明](docs/http2_session.md)及 [T07 生命周期](docs/http2_lifecycle.md)。
+`MainReactor::Drain(timeout)` 可触发有期限的服务排空，Worker 可通过 stop_token 感知取消。
+下一轮完善 T08 的预算和背压，
+后续再接入自动选择及 HTTPS。默认长度前缀和显式 RPC 配置保持原有行为。
 
 ## 数据流程
 

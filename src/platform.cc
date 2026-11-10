@@ -196,6 +196,9 @@ bool SetReceiveTimeout(SocketHandle socket, int milliseconds) {
 bool SetReceiveBuffer(SocketHandle socket, int bytes) {
   return SetIntOption(socket, SO_RCVBUF, bytes);
 }
+bool SetSendBuffer(SocketHandle socket, int bytes) {
+  return SetIntOption(socket, SO_SNDBUF, bytes);
+}
 bool ShutdownWrite(SocketHandle socket) {
 #ifdef _WIN32
   return shutdown(socket, SD_SEND) == 0;

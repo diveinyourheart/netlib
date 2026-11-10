@@ -83,14 +83,32 @@ MainReactor::MainReactor(std::unique_ptr<EventLoop> event_loop, uint16_t port,
 
 MainReactor::~MainReactor() = default;
 
-void MainReactor::Run() { event_loop_->Run(); }
+void MainReactor::Run() {
+  event_loop_->Run();
+  stopping_.store(true);
+  listener_channel_.reset();
+  listen_fd_.Reset();
+}
 
 void MainReactor::Stop() {
+  stopping_.store(true);
   NETLIB_LOG_INFO("main reactor stopping");
   event_loop_->Stop();
 }
 
 uint16_t MainReactor::port() const { return port_; }
+
+bool MainReactor::Drain(std::chrono::milliseconds timeout) {
+  if (timeout <= std::chrono::milliseconds::zero() ||
+      timeout > std::chrono::hours(24))
+    return false;
+  Stop();
+  bool accepted = true;
+  for (SubReactor* reactor : sub_reactors_) {
+    if (!reactor->Drain(timeout)) accepted = false;
+  }
+  return accepted;
+}
 
 void MainReactor::DispatchConnection(UniqueFd& connection) {
   SocketHandle fd = connection.get();
@@ -106,7 +124,7 @@ void MainReactor::DispatchConnection(UniqueFd& connection) {
 }
 
 void MainReactor::HandleReadable() {
-  while (true) {
+  while (!stopping_.load()) {
     SocketHandle connection_fd = platform::Accept(listen_fd_.get());
     if (connection_fd != kInvalidSocket) {
       UniqueFd connection(connection_fd);

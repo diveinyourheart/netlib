@@ -9,6 +9,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <unordered_map>
 #include <vector>
 
@@ -33,6 +34,8 @@ struct SubReactorOptions {
       kFrameLengthPrefixSize + kMaxFramePayloadSize;
   // Maximum time from Worker submission to an accepted response.
   std::chrono::milliseconds request_timeout = std::chrono::minutes(10);
+  // Idle time while encoded socket output remains unsent (0 < timeout <= 24h).
+  std::chrono::milliseconds write_timeout = std::chrono::seconds(30);
 };
 
 // Owns accepted connections, protocol sessions, and nonblocking read/write
@@ -79,6 +82,10 @@ class SubReactor {
 
   void Run();
   void Stop();
+  // Thread-safe: stop adoption, drain accepted connections, then stop the loop.
+  // Repeated calls may shorten but never extend the deadline (0 < timeout <=
+  // 24h).
+  bool Drain(std::chrono::milliseconds timeout = std::chrono::seconds(30));
 
  private:
   class Connection;
@@ -113,6 +120,11 @@ class SubReactor {
   void FlushConnection(std::uint64_t connection_id);
   void CancelRequestTimers();
   void CloseConnection(std::uint64_t connection_id);
+  void ApplyDrain();
+  void RefreshSessionTimer(std::uint64_t connection_id);
+  void HandleSessionDeadline(std::uint64_t connection_id,
+                             std::uint64_t generation);
+  void HandleDrainDeadline(std::uint64_t generation);
 
   std::unique_ptr<EventLoop> event_loop_;
   ThreadPool::Submitter request_submitter_;
@@ -126,6 +138,11 @@ class SubReactor {
   std::mutex pending_mutex_;
   std::deque<UniqueFd> pending_connections_;
   std::atomic<bool> stopping_{false};
+  std::atomic<bool> draining_{false};
+  std::optional<TimerScheduler::Clock::time_point> requested_drain_deadline_;
+  std::optional<TimerScheduler::Clock::time_point> drain_deadline_;
+  TimerScheduler::TimerId drain_timer_ = TimerScheduler::kInvalidTimer;
+  std::uint64_t drain_generation_ = 0;
 };
 
 }  // namespace netlib

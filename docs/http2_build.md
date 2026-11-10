@@ -1,7 +1,7 @@
 # HTTP/2 协议依赖构建（T05）
 
-当前完成可选 nghttp2 依赖接入，**尚未实现 HTTP/2 Session，也没有在线 HTTP/1/2 自动选择
-或 TLS/ALPN**。开启选项表示编译协议内核及其测试；实际请求处理从 T06 开始。
+当前完成可选 nghttp2 依赖和 T06 的显式原生 Session；开启后可实际处理明文 HTTP/2，
+接入见 [http2_session.md](http2_session.md)。尚未实现在线 HTTP/1/2 自动选择或 TLS/ALPN。
 进度与每轮交接见 [HTTP2_TASKS.md](../HTTP2_TASKS.md)，会话边界见
 [http2_design.md](http2_design.md)。
 
@@ -96,7 +96,7 @@ NGHTTP2_STATICLIB。内部还启用 NGHTTP2_NO_SSIZE_T，隐藏依赖 POSIX ssiz
 静态库链接要求传给最终可执行文件，依赖头文件路径和编译宏不会
 传入只链接 netlib::netlib 的使用方。公开头文件没有 nghttp2 类型。
 
-后续 Http2Session 应在 src 实现中使用该依赖；nghttp2 只负责协议状态与字节，不接管
+Http2Session 在 src 实现中使用该依赖；nghttp2 只负责协议状态与字节，不接管
 socket/TLS I/O，不增加线程。全部 session 调用仍发生在所属 SubReactor owner 线程。
 上游 CMake 选项在函数作用域内设置；BUILD_TESTING 的 cache 强制写入额外做保存和恢复。
 

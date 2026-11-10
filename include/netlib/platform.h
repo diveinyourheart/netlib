@@ -32,6 +32,7 @@ SocketHandle Accept(SocketHandle listener);
 bool ConnectLoopback(SocketHandle socket, std::uint16_t port);
 bool SetReceiveTimeout(SocketHandle socket, int milliseconds);
 bool SetReceiveBuffer(SocketHandle socket, int bytes);
+bool SetSendBuffer(SocketHandle socket, int bytes);
 bool ShutdownWrite(SocketHandle socket);
 std::ptrdiff_t Receive(SocketHandle socket, char* data, std::size_t size);
 std::ptrdiff_t Send(SocketHandle socket, const char* data, std::size_t size);

@@ -1,6 +1,8 @@
 #ifndef NETLIB_INCLUDE_NETLIB_MAIN_REACTOR_H_
 #define NETLIB_INCLUDE_NETLIB_MAIN_REACTOR_H_
 
+#include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -31,6 +33,8 @@ class MainReactor {
 
   void Run();
   void Stop();
+  // Stops accepting and initiates bounded draining on every SubReactor.
+  bool Drain(std::chrono::milliseconds timeout = std::chrono::seconds(30));
   uint16_t port() const;
 
  private:
@@ -46,6 +50,7 @@ class MainReactor {
   std::size_t next_sub_reactor_ = 0;
   UniqueFd listen_fd_;
   std::unique_ptr<Channel> listener_channel_;
+  std::atomic<bool> stopping_{false};
 };
 
 }  // namespace netlib

@@ -773,14 +773,6 @@ int RunUnorderedResponseTest() {
     ReportFailure("unordered response path did not bypass pipeline ordering");
     success = false;
   }
-  {
-    std::lock_guard<std::mutex> lock(gate_mutex);
-    if (!unordered_queued) {
-      ReportFailure("unordered response was not accepted");
-      success = false;
-    }
-  }
-
   if (client) {
     netlib::platform::ShutdownWrite(client.get());
   }
@@ -790,6 +782,12 @@ int RunUnorderedResponseTest() {
   main_thread.join();
   sub_thread.join();
   worker_pool->Stop();
+  // Socket delivery can finish before the producer resumes from Respond and
+  // publishes unordered_queued. Joining Workers establishes that publication.
+  if (!unordered_queued) {
+    ReportFailure("unordered response was not accepted");
+    success = false;
+  }
   return success ? 0 : 1;
 }
 

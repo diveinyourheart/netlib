@@ -2,8 +2,8 @@
 
 分支：`codex/http2-support`。
 基线：`main`，`16cc2f95b814ebb455abe5cac77820ae74a383c0`。
-执行到第三轮：T01–T04 已验收；T05 依赖接入和 Windows 验证已完成，Linux CI 待执行。
-下一轮先核对 Linux 验证进度，再进入 T06 的原生 HTTP/2 Session 实现。
+执行到第五轮：T01–T07 已完成，本轮新增阶段期限、Worker 取消通知和有期限排空。
+下一轮入口为 T08 的全链路预算与背压，之后才进入 T09 自动选择。
 
 ## 目标和当前边界
 
@@ -44,26 +44,26 @@
   - 每连接一个 Session，只有所属 SubReactor 线程访问；简单协议包装现有 Codec。
   - 引入请求上下文，区分本地任务编号、HTTP/1 pipeline sequence 和 HTTP/2 stream ID。
   - 验收：长度前缀、RPC、HTTP/1 的响应排序、超时和错误行为保持兼容。
-- [ ] **T05：nghttp2 可选依赖**（依赖 T04）
+- [x] **T05：nghttp2 可选依赖**（依赖 T04）
   - 选择并固定稳定版本、明确获取方式和许可证；可选 CMake 开关，缺少依赖时明确报错。
   - 核心头文件不暴露 nghttp2 类型；nghttp2 不负责 socket/TLS I/O。
   - 验收：Windows MinGW/MSVC、Linux 的启用/禁用构建。
-  - 当前：依赖、许可证、离线构建、本机 Windows 验证和 CI 配置已完成；Linux ON/OFF
-    尚未实际运行，因此保留未整体验收的标记，证据见第三轮记录。
+  - 第四轮已核对上轮提交的十项 CI 全部通过，含 Linux Debug/Release ON/OFF，证据见第四轮记录。
 
 ## 第三批：HTTP/2 明文链路
 
-- [ ] **T06：HTTP/2 Session 与完整请求/响应**（依赖 T04、T05）
+- [x] **T06：HTTP/2 Session 与完整请求/响应**（依赖 T04、T05）
   - 处理 preface、SETTINGS/ACK、HPACK、HEADERS/CONTINUATION、DATA、PING。
   - 按 stream 聚合有上限的请求，END_STREAM 后向 Worker 投递完整请求。
   - 响应按 stream 寻址，不经过 HTTP/1 的整连接 pipeline 排序。
   - 基本连接/stream 流控必须从此阶段起正确处理，不允许临时忽略对端窗口。
   - 验收：至少两条 stream 交错请求、乱序完成响应、帧分片和控制帧往返。
-- [ ] **T07：stream 超时、取消和优雅结束**（依赖 T06）
+- [x] **T07：stream 超时、取消和优雅结束**（依赖 T06）
   - 超时接口接收对应请求上下文，结合发送阶段决定错误响应或 RST_STREAM。
   - 收到取消后释放 stream 资源，迟到回复拒绝；其他 stream 可继续使用。
   - GOAWAY、最后接受的 stream ID、排空期限与强制结束分开建模。
   - 验收：超时/响应竞争、取消后回写、单流异常隔离、连接排空。
+  - 第五轮已补齐阶段期限、stop_token、外部 Drain、截止期限与竞争验证，见第五轮记录。
 - [ ] **T08：内存预算和背压闭环**（依赖 T06、T07）
   - 限制并发 stream、解压后 Header、各流正文、待编码输出和连接累计字节数。
   - 接收窗口与缓冲预算关联，整包聚合不能因等 Worker 才归还窗口而卡死。
@@ -94,7 +94,7 @@
 ## 分批完成标准
 
 每批结束更新本清单的状态、改动文件、测试结果和下一批入口。没有通过验收的任务不勾选。
-每轮完成后总结并更新交接上下文，保留已完成轮次的记录；第三轮到 T05 的本机验证为止，
+每轮完成后总结并更新交接上下文，保留已完成轮次的记录；第五轮到 T07 为止，
 不自动继续全部任务。依赖与 TLS 按对应任务阶段引入。
 
 ## 第一批执行记录
@@ -285,3 +285,173 @@ OFF 比第二轮多一项依赖配置测试，ON 另多一项 nghttp2 内存会�
 按用户要求，将前三轮实现、文档和测试整理提交到 codex/http2-support 并推送 origin。
 本日工作到此结束，不继续 T06。下次先检查分支的 GitHub Actions 结果，补充 T05 的
 Linux ON/OFF 证据；通过验收后再更新清单，随后继续上述 T06 入口。
+
+## 第四轮执行记录：T05 收尾与 T06（2026-11-10）
+
+本轮按难度评估完成两项：补齐 T05 验收，以及实现 T06 原生 HTTP/2 Session。
+T06 涉及协议状态、回调生命周期、取消和流控，未合并实施 T09 自动选择，也未将已有
+GOAWAY 基础等同于完成 T07 的有期限排空。
+
+### T05 远端证据
+
+已核对 [Actions 42650782593](https://github.com/diveinyourheart/netlib/actions/runs/42650782593)，
+对应前三轮提交 4da60510a43f2e0208f6495eb20bb4c0e7deb761，十个作业全部 success：
+Ubuntu 24.04 GCC 和 Windows MSVC 的 Debug/Release × ON/OFF，以及 MinGW UCRT64
+Debug ON/OFF。Linux 缺失的实际构建和运行证据已补齐，T05 现可勾选。
+该 CI 结果不覆盖本轮尚未提交的 T06 代码。
+
+### T06 实现及接口决定
+
+- 新增 [http2_session.h](include/netlib/http2_session.h) 和
+  [http2_session.cc](src/http2_session.cc)。工厂 CreateHttp2Session(limits, options)
+  供 CreateWithSession 显式接入；关闭构建功能或选项非法时返回 nullptr。
+  不对长度前缀/RPC/HTTP/1 入口偷偷启用探测。
+- nghttp2 server session 只由 owner Reactor 访问，处理 preface、SETTINGS/ACK、HPACK、
+  HEADERS/CONTINUATION、DATA、PING。每流独立聚合，END_STREAM 后发出 owned 请求，
+  本地 request_id 按完整请求完成顺序分配，与 stream_id 独立。
+- HttpRequestMetadata 新增 scheme/authority，HTTP/2 version 为 HTTP/2；普通 Header 与
+  Body 保留独立所有权。旧 HTTP/1 字段与响应接口保持兼容。
+- 应用仍返回 HttpResponse；按 context 寻址 stream，忽略跨流排序提示，校验/规范化响应
+  Header 和 Content-Length，自动补正文长度，HEAD/204/304 不发正文。拒绝连接专用字段、
+  非法字段值/状态、错误响应类型，重置该流而不是让其他流一起失败。
+- 接收窗口显式 consume，存入有界缓冲或丢弃数据后立即返还信用，解决大请求在初始窗口
+  内收不完的问题。发送遵守 peer 的连接/stream 窗口；零窗口不阻止其他流和控制输入。
+- ProduceOutput 使用 send_callback2 复制到 Session 拥有的输出向量，并支持预算内部分
+  接收；没有跨 nghttp2 调用保存 mem_send2 内部指针。响应正文只移动一次到稳定 Stream
+  对象，已编码字节按 socket 实际发送量消费，流关闭时回收保留正文。
+- 增加每流 Header/Body、并发 stream、Session 正文合计及输入分块限制。Header 预算按
+  name/value + 每项 32 字节计算；超限流不派发业务。流控、部分写和这些基础限制从首版
+  生效，T08 的全链路预算与队列背压仍未完成。
+- SessionInputResult 新增 cancelled_requests；ProtocolSession 增加默认空实现的
+  TakeCancelledRequests，覆盖协议输出阶段产生的关闭事件。Reactor 两处均按保存的
+  RequestContext 复核并取消 timer，取消或超时后的迟到回复不再传给 Session。
+- OnTimeout 当前对尚未回应的流发送 504，保持连接可用；BeginDrain 发 GOAWAY，固定
+  最后接受的 stream，已有流继续收发。响应的 keep_alive=false 或 close_after_write
+  请求进入此会话排空过程，外部 Stop 的行为仍未改成自动排空。
+
+### 验证结果
+
+新增 [http2_factory_test.cc](tests/http2_factory_test.cc)，ON/OFF 都只链接公开 netlib
+目标，验证工厂行为、选项与第三方宏隔离。新增
+[http2_session_test.cc](tests/http2_session_test.cc)，使用真实 nghttp2 客户端内核：
+
+- 内存链路逐字节拆帧，双流交错 Body/END_STREAM 与本地编号分离、乱序完成响应、控制 ACK。
+- 7 字节输出预算与部分写；130000 字节请求及 40000 字节 Header/CONTINUATION；
+  小 stream 窗口耗尽、其他流继续响应、WINDOW_UPDATE 后恢复。
+- Header、单流及连接正文预算，畸形 preface、HEAD、非法应用响应的流隔离。
+- 输入侧 RST 和输出侧 RST 的取消事件，迟到响应、单流 504 与 GOAWAY 完成已有流。
+- 实际 TCP + MainReactor/SubReactor + Worker 链路：双流反序响应；仅一个在途槽时 RST
+  与新请求连续进入，验证旧 context/timer 及时回收；真实 timer 触发 504 后连接继续服务。
+
+本机全量回归：
+
+| 配置 | HTTP/2 OFF | HTTP/2 ON |
+| --- | --- | --- |
+| MinGW Debug | 23/23 | 25/25 |
+| MinGW Release | 23/23 | 25/25 |
+| MSVC Debug | 23/23 | 25/25 |
+
+MSVC OFF 在高并发构建验证中暴露旧无序响应测试的状态发布竞态：收到 socket 响应不代表
+生产者已从 RespondUnordered 返回并发布测试标志。已将相关断言移到 Worker join 之后，
+修正后 MSVC 全量通过。只改测试同步，不改变业务回写语义。MSVC 仍有先前记录的
+FrameMessage payload 参数遮蔽警告。本轮 T06 尚无 Linux 实测，待下一次推送后的 CI 补证据。
+
+接入、元数据、流控、选项与限制见 [http2_session.md](docs/http2_session.md)；README、
+构建/设计/架构文档已同步。clangd 编译数据库已刷新；格式、文档链接/锚点、代码块和
+git diff --check 已检查。本轮改动保留在工作区，未自动提交或 push。
+
+### 下一轮入口：T07
+
+1. 继续当前分支与本轮工作区，先查看 T06 提交后的 CI 结果（如已推送），不要把 T05 的
+   绿色 CI 当成本轮 Linux 验证。
+2. 阅读新 http2_session.md 和协议源码。现有业务 timer 仅从投递 Worker 到接受应用响应，
+   不覆盖 Header/Body 接收、等待发送窗口和最终写出；分开设计这些阶段的超时。
+3. 定义 owner 线程的外部 drain 命令及排空期限，再将服务停止与 BeginDrain/GOAWAY 接通；
+   既有流需要继续 WINDOW_UPDATE/DATA 输入，不能关闭读兴趣后等待它们结束。
+4. 增加请求级取消状态/通知，让 Worker 可感知 RST/超时而停止无效工作；继续保留 Reactor
+   的最终身份复核。对响应/取消/超时竞争、GOAWAY 后新流、排空期限届满进行测试。
+5. 完成 T07 后再推进 T08：把 Worker 持有正文、队列、nghttp2 内部状态与向量容量纳入
+   字节预算，补 Worker 满时的单流拒绝与每轮字节/帧公平性。当前 Submit 失败仍关闭整连接。
+6. T09 再组合已实现的检测器与 HTTP/1/2 Session，实现同端口自适应。CONNECT、trailers、
+   流式业务、1xx 和 server push 当前不支持；不要误报为已支持 HTTPS/gRPC。
+
+## 第五轮执行记录：T07（2026-11-10–11）
+
+本轮完成 T07，不展开 T08/T09。本轮继续在 T06 的未提交工作区上实现，没有覆盖或丢弃
+前轮成果。T06/T07 按 2026-11-11 的收尾要求统一提交并推送；Linux 运行验证待该提交的 CI。
+
+### 实现及接口决定
+
+- ProtocolSession 新增默认无期限的 NextDeadline/OnDeadline。Http2Session 用有序期限表
+  和每流迭代器维护 Header、Body 空闲、响应发送期限；取最早期限 O(1)、更新 O(log N)、
+  删除 O(1)。每连接只挂一个协议/写停滞闹钟，不轮询扫描，也不在 timer 线程操作协议。
+- Header 期限同时覆盖 preface/首个 SETTINGS、半帧和未完成 HPACK Header 块。轻量帧
+  边界计数仅跟踪 9 字节帧头和 payload 长度，不重复解析 HPACK；这些状态无法安全丢弃
+  后继续解码，到期关闭整连接。Body 空闲到期只重置相应流，有效 DATA 进度才刷新期限。
+- 业务超时仍从提交到 owner 接受回复，HTTP/2 返回单流 504；响应接受后另有绝对发送期限，
+  覆盖等待 peer 窗口，过期发 RST。用户态待发输出的 socket 无进展期限是连接级保护。
+  Header 默认 10 秒，Body/响应/写停滞/排空默认 30 秒；业务默认 10 分钟。可配置为
+  (0, 24 小时]，完整含义见 [http2_lifecycle.md](docs/http2_lifecycle.md)。
+- 保存业务绝对截止时间，不能因 moodycamel 跨 producer 乱序让过期回复优先被接受。
+  协议/排空闹钟带 generation，取消后已经选中的旧 callback 只会投递无效控制事件。
+  控制命令复用隐式 producer，不受普通响应队列容量限制；常驻 Worker 显式 token 不变。
+- FrameMessage 新增 stop_token 和 IsCancelled；Reactor 在派发前登记 stop_source/timer，
+  peer RST、超时、关闭、强制排空和 Stop 会通知仍在途 Worker。正常回复被 owner 接受
+  后该业务结束，不再补发取消。FrameMessage 的回写助手先拒绝已取消消息，原始
+  ConnectionHandle 继续保持入队语义，owner 仍作最终复核。
+- MainReactor::Drain(timeout) 停止监听接收，向各 SubReactor 请求有期限排空；也能单独
+  SubReactor::Drain。拒绝新 Adopt，清理未注册描述符，在 owner 中 BeginDrain。
+  重复请求只能缩短期限。既有 HTTP/2 流继续读取 DATA/WINDOW_UPDATE，最后接受的
+  stream ID 不再增加；peer GOAWAY 和会话自身排空也受本地期限限制。
+- 到期强制关闭剩余连接并停止 loop；正常排空结束自动退出。Stop 保持立即停止，Run
+  退出时统一取消 timer/token、清理连接并作废句柄；Main Run 退出解除监听并关闭 socket。
+  Worker 取消是协作式的，网络排空期限不能强行终止忽略取消的业务线程。
+- 新增 platform::SetSendBuffer，用于设置发送缓冲及构造真实写停滞测试。分发/Worker
+  两方向 moodycamel 队列架构、Codec 子类和默认协议入口保持兼容。顺带将回写助手的
+  payload 形参更名，消除之前已记录的 MSVC C4458 遮蔽警告。
+
+### 验收与结果
+
+- 新增 [drain_test.cc](tests/drain_test.cc)，ON/OFF 都运行：完整响应后排空退出、拒绝
+  新 Adopt、重复请求不延长截止时间、强制排空/Stop 的 stop_token 与回调线程、真实
+  socket 写停滞。测试使用小发送缓冲和分块 Codec 输出，避免把 Windows 已接收进
+  内核的超大 send 当作用户态停滞。
+- 专门阻塞测试进程的 TimerScheduler 回调，让超时控制暂时无法送达；不同 producer 的
+  过期回复先进入 owner 后仍触发超时，验证绝对期限复核，而非依赖队列顺序。
+- 扩展 [http2_session_test.cc](tests/http2_session_test.cc)：preface/部分帧头/HPACK 块
+  确定性到期，Body 续传后旧期限不误杀，Body 空闲及零窗口发送超时隔离，GOAWAY 最后
+  stream ID 和新流边界，强制排空期限。真实 TCP 验证外部 Drain 与握手期限调度。
+- 扩展工厂参数边界测试；既有 peer RST、业务 timer 和迟到回写验证增加 token 判定。
+  旧 Codec、HTTP/RPC、线程池、timer 和日志回归全部继续通过。
+
+| 本机配置 | HTTP/2 OFF | HTTP/2 ON |
+| --- | --- | --- |
+| MinGW Debug | 24/24 | 26/26 |
+| MinGW Release | 24/24 | 26/26 |
+| MSVC Debug | 24/24 | 26/26 |
+
+本轮编译没有新增警告，并已消除原有 FrameMessage 参数遮蔽警告。clangd 编译数据库已
+刷新；Google 代码格式、文档本地链接/锚点、代码块和 git diff --check 已检查。
+本轮 T07 与前轮 T06 一起提交推送，不能把 T05 的绿色 Linux CI 当作新代码的运行证据。
+
+### 下一轮明确入口：T08
+
+1. 从 codex/http2-support 的 T06/T07 提交继续，先检查该提交的 CI，再回填 Linux
+   证据。按后续用户指令推进，不要自动把所有后续任务实现或提交。
+2. 阅读 [http2_lifecycle.md](docs/http2_lifecycle.md)、http2_session.md 及新期限/取消代码。
+   stop_source、timer、FrameMessage 所有权和当前 Header/Body 预算都应纳入后续设计。
+3. 目前正文预算按 vector.size 统计，只管 Session 持有的正文，不包含 vector.capacity、
+   Worker/响应队列持有的正文与 nghttp2 内部状态。先设计跨所有权移动的字节预算凭证，
+   避免搬到队列就漏记，也不要在取消通知发出时提前释放 Worker 仍持有的内存预算。
+4. 添加 owner 中的“请求派发拒绝”事件/回调，把 Worker 队列满从整连接关闭改为合适的
+   单流拒绝/重置；仍要消费必要的控制输入，不能等 Worker 完成才返还全部接收窗口。
+5. 为读取、解码、输出、响应命令处理设置每轮预算和继续调度入口；注意 epoll ET 下
+   不能预算用尽就丢掉后续就绪。验证控制洪流、大 Body、慢流、队列饱和与取消后的预算归还。
+6. T08 验收后才进入 T09 的明文自动选择。TLS/ALPN、流式业务、trailers、CONNECT 等
+   尚未实现，不要扩展现有能力声明。
+
+## 本日交接封存（2026-11-11）
+
+按用户要求，将第四、第五轮的 T06/T07 实现、测试与文档统一提交到
+codex/http2-support 并推送远端，今天到此结束。下一轮先核对该提交的 CI，
+再从上面的 T08 入口继续；本机验证结果已记录，尚未取得该提交的 Linux CI 结果。

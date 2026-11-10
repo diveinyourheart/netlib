@@ -47,9 +47,11 @@ both. Reactors arrange their members in that order so Channels are removed
 before descriptors close.
 
 HTTP/2 work is tracked in [HTTP2_TASKS.md](../HTTP2_TASKS.md), with the session
-and protocol-selection design in [http2_design.md](http2_design.md). T01–T04
-provide detection, input-only progress and the Session boundary wired into the
-Reactor. They do not yet negotiate or serve HTTP/2 connections.
+and protocol-selection design in [http2_design.md](http2_design.md). T06 now
+serves explicit cleartext HTTP/2 through CreateHttp2Session; see
+[http2_session.md](http2_session.md). Automatic HTTP/1/2 selection and TLS/ALPN
+remain later work. Stream cancellation removes the matching request timer;
+both input and protocol output may produce cancellation events.
 
 MainReactor owns the listening descriptor and its Channel, but keeps non-owning
 pointers to SubReactors. The server orchestrator must keep every SubReactor
@@ -77,10 +79,13 @@ an empty interest set pauses Channel registration, and resuming creates a fresh
 token. Already buffered input is processed on resume before waiting for more
 socket input. Input allocation is capped even for limits smaller than 4 KiB.
 
-`BeginDrain` is currently a Session hook: CodecSession stops accepting requests
-and waits for accepted responses. It is not wired to an orchestrator shutdown
-command; `SubReactor::Stop` still stops the loop immediately. HTTP/2 GOAWAY,
-stream cancellation, flow control and drain deadlines remain later work.
+`MainReactor::Drain(timeout)` stops accepting and requests bounded draining on
+its SubReactors. `SubReactor::Drain` runs Session::BeginDrain on the owner and
+forces closure at the deadline; HTTP/2 continues control/data input for accepted
+streams. `Stop` remains immediate. In-flight Workers receive stop_token on
+cancellation, timeout or closure. Stage deadlines and a connection's socket
+write stall share one generation-checked alarm. See
+[http2_lifecycle.md](http2_lifecycle.md) for phase semantics and callback rules.
 
 ## Thread handoff
 

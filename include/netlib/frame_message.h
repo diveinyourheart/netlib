@@ -2,6 +2,7 @@
 #define NETLIB_INCLUDE_NETLIB_FRAME_MESSAGE_H_
 
 #include <cstdint>
+#include <stop_token>
 #include <utility>
 #include <vector>
 
@@ -11,7 +12,8 @@
 
 namespace netlib {
 
-// Owns a complete transport frame after it leaves a connection read buffer.
+// Owns one complete protocol request after assembly. Multiplexed protocols may
+// assemble it from several transport frames before dispatching to a Worker.
 struct FrameMessage {
   std::uint64_t connection_id = 0;
   // Zero-based per-connection request order; return it with the response.
@@ -21,25 +23,35 @@ struct FrameMessage {
   std::vector<char> payload;
   // sequence mirrors request_context.request_id for existing handlers.
   RequestContext request_context;
+  // Cooperative cancellation. Callbacks may run in Reactor, or immediately on
+  // registration if already cancelled. Keep them short and nonblocking.
+  std::stop_token stop_token{};
+
+  bool IsCancelled() const { return stop_token.stop_requested(); }
 
   bool Respond(ApplicationResponse response,
                bool close_after_write = false) const {
-    return connection.Respond(sequence, std::move(response), close_after_write);
+    return !IsCancelled() &&
+           connection.Respond(sequence, std::move(response), close_after_write);
   }
-  bool Respond(std::vector<char> payload,
+  bool Respond(std::vector<char> response_payload,
                bool close_after_write = false) const {
-    return connection.Respond(sequence, std::move(payload), close_after_write);
+    return !IsCancelled() &&
+           connection.Respond(sequence, std::move(response_payload),
+                              close_after_write);
   }
   // Skips pipeline response ordering. Use only when the protocol or handler
   // has its own ordering guarantee.
   bool RespondUnordered(ApplicationResponse response,
                         bool close_after_write = false) const {
-    return connection.RespondUnordered(sequence, std::move(response),
+    return !IsCancelled() &&
+           connection.RespondUnordered(sequence, std::move(response),
                                        close_after_write);
   }
-  bool RespondUnordered(std::vector<char> payload,
+  bool RespondUnordered(std::vector<char> response_payload,
                         bool close_after_write = false) const {
-    return connection.RespondUnordered(sequence, std::move(payload),
+    return !IsCancelled() &&
+           connection.RespondUnordered(sequence, std::move(response_payload),
                                        close_after_write);
   }
 };

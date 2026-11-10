@@ -1,10 +1,12 @@
 #ifndef NETLIB_INCLUDE_NETLIB_PROTOCOL_SESSION_H_
 #define NETLIB_INCLUDE_NETLIB_PROTOCOL_SESSION_H_
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -33,6 +35,10 @@ struct SessionInputResult {
   // otherwise this is a total unread-byte target strictly larger than input.
   std::size_t required_bytes = 0;
   std::vector<SessionRequest> requests;
+  // Already-dispatched requests cancelled by the peer/protocol. Reactor removes
+  // their timers; late Worker replies are rejected by its trusted request
+  // table.
+  std::vector<RequestContext> cancelled_requests{};
 };
 
 enum class SessionResponseMode : std::uint8_t { kOrdered, kUnordered };
@@ -57,6 +63,7 @@ struct ProtocolSessionOptions {
 // route by context and apply its own protocol ordering rules.
 class ProtocolSession {
  public:
+  using Clock = std::chrono::steady_clock;
   ProtocolSession() = default;
   ProtocolSession(const ProtocolSession&) = delete;
   ProtocolSession& operator=(const ProtocolSession&) = delete;
@@ -78,6 +85,15 @@ class ProtocolSession {
   // the total PendingOutput, including bytes already buffered. False is fatal.
   // True with empty output may mean waiting for peer input (e.g. a window).
   virtual bool ProduceOutput(std::size_t byte_budget) = 0;
+  // Protocol output can also close/reset streams. Drain these owner-thread
+  // events after ProduceOutput so their timers do not wait for more peer input.
+  virtual std::vector<RequestContext> TakeCancelledRequests() { return {}; }
+  // Owner-thread deadlines. Reactor arms only the earliest deadline, and calls
+  // OnDeadline after validating the alarm generation. No polling thread needed.
+  virtual std::optional<Clock::time_point> NextDeadline() const {
+    return std::nullopt;
+  }
+  virtual void OnDeadline(Clock::time_point) {}
   // The span remains valid until the next non-const Session call. Socket writes
   // consume only bytes actually sent; ConsumeOutput must not exceed span size.
   virtual std::span<const char> PendingOutput() const = 0;

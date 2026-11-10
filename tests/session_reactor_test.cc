@@ -291,9 +291,9 @@ bool RunSessionTest(TestMode mode) {
           std::lock_guard<std::mutex> lock(observation.mutex);
           expired = observation.requests[2];
         }
-        success = expired.Respond(std::vector<char>{'l'}) &&
-                  SendByte(client.get(), '!') &&
-                  ReadExpected(client.get(), "C");
+        success =
+            expired.IsCancelled() && !expired.Respond(std::vector<char>{'l'}) &&
+            SendByte(client.get(), '!') && ReadExpected(client.get(), "C");
       }
     }
   } else {

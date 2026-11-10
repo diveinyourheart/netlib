@@ -1,8 +1,9 @@
 # HTTP/2 设计与分批接入
 
 任务进度和每轮交接统一记录在根目录 [HTTP2_TASKS.md](../HTTP2_TASKS.md)。目前已实现
-T01–T05：协议识别、无业务消息消费、已接入 Reactor 的会话层与旧 Codec 适配，
-以及固定的可选 nghttp2 依赖。T05 的 Linux CI 尚待运行，尚未提供可用 HTTP/2 服务端。
+T01–T07：协议识别、会话层、可选依赖、显式明文 HTTP/2，以及分阶段超时、取消和有期限排空。
+T05 的 Linux CI 已通过；会话接口见 [http2_session.md](http2_session.md)，生命周期见
+[http2_lifecycle.md](http2_lifecycle.md)。
 
 ## 如何自适应版本
 
@@ -60,7 +61,7 @@ T03 的无业务消息消费状态经 T04 的 Codec 适配器映射为会话输�
 
 nghttp2 仅作为协议内核，不承担 socket/TLS I/O。Session 只在所属 Reactor 线程上驱动，
 nghttp2 类型通过实现细节隐藏。T05 已固定 1.71.0 C 静态库，默认不启用；获取与离线构建
-见 [http2_build.md](http2_build.md)。下轮 T06 再将该内核接入原生 Http2Session。
+见 [http2_build.md](http2_build.md)。T06 已将该内核接入原生 Http2Session。
 
 ## 流控与内存
 
@@ -137,6 +138,7 @@ ctest --test-dir build/debug -R "netlib_(http_protocol|reactor)_test" --output-o
 | ShouldClose | 协议请求关闭；Reactor 必须先发送完 PendingOutput |
 | BeginDrain | 进入会话排空状态；旧 Codec 停收新请求，等已接受请求完成，再发送完输出 |
 | MaxInputBufferSize | 限制传输层未消费输入；Session 内部的 stream/body/待编码输出仍需 T08 独立预算 |
+| NextDeadline / OnDeadline | T07 的 owner 期限钩子；Reactor 只为每个连接的最近期限挂闹钟 |
 
 kNeedMore.required_bytes 为总未消费字节目标，必须大于当前输入，或用 0 表示未知。
 kProgress.required_bytes 必须为 0。Reactor 拒绝零进度、消费越界、非法 NeedMore、
@@ -193,9 +195,9 @@ CodecSession 保留 ordered 缓存、unordered 完成占位、关闭策略和输
 HTTP/1 超时仍是排序后的 504 并关闭，长度前缀与 RPC 仍在无安全错误帧时直接关闭。
 原生 Session 可以利用 context 实现单 stream 超时，不必继承整连接关闭策略。
 
-本轮 BeginDrain 只是会话钩子，尚无服务编排层的 drain 命令或 GOAWAY。
-SubReactor::Stop 仍立即结束事件循环。取消事件、Worker 拒绝的流级处理、排空期限
-和请求级有效性复核属于 T07/T08；目前 Submit 失败仍关闭整个连接。
+BeginDrain 在 T04 起是会话钩子；T07 已接入 MainReactor/SubReactor::Drain(timeout)、
+GOAWAY 和排空期限，并向在途 Worker 发布 stop_token 取消。Stop 保留立即停止语义。
+Worker 拒绝的流级处理仍属于 T08，目前 Submit 失败仍关闭整个连接。
 原生 Session 的资源预算和 HTTP/2 正确性不能由 Codec 适配器测试代替。
 
 T04 的验证入口：

@@ -14,6 +14,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <stop_token>
 #include <utility>
 #include <vector>
 
@@ -44,6 +45,8 @@ enum class ResponseMessageKind : std::uint8_t {
   kApplication,
   kUnordered,
   kTimeout,
+  kSessionDeadline,
+  kDrainDeadline,
 };
 
 struct ResponseMessage {
@@ -90,6 +93,13 @@ class SubReactor::ResponseQueue {
             .connection_id = connection_id,
             .sequence = sequence,
         },
+        false);
+  }
+
+  bool EnqueueControl(ResponseMessageKind kind, std::uint64_t connection_id,
+                      std::uint64_t generation) {
+    return EnqueueMessage(
+        {.kind = kind, .connection_id = connection_id, .sequence = generation},
         false);
   }
 
@@ -204,9 +214,12 @@ class SubReactor::Connection {
   bool HasRequestTimerCapacity() const {
     return request_timers_.size() < max_pending_responses_;
   }
-  bool TrackRequestTimer(RequestContext context, TimerScheduler::TimerId id) {
+  bool TrackRequestTimer(RequestContext context, TimerScheduler::TimerId id,
+                         std::stop_source source,
+                         TimerScheduler::Clock::time_point deadline) {
     return request_timers_
-        .emplace(context.request_id, PendingRequest{context, id})
+        .emplace(context.request_id,
+                 PendingRequest{context, id, std::move(source), deadline})
         .second;
   }
   std::optional<RequestContext> FindRequest(std::uint64_t id) const {
@@ -216,11 +229,18 @@ class SubReactor::Connection {
     }
     return request->second.context;
   }
-  TimerScheduler::TimerId TakeRequestTimer(std::uint64_t id) {
+  bool RequestExpired(std::uint64_t id) const {
+    auto request = request_timers_.find(id);
+    return request != request_timers_.end() &&
+           TimerScheduler::Clock::now() >= request->second.deadline;
+  }
+  TimerScheduler::TimerId TakeRequestTimer(std::uint64_t id,
+                                           bool cancel = false) {
     auto request = request_timers_.find(id);
     if (request == request_timers_.end()) {
       return TimerScheduler::kInvalidTimer;
     }
+    if (cancel) request->second.source.request_stop();
     TimerScheduler::TimerId timer_id = request->second.timer_id;
     request_timers_.erase(request);
     return timer_id;
@@ -228,10 +248,16 @@ class SubReactor::Connection {
   std::vector<TimerScheduler::TimerId> TakeRequestTimers() {
     std::vector<TimerScheduler::TimerId> ids;
     ids.reserve(request_timers_.size());
-    for (const auto& [id, request] : request_timers_) {
+    for (auto& [id, request] : request_timers_) {
+      request.source.request_stop();
       ids.push_back(request.timer_id);
     }
     request_timers_.clear();
+    if (alarm_timer_ != TimerScheduler::kInvalidTimer)
+      ids.push_back(alarm_timer_);
+    alarm_timer_ = TimerScheduler::kInvalidTimer;
+    alarm_deadline_.reset();
+    ++alarm_generation_;
     return ids;
   }
 
@@ -257,9 +283,12 @@ class SubReactor::Connection {
   void ClearDecodeTarget() { decode_target_size_ = 0; }
 
  private:
+  friend class SubReactor;
   struct PendingRequest {
     RequestContext context;
     TimerScheduler::TimerId timer_id;
+    std::stop_source source;
+    TimerScheduler::Clock::time_point deadline;
   };
   void MakeWritable(std::size_t min_bytes);
 
@@ -277,6 +306,10 @@ class SubReactor::Connection {
   std::size_t decode_target_size_ = 0;
   std::uint64_t next_request_id_ = 0;
   std::map<std::uint64_t, PendingRequest> request_timers_;
+  std::optional<TimerScheduler::Clock::time_point> alarm_deadline_;
+  std::optional<TimerScheduler::Clock::time_point> write_deadline_;
+  TimerScheduler::TimerId alarm_timer_ = TimerScheduler::kInvalidTimer;
+  std::uint64_t alarm_generation_ = 0;
   bool read_interest_enabled_ = true;
   bool write_interest_enabled_ = false;
 };
@@ -388,7 +421,10 @@ std::unique_ptr<SubReactor> SubReactor::CreateWithSession(
   if (options.max_pending_connections == 0 ||
       options.max_pending_responses == 0 ||
       options.max_pending_output_bytes == 0 ||
-      options.request_timeout <= std::chrono::milliseconds::zero()) {
+      options.request_timeout <= std::chrono::milliseconds::zero() ||
+      options.request_timeout > std::chrono::hours(24) ||
+      options.write_timeout <= std::chrono::milliseconds::zero() ||
+      options.write_timeout > std::chrono::hours(24)) {
     NETLIB_LOG_ERROR("SubReactor option is outside its valid range");
     return nullptr;
   }
@@ -461,6 +497,7 @@ SubReactor::SubReactor(std::unique_ptr<EventLoop> event_loop,
 SubReactor::~SubReactor() {
   response_queue_->Shutdown();
   CancelRequestTimers();
+  for (auto& [id, state] : connections_) state->MarkClosed();
 }
 
 bool SubReactor::AdoptConnection(UniqueFd& connection) {
@@ -469,7 +506,7 @@ bool SubReactor::AdoptConnection(UniqueFd& connection) {
   }
 
   std::lock_guard<std::mutex> lock(pending_mutex_);
-  if (stopping_.load() ||
+  if (stopping_.load() || draining_.load() ||
       pending_connections_.size() >= options_.max_pending_connections) {
     return false;
   }
@@ -484,7 +521,14 @@ bool SubReactor::AdoptConnection(UniqueFd& connection) {
 
 void SubReactor::Run() {
   event_loop_->Run();
+  stopping_.store(true);
+  {
+    std::lock_guard<std::mutex> lock(pending_mutex_);
+    pending_connections_.clear();
+  }
+  response_queue_->Shutdown();
   CancelRequestTimers();
+  while (!connections_.empty()) CloseConnection(connections_.begin()->first);
 }
 
 void SubReactor::Stop() {
@@ -504,19 +548,29 @@ void SubReactor::HandleWake() {
     return;
   }
 
+  ApplyDrain();
+  if (stopping_.load()) return;
   std::deque<UniqueFd> pending;
   {
     std::lock_guard<std::mutex> lock(pending_mutex_);
     pending.swap(pending_connections_);
   }
 
-  while (!pending.empty() && !stopping_.load()) {
+  while (!pending.empty() && !stopping_.load() && !draining_.load()) {
     RegisterConnection(std::move(pending.front()));
     pending.pop_front();
   }
 
   ResponseMessage response;
   while (!stopping_.load() && response_queue_->TryDequeue(response)) {
+    if (response.kind == ResponseMessageKind::kSessionDeadline) {
+      HandleSessionDeadline(response.connection_id, response.sequence);
+      continue;
+    }
+    if (response.kind == ResponseMessageKind::kDrainDeadline) {
+      HandleDrainDeadline(response.sequence);
+      continue;
+    }
     if (response.kind == ResponseMessageKind::kTimeout) {
       HandleRequestTimeout(response.connection_id, response.sequence);
       continue;
@@ -563,6 +617,10 @@ void SubReactor::HandleResponse(std::uint64_t connection_id,
   if (!context.has_value()) {
     return;
   }
+  if (state.RequestExpired(sequence)) {
+    HandleRequestTimeout(connection_id, sequence);
+    return;
+  }
   SessionResponseStatus status = state.session().OnResponse(
       *context, std::move(response), mode, close_after_write);
   TimerScheduler::TimerId timer_id = state.TakeRequestTimer(sequence);
@@ -590,12 +648,132 @@ void SubReactor::HandleRequestTimeout(std::uint64_t connection_id,
   if (!context.has_value()) {
     return;
   }
-  TimerScheduler::TimerId timer_id = state.TakeRequestTimer(sequence);
+  TimerScheduler::TimerId timer_id = state.TakeRequestTimer(sequence, true);
   TimerScheduler::Cancel(timer_id);
   SessionResponseStatus status = state.session().OnTimeout(*context);
   if (status == SessionResponseStatus::kError) {
     NETLIB_LOG_WARN("session timeout failed for connection id={} sequence={}",
                     connection_id, sequence);
+    CloseConnection(connection_id);
+    return;
+  }
+  FlushConnection(connection_id);
+}
+
+bool SubReactor::Drain(std::chrono::milliseconds timeout) {
+  if (timeout <= std::chrono::milliseconds::zero() ||
+      timeout > std::chrono::hours(24))
+    return false;
+  const TimerScheduler::Clock::time_point deadline =
+      TimerScheduler::Clock::now() + timeout;
+  {
+    std::lock_guard<std::mutex> lock(pending_mutex_);
+    if (stopping_.load()) return false;
+    draining_.store(true);
+    if (!requested_drain_deadline_ || deadline < *requested_drain_deadline_) {
+      requested_drain_deadline_ = deadline;
+    }
+  }
+  return Wake();
+}
+
+void SubReactor::ApplyDrain() {
+  std::optional<TimerScheduler::Clock::time_point> requested;
+  std::deque<UniqueFd> discarded;
+  {
+    std::lock_guard<std::mutex> lock(pending_mutex_);
+    requested = requested_drain_deadline_;
+    if (requested) discarded.swap(pending_connections_);
+  }
+  if (!requested || requested == drain_deadline_) return;
+  bool begin = !drain_deadline_;
+  drain_deadline_ = requested;
+  TimerScheduler::Cancel(drain_timer_);
+  std::uint64_t generation = ++drain_generation_;
+  if (TimerScheduler::Clock::now() >= *requested || connections_.empty()) {
+    HandleDrainDeadline(generation);
+    if (connections_.empty()) Stop();
+    return;
+  }
+  std::weak_ptr<ResponseQueue> queue = response_queue_;
+  drain_timer_ = TimerScheduler::ScheduleAt(*requested, [queue, generation] {
+    if (std::shared_ptr<ResponseQueue> target = queue.lock()) {
+      target->EnqueueControl(ResponseMessageKind::kDrainDeadline, 0,
+                             generation);
+    }
+  });
+  if (drain_timer_ == TimerScheduler::kInvalidTimer) {
+    Stop();
+    return;
+  }
+  if (begin) {
+    std::vector<std::uint64_t> ids;
+    ids.reserve(connections_.size());
+    for (const auto& [id, state] : connections_) ids.push_back(id);
+    for (std::uint64_t id : ids) {
+      auto connection = connections_.find(id);
+      if (connection == connections_.end()) continue;
+      connection->second->session().BeginDrain();
+      FlushConnection(id);
+    }
+  }
+}
+
+void SubReactor::HandleDrainDeadline(std::uint64_t generation) {
+  if (generation != drain_generation_ || !drain_deadline_ ||
+      TimerScheduler::Clock::now() < *drain_deadline_)
+    return;
+  while (!connections_.empty()) CloseConnection(connections_.begin()->first);
+  Stop();
+}
+
+void SubReactor::RefreshSessionTimer(std::uint64_t connection_id) {
+  auto connection = connections_.find(connection_id);
+  if (connection == connections_.end()) return;
+  Connection& state = *connection->second;
+  std::optional<TimerScheduler::Clock::time_point> deadline =
+      state.session().NextDeadline();
+  if (state.write_deadline_ &&
+      (!deadline || *state.write_deadline_ < *deadline)) {
+    deadline = state.write_deadline_;
+  }
+  if (deadline == state.alarm_deadline_ &&
+      (!deadline || state.alarm_timer_ != TimerScheduler::kInvalidTimer))
+    return;
+  TimerScheduler::Cancel(state.alarm_timer_);
+  state.alarm_timer_ = TimerScheduler::kInvalidTimer;
+  state.alarm_deadline_ = deadline;
+  std::uint64_t generation = ++state.alarm_generation_;
+  if (!deadline) return;
+  std::weak_ptr<ResponseQueue> queue = response_queue_;
+  state.alarm_timer_ =
+      TimerScheduler::ScheduleAt(*deadline, [queue, connection_id, generation] {
+        if (std::shared_ptr<ResponseQueue> target = queue.lock()) {
+          target->EnqueueControl(ResponseMessageKind::kSessionDeadline,
+                                 connection_id, generation);
+        }
+      });
+  if (state.alarm_timer_ == TimerScheduler::kInvalidTimer)
+    CloseConnection(connection_id);
+}
+
+void SubReactor::HandleSessionDeadline(std::uint64_t connection_id,
+                                       std::uint64_t generation) {
+  auto connection = connections_.find(connection_id);
+  if (connection == connections_.end()) return;
+  Connection& state = *connection->second;
+  if (generation != state.alarm_generation_) return;
+  state.alarm_timer_ = TimerScheduler::kInvalidTimer;
+  TimerScheduler::Clock::time_point now = TimerScheduler::Clock::now();
+  if (state.write_deadline_ && now >= *state.write_deadline_) {
+    CloseConnection(connection_id);
+    return;
+  }
+  state.session().OnDeadline(now);
+  // A broken Session must not reschedule the same expired deadline forever.
+  std::optional<TimerScheduler::Clock::time_point> next =
+      state.session().NextDeadline();
+  if (next && *next <= now && !state.session().ShouldClose()) {
     CloseConnection(connection_id);
     return;
   }
@@ -742,6 +920,7 @@ bool SubReactor::ProcessInput(Connection& connection) {
     SessionInputResult result = connection.session().OnInput(readable);
     if (result.status == SessionInputStatus::kNeedMore) {
       if (result.consumed_bytes != 0 || !result.requests.empty() ||
+          !result.cancelled_requests.empty() ||
           result.required_bytes > connection.session().MaxInputBufferSize() ||
           (result.required_bytes != 0 &&
            result.required_bytes <= readable.size())) {
@@ -757,6 +936,14 @@ bool SubReactor::ProcessInput(Connection& connection) {
     }
     connection.ClearDecodeTarget();
     connection.Consume(result.consumed_bytes);
+    for (const RequestContext& cancelled : result.cancelled_requests) {
+      std::optional<RequestContext> active =
+          connection.FindRequest(cancelled.request_id);
+      if (active.has_value() && *active == cancelled) {
+        TimerScheduler::Cancel(
+            connection.TakeRequestTimer(cancelled.request_id, true));
+      }
+    }
     for (SessionRequest& request : result.requests) {
       if (!connection.HasRequestTimerCapacity() ||
           !connection.AcceptRequestId(request.context.request_id)) {
@@ -765,6 +952,7 @@ bool SubReactor::ProcessInput(Connection& connection) {
       const RequestContext context = request.context;
       std::uint64_t connection_id = connection.connection_id();
       std::uint64_t sequence = context.request_id;
+      std::stop_source source;
       FrameMessage message{
           .connection_id = connection_id,
           .sequence = sequence,
@@ -772,16 +960,13 @@ bool SubReactor::ProcessInput(Connection& connection) {
           .metadata = std::move(request.metadata),
           .payload = std::move(request.payload),
           .request_context = context,
+          .stop_token = source.get_token(),
       };
-      if (!request_submitter_.Submit(std::move(message))) {
-        NETLIB_LOG_WARN("worker queue full for connection id={} sequence={}",
-                        connection_id, sequence);
-        return false;
-      }
       std::weak_ptr<ResponseQueue> weak_response_queue = response_queue_;
-      TimerScheduler::TimerId timer_id = TimerScheduler::ScheduleAfter(
-          options_.request_timeout,
-          [weak_response_queue, connection_id, sequence] {
+      TimerScheduler::Clock::time_point deadline =
+          TimerScheduler::Clock::now() + options_.request_timeout;
+      TimerScheduler::TimerId timer_id = TimerScheduler::ScheduleAt(
+          deadline, [weak_response_queue, connection_id, sequence] {
             std::shared_ptr<ResponseQueue> response_queue =
                 weak_response_queue.lock();
             if (response_queue != nullptr) {
@@ -795,8 +980,14 @@ bool SubReactor::ProcessInput(Connection& connection) {
             connection_id, sequence);
         return false;
       }
-      if (!connection.TrackRequestTimer(context, timer_id)) {
+      if (!connection.TrackRequestTimer(context, timer_id, std::move(source),
+                                        deadline)) {
         TimerScheduler::Cancel(timer_id);
+        return false;
+      }
+      if (!request_submitter_.Submit(std::move(message))) {
+        NETLIB_LOG_WARN("worker queue full for connection id={} sequence={}",
+                        connection_id, sequence);
         return false;
       }
     }
@@ -827,17 +1018,31 @@ void SubReactor::FlushConnection(std::uint64_t connection_id) {
       CloseConnection(connection_id);
       return;
     }
+    for (const RequestContext& cancelled : session.TakeCancelledRequests()) {
+      std::optional<RequestContext> active =
+          state.FindRequest(cancelled.request_id);
+      if (active.has_value() && *active == cancelled) {
+        TimerScheduler::Cancel(
+            state.TakeRequestTimer(cancelled.request_id, true));
+      }
+    }
     std::span<const char> output = session.PendingOutput();
     if (output.size() > options_.max_pending_output_bytes) {
       CloseConnection(connection_id);
       return;
     }
     if (output.empty()) {
+      state.write_deadline_.reset();
       break;
     }
+    if (!state.write_deadline_)
+      state.write_deadline_ =
+          TimerScheduler::Clock::now() + options_.write_timeout;
     std::ptrdiff_t result =
         platform::Send(state.fd(), output.data(), output.size());
     if (result > 0) {
+      state.write_deadline_ =
+          TimerScheduler::Clock::now() + options_.write_timeout;
       session.ConsumeOutput(static_cast<std::size_t>(result));
       continue;
     }
@@ -847,6 +1052,8 @@ void SubReactor::FlushConnection(std::uint64_t connection_id) {
     if (result < 0 && platform::WouldBlock(platform::LastError())) {
       if (!state.UpdateInterest(true)) {
         CloseConnection(connection_id);
+      } else {
+        RefreshSessionTimer(connection_id);
       }
       return;
     }
@@ -857,10 +1064,14 @@ void SubReactor::FlushConnection(std::uint64_t connection_id) {
   }
   if (session.ShouldClose() || !state.UpdateInterest(false)) {
     CloseConnection(connection_id);
+  } else {
+    RefreshSessionTimer(connection_id);
   }
 }
 
 void SubReactor::CancelRequestTimers() {
+  TimerScheduler::Cancel(drain_timer_);
+  drain_timer_ = TimerScheduler::kInvalidTimer;
   for (auto& entry : connections_) {
     std::vector<TimerScheduler::TimerId> timer_ids =
         entry.second->TakeRequestTimers();
@@ -887,6 +1098,7 @@ void SubReactor::CloseConnection(std::uint64_t connection_id) {
     callbacks_.on_closed(fd);
   }
   connections_.erase(connection);
+  if (drain_deadline_.has_value() && connections_.empty()) Stop();
 }
 
 }  // namespace netlib
