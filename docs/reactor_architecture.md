@@ -87,6 +87,14 @@ cancellation, timeout or closure. Stage deadlines and a connection's socket
 write stall share one generation-checked alarm. See
 [http2_lifecycle.md](http2_lifecycle.md) for phase semantics and callback rules.
 
+T08 bounds read/write bytes and decode calls per connection and poll turn, and
+response commands per SubReactor turn. Owner-only EventLoop::Defer combines
+connection continuations and polls readiness between batches, including on epoll
+ET. HTTP/2 can refuse a dispatch with REFUSED_STREAM without closing other streams.
+Memory reservations follow requests into Workers and responses into Sessions;
+cancellation does not release still-owned bytes. See
+[http2_backpressure.md](http2_backpressure.md) for capacities and application boundaries.
+
 ## Thread handoff
 
 The MainReactor thread appends an accepted descriptor to the SubReactor queue

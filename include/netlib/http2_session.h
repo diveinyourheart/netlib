@@ -14,10 +14,12 @@ struct Http2SessionOptions {
   // Decoded name/value bytes plus 32 bytes per field, including pseudo-fields.
   std::size_t max_header_bytes = 64 * 1024;
   std::size_t max_body_bytes = 16 * 1024 * 1024;
-  // Session-owned request and response bodies share this connection budget.
-  // Bodies already moved to Workers are governed by the Worker queue instead.
+  // Logical aggregate of Session-owned body sizes, separate from capacity.
   std::size_t max_buffered_body_bytes = 32 * 1024 * 1024;
   std::size_t max_input_chunk_bytes = 16 * 1024;
+  // Allocation capacities across Session, Worker-held requests, queued replies
+  // and nghttp2. Moving a request to a Worker does not return this credit.
+  std::size_t max_memory_bytes = 64 * 1024 * 1024;
   // Positive and at most 24 hours. Header also bounds preface/SETTINGS and
   // incomplete wire frames. Body is idle time; response is an absolute deadline
   // from application acceptance to serialization. Reactor bounds socket stalls.

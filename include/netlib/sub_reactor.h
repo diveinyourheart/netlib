@@ -39,6 +39,11 @@ struct SubReactorOptions {
   // Fixed wait for peer EOF after graceful TCP write shutdown (0 < time <=
   // 24h).
   std::chrono::milliseconds close_timeout = std::chrono::seconds(5);
+  std::size_t max_queued_response_bytes = 64 * 1024 * 1024;
+  std::size_t max_read_bytes_per_turn = 64 * 1024;
+  std::size_t max_write_bytes_per_turn = 64 * 1024;
+  std::size_t max_decode_calls_per_turn = 64;
+  std::size_t max_response_commands_per_turn = 64;
 };
 
 // Owns accepted connections, protocol sessions, and nonblocking read/write
@@ -106,7 +111,8 @@ class SubReactor {
   void RegisterConnection(UniqueFd connection);
   void HandleReadable(std::uint64_t connection_id);
   void HandleWritable(std::uint64_t connection_id);
-  bool ProcessInput(Connection& connection);
+  bool ProcessInput(Connection& connection, std::size_t& calls);
+  void ContinueConnection(std::uint64_t connection_id, bool read, bool write);
   void HandleApplicationResponse(std::uint64_t connection_id,
                                  std::uint64_t sequence,
                                  ApplicationResponse response,
@@ -148,6 +154,9 @@ class SubReactor {
   std::optional<TimerScheduler::Clock::time_point> drain_deadline_;
   TimerScheduler::TimerId drain_timer_ = TimerScheduler::kInvalidTimer;
   std::uint64_t drain_generation_ = 0;
+  bool response_continuation_ = false;
+  std::uint64_t response_turn_ = 0;
+  std::size_t response_commands_ = 0;
 };
 
 }  // namespace netlib

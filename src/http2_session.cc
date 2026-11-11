@@ -8,6 +8,7 @@
 #include <cassert>
 #include <charconv>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -19,8 +20,63 @@
 #include <variant>
 #include <vector>
 
+#include "netlib/message_memory.h"
+
 namespace netlib {
 namespace {
+
+struct alignas(std::max_align_t) Allocation {
+  std::size_t bytes;
+};
+void* Allocate(std::size_t size, void* data) {
+  MemoryBudget& budget = *static_cast<MemoryBudget*>(data);
+  if (size > std::numeric_limits<std::size_t>::max() - sizeof(Allocation))
+    return nullptr;
+  std::size_t bytes = size + sizeof(Allocation);
+  if (!budget.TryAcquire(bytes)) return nullptr;
+  Allocation* allocation = static_cast<Allocation*>(std::malloc(bytes));
+  if (!allocation) {
+    budget.Release(bytes);
+    return nullptr;
+  }
+  allocation->bytes = bytes;
+  return allocation + 1;
+}
+void Deallocate(void* pointer, void* data) {
+  if (!pointer) return;
+  Allocation* allocation = static_cast<Allocation*>(pointer) - 1;
+  static_cast<MemoryBudget*>(data)->Release(allocation->bytes);
+  std::free(allocation);
+}
+void* AllocateZero(std::size_t count, std::size_t size, void* data) {
+  if (size != 0 && count > std::numeric_limits<std::size_t>::max() / size)
+    return nullptr;
+  void* result = Allocate(count * size, data);
+  if (result) std::memset(result, 0, count * size);
+  return result;
+}
+void* Reallocate(void* pointer, std::size_t size, void* data) {
+  if (!pointer) return Allocate(size, data);
+  if (size == 0) {
+    Deallocate(pointer, data);
+    return nullptr;
+  }
+  if (size > std::numeric_limits<std::size_t>::max() - sizeof(Allocation))
+    return nullptr;
+  MemoryBudget& budget = *static_cast<MemoryBudget*>(data);
+  Allocation* old = static_cast<Allocation*>(pointer) - 1;
+  const std::size_t previous = old->bytes;
+  const std::size_t bytes = size + sizeof(Allocation);
+  if (bytes > previous && !budget.TryAcquire(bytes - previous)) return nullptr;
+  Allocation* result = static_cast<Allocation*>(std::realloc(old, bytes));
+  if (!result) {
+    if (bytes > previous) budget.Release(bytes - previous);
+    return nullptr;
+  }
+  if (bytes < previous) budget.Release(previous - bytes);
+  result->bytes = bytes;
+  return result + 1;
+}
 
 bool IsConnectionField(std::string_view name) {
   return name == "connection" || name == "keep-alive" ||
@@ -31,7 +87,12 @@ bool IsConnectionField(std::string_view name) {
 class Http2Session final : public ProtocolSession {
  public:
   Http2Session(ProtocolSessionOptions limits, Http2SessionOptions options)
-      : limits_(limits), options_(options) {}
+      : limits_(limits),
+        options_(options),
+        memory_(std::make_shared<MemoryBudget>(options.max_memory_bytes)),
+        control_memory_(MemoryReservation::Acquire(
+            memory_, options.max_concurrent_streams * 1024)),
+        output_memory_(MemoryReservation::Acquire(memory_, 0)) {}
   ~Http2Session() override { nghttp2_session_del(session_); }
   bool Initialize();
   SessionInputResult OnInput(std::span<const char> input) override;
@@ -41,9 +102,22 @@ class Http2Session final : public ProtocolSession {
                                    bool close_after_write) override;
   SessionResponseStatus OnTimeout(const RequestContext& context) override;
   void BeginDrain() override;
+  SessionResponseStatus OnDispatchRejected(
+      const RequestContext& context) override {
+    if (Find(context) == nullptr) return SessionResponseStatus::kStale;
+    return context.stream_id &&
+                   Reject(static_cast<std::int32_t>(*context.stream_id),
+                          NGHTTP2_REFUSED_STREAM) == 0
+               ? SessionResponseStatus::kQueued
+               : SessionResponseStatus::kError;
+  }
+  std::shared_ptr<MemoryBudget> memory_budget() const override {
+    return memory_;
+  }
   std::optional<Clock::time_point> NextDeadline() const override;
   void OnDeadline(Clock::time_point now) override;
   bool ProduceOutput(std::size_t byte_budget) override;
+  bool SupportsOutputChunks() const override { return true; }
   std::vector<RequestContext> TakeCancelledRequests() override {
     std::vector<RequestContext> result;
     result.swap(cancelled_requests_);
@@ -81,6 +155,7 @@ class Http2Session final : public ProtocolSession {
     std::vector<char> response_body;
     std::size_t response_offset = 0;
     std::size_t header_bytes = 0;
+    std::size_t metadata_bytes = 0;
     RequestContext context;
     bool dispatched = false;
     bool responded = false;
@@ -88,6 +163,9 @@ class Http2Session final : public ProtocolSession {
     bool headers_received = false;
     Stage stage = Stage::kHeaders;
     std::optional<Deadlines::iterator> deadline;
+    bool head_request = false;
+    std::shared_ptr<MemoryReservation> request_memory;
+    std::shared_ptr<MemoryReservation> response_memory;
   };
 
   static Http2Session& Self(void* data) {
@@ -123,6 +201,10 @@ class Http2Session final : public ProtocolSession {
 
   const ProtocolSessionOptions limits_;
   const Http2SessionOptions options_;
+  const std::shared_ptr<MemoryBudget> memory_;
+  // Fixed conservative allowance for bounded C++ stream/index/event storage.
+  const std::shared_ptr<MemoryReservation> control_memory_;
+  const std::shared_ptr<MemoryReservation> output_memory_;
   nghttp2_session* session_ = nullptr;
   std::unordered_map<std::int32_t, std::unique_ptr<Stream>> streams_;
   std::unordered_map<std::uint64_t, std::int32_t> requests_;
@@ -147,6 +229,7 @@ class Http2Session final : public ProtocolSession {
 };
 
 bool Http2Session::Initialize() {
+  if (!control_memory_) return false;
   handshake_deadline_ = Clock::now() + options_.header_timeout;
   nghttp2_session_callbacks* callbacks = nullptr;
   if (nghttp2_session_callbacks_new(&callbacks) != 0) return false;
@@ -165,8 +248,10 @@ bool Http2Session::Initialize() {
   nghttp2_option_set_no_auto_window_update(settings, 1);
   nghttp2_option_set_max_send_header_block_length(settings,
                                                   options_.max_header_bytes);
-  int result =
-      nghttp2_session_server_new2(&session_, callbacks, this, settings);
+  nghttp2_mem allocator{memory_.get(), Allocate, Deallocate, AllocateZero,
+                        Reallocate};
+  int result = nghttp2_session_server_new3(&session_, callbacks, this, settings,
+                                           &allocator);
   nghttp2_option_del(settings);
   nghttp2_session_callbacks_del(callbacks);
   if (result != 0) return false;
@@ -175,8 +260,12 @@ bool Http2Session::Initialize() {
        static_cast<std::uint32_t>(options_.max_concurrent_streams)},
       {NGHTTP2_SETTINGS_MAX_HEADER_LIST_SIZE,
        static_cast<std::uint32_t>(options_.max_header_bytes)},
+      {NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE,
+       static_cast<std::uint32_t>(std::min(
+           {std::size_t{65535}, options_.max_body_bytes,
+            options_.max_buffered_body_bytes, options_.max_memory_bytes / 2}))},
   };
-  return nghttp2_submit_settings(session_, NGHTTP2_FLAG_NONE, entries, 2) == 0;
+  return nghttp2_submit_settings(session_, NGHTTP2_FLAG_NONE, entries, 3) == 0;
 }
 
 Http2Session::Stream* Http2Session::Find(std::int32_t id) {
@@ -200,7 +289,9 @@ int Http2Session::Reject(std::int32_t id, std::uint32_t error) {
     SetDeadline(id, *stream, std::nullopt);
     stream->rejected = true;
     body_bytes_ -= stream->body.size();
-    stream->body.clear();
+    std::vector<char>().swap(stream->body);
+    stream->metadata = HttpRequestMetadata{};
+    stream->request_memory.reset();
   }
   return nghttp2_submit_rst_stream(session_, NGHTTP2_FLAG_NONE, id, error) == 0
              ? 0
@@ -220,6 +311,10 @@ int Http2Session::BeginHeaders(nghttp2_session*, const nghttp2_frame* frame,
     return self.Reject(id, NGHTTP2_REFUSED_STREAM);
   }
   std::unique_ptr<Stream> stream = std::make_unique<Stream>();
+  stream->metadata_bytes = RetainedBytes(stream->metadata);
+  stream->request_memory = MemoryReservation::Acquire(
+      self.memory_, sizeof(SessionRequest) + stream->metadata_bytes);
+  if (!stream->request_memory) return self.Reject(id, NGHTTP2_REFUSED_STREAM);
   self.SetDeadline(id, *stream, Clock::now() + self.options_.header_timeout);
   self.streams_.emplace(id, std::move(stream));
   self.last_accepted_stream_ = std::max(self.last_accepted_stream_, id);
@@ -239,18 +334,39 @@ int Http2Session::Header(nghttp2_session*, const nghttp2_frame* frame,
     return self.Reject(frame->hd.stream_id, NGHTTP2_ENHANCE_YOUR_CALM);
   }
   stream->header_bytes += name_size + value_size + 32;
+  // Reserve before growing strings/header slots, then charge actual capacity.
+  if (!stream->request_memory->Resize(
+          stream->request_memory->size() + 2 * (name_size + value_size) +
+          2 * (stream->metadata.headers.capacity() + 1) * sizeof(HttpHeader) +
+          128))
+    return self.Reject(frame->hd.stream_id, NGHTTP2_ENHANCE_YOUR_CALM);
   std::string_view field(reinterpret_cast<const char*>(name), name_size);
   std::string text(reinterpret_cast<const char*>(value), value_size);
+  std::string* pseudo = nullptr;
   if (field == ":method")
-    stream->metadata.method = std::move(text);
+    pseudo = &stream->metadata.method;
   else if (field == ":path")
-    stream->metadata.target = std::move(text);
+    pseudo = &stream->metadata.target;
   else if (field == ":scheme")
-    stream->metadata.scheme = std::move(text);
+    pseudo = &stream->metadata.scheme;
   else if (field == ":authority")
-    stream->metadata.authority = std::move(text);
-  else
+    pseudo = &stream->metadata.authority;
+  if (pseudo) {
+    stream->metadata_bytes -= pseudo->capacity() + 1;
+    *pseudo = std::move(text);
+    stream->metadata_bytes += pseudo->capacity() + 1;
+  } else {
+    const std::size_t slots = stream->metadata.headers.capacity();
     stream->metadata.headers.push_back({std::string(field), std::move(text)});
+    const HttpHeader& header = stream->metadata.headers.back();
+    stream->metadata_bytes +=
+        (stream->metadata.headers.capacity() - slots) * sizeof(HttpHeader) +
+        header.name.capacity() + header.value.capacity() + 2;
+  }
+  if (!stream->request_memory->Resize(sizeof(SessionRequest) +
+                                      stream->metadata_bytes +
+                                      stream->body.capacity()))
+    return self.Reject(frame->hd.stream_id, NGHTTP2_ENHANCE_YOUR_CALM);
   return 0;
 }
 
@@ -268,8 +384,27 @@ int Http2Session::Data(nghttp2_session*, std::uint8_t, std::int32_t id,
         size > self.options_.max_buffered_body_bytes - self.body_bytes_) {
       if (self.Reject(id, NGHTTP2_ENHANCE_YOUR_CALM) != 0) return self.Fatal();
     } else {
-      stream->body.insert(stream->body.end(), bytes, bytes + size);
-      self.body_bytes_ += size;
+      if (stream->body.size() + size > stream->body.capacity()) {
+        std::size_t capacity = std::min(
+            self.options_.max_body_bytes,
+            std::max(stream->body.size() + size, stream->body.capacity() * 2));
+        if (!stream->request_memory->Resize(
+                sizeof(SessionRequest) + stream->metadata_bytes + capacity)) {
+          if (self.Reject(id, NGHTTP2_ENHANCE_YOUR_CALM) != 0)
+            return self.Fatal();
+        } else {
+          stream->body.reserve(capacity);
+          if (!stream->request_memory->Resize(sizeof(SessionRequest) +
+                                              stream->metadata_bytes +
+                                              stream->body.capacity()))
+            if (self.Reject(id, NGHTTP2_ENHANCE_YOUR_CALM) != 0)
+              return self.Fatal();
+        }
+      }
+      if (!stream->rejected) {
+        stream->body.insert(stream->body.end(), bytes, bytes + size);
+        self.body_bytes_ += size;
+      }
     }
   }
   // Return credit after bounded storage/discard, not only after END_STREAM.
@@ -335,9 +470,15 @@ SessionInputResult Http2Session::OnInput(std::span<const char> input) {
     return result;
   }
   completed_streams_.clear();
+  // At most one framing fragment per call. Combined with Reactor's decode-call
+  // budget, even zero-payload control frames cannot run an unbounded callback.
+  std::size_t fragment = preface_remaining_ != 0 ? preface_remaining_
+                         : frame_header_size_ < frame_header_.size()
+                             ? frame_header_.size() - frame_header_size_
+                             : frame_payload_remaining_;
   nghttp2_ssize consumed = nghttp2_session_mem_recv2(
       session_, reinterpret_cast<const std::uint8_t*>(input.data()),
-      std::min(input.size(), options_.max_input_chunk_bytes));
+      std::min({input.size(), options_.max_input_chunk_bytes, fragment}));
   result.cancelled_requests = TakeCancelledRequests();
   if (consumed <= 0 || failed_) {
     failed_ = true;
@@ -361,11 +502,10 @@ SessionInputResult Http2Session::OnInput(std::span<const char> input) {
     stream->metadata.content_length = stream->body.size();
     body_bytes_ -= stream->body.size();
     requests_.emplace(stream->context.request_id, id);
+    stream->head_request = stream->metadata.method == "HEAD";
     result.requests.push_back({stream->context, std::move(stream->metadata),
-                               std::move(stream->body)});
-    // Preserve only the request method needed to encode HEAD responses.
-    stream->metadata.method =
-        std::get<HttpRequestMetadata>(result.requests.back().metadata).method;
+                               std::move(stream->body),
+                               std::move(stream->request_memory)});
   }
   return result;
 }
@@ -376,6 +516,15 @@ nghttp2_ssize Http2Session::Send(nghttp2_session*, const std::uint8_t* bytes,
   std::size_t accepted =
       std::min(size, self.output_budget_ - self.output_.size());
   if (accepted == 0) return NGHTTP2_ERR_WOULDBLOCK;
+  if (self.output_.size() + accepted > self.output_.capacity()) {
+    std::size_t capacity = std::min(
+        self.output_budget_,
+        std::max(self.output_.size() + accepted, self.output_.capacity() * 2));
+    if (!self.output_memory_->Resize(capacity)) return self.Fatal();
+    self.output_.reserve(capacity);
+    if (!self.output_memory_->Resize(self.output_.capacity()))
+      return self.Fatal();
+  }
   self.output_.insert(self.output_.end(), bytes, bytes + accepted);
   return static_cast<nghttp2_ssize>(accepted);
 }
@@ -433,7 +582,12 @@ SessionResponseStatus Http2Session::OnResponse(const RequestContext& context,
       http->body.size() > options_.max_buffered_body_bytes - body_bytes_) {
     return reject();
   }
-  bool head = stream->metadata.method == "HEAD";
+  if (!http->memory || http->memory->budget() != memory_ ||
+      http->memory->size() < RetainedBytes(response))
+    http->memory = MemoryReservation::Acquire(memory_, RetainedBytes(response));
+  if (!http->memory) return reject();
+  stream->response_memory = std::move(http->memory);
+  bool head = stream->head_request;
   bool no_body = http->status_code == 204 || http->status_code == 304;
   if (no_body && !http->body.empty()) return reject();
   std::string status = std::to_string(http->status_code);
@@ -611,6 +765,7 @@ std::unique_ptr<ProtocolSession> CreateHttp2Session(
       options.max_body_bytes == 0 || options.max_buffered_body_bytes == 0 ||
       options.max_input_chunk_bytes == 0)
     return nullptr;
+  if (options.max_memory_bytes == 0) return nullptr;
   for (std::chrono::milliseconds timeout :
        {options.header_timeout, options.body_idle_timeout,
         options.response_timeout, options.drain_timeout}) {
@@ -622,6 +777,8 @@ std::unique_ptr<ProtocolSession> CreateHttp2Session(
   options.max_concurrent_streams =
       std::min({options.max_concurrent_streams, limits.max_pending_responses,
                 std::size_t{0x7fffffff}});
+  if (options.max_concurrent_streams > options.max_memory_bytes / 1024)
+    return nullptr;
   std::unique_ptr<Http2Session> session =
       std::make_unique<Http2Session>(limits, options);
   return session->Initialize() ? std::move(session) : nullptr;

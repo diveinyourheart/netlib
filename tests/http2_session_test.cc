@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -375,7 +376,7 @@ bool SendClient(Client& client, netlib::SocketHandle socket) {
 }
 
 bool RunTcpTest(bool cancel, bool timeout, bool drain = false,
-                std::size_t read_chunk = 4096) {
+                std::size_t read_chunk = 4096, std::size_t ping_count = 0) {
   std::mutex mutex;
   std::condition_variable condition;
   std::vector<netlib::FrameMessage> requests;
@@ -393,7 +394,11 @@ bool RunTcpTest(bool cancel, bool timeout, bool drain = false,
   netlib::SubReactorOptions options{
       .max_pending_responses = cancel ? 1U : 2U,
       .request_timeout = timeout ? std::chrono::milliseconds(150)
-                                 : std::chrono::milliseconds(5000)};
+                                 : std::chrono::milliseconds(5000),
+      .max_read_bytes_per_turn = 17,
+      .max_write_bytes_per_turn = 7,
+      .max_decode_calls_per_turn = 1,
+      .max_response_commands_per_turn = 1};
   netlib::SubReactor::ConnectionCallbacks callbacks;
   callbacks.on_closed = [&](netlib::SocketHandle) {
     std::lock_guard<std::mutex> lock(mutex);
@@ -423,6 +428,10 @@ bool RunTcpTest(bool cancel, bool timeout, bool drain = false,
       socket && netlib::platform::SetReceiveTimeout(socket.get(), 2000) &&
       netlib::platform::ConnectLoopback(socket.get(), main->port()) &&
       client.Initialize();
+  const std::array<std::uint8_t, 8> ping{};
+  for (std::size_t i = 0; success && i < ping_count; ++i)
+    success = nghttp2_submit_ping(client.session, NGHTTP2_FLAG_NONE,
+                                  ping.data()) == 0;
   std::int32_t first = success ? client.Request("/cancel") : -1;
   if (!cancel && !timeout && success) success = client.Request("/two") == 3;
   success = success && first > 0 && SendClient(client, socket.get());
@@ -467,10 +476,9 @@ bool RunTcpTest(bool cancel, bool timeout, bool drain = false,
   if (success && drain) success = main->Drain(std::chrono::seconds(2));
   if (success) {
     success = expired.sequence == 0 && replacement.Respond(Reply("done"));
-    if (!cancel)
-      success = success && (timeout ? expired.IsCancelled() &&
-                                          !expired.Respond(Reply("late"))
-                                    : expired.Respond(Reply("first")));
+    if (timeout)
+      success =
+          success && expired.IsCancelled() && !expired.Respond(Reply("late"));
     if (cancel) success = success && expired.IsCancelled();
   }
   // Hold the SETTINGS ACK until after FIN, and fragment every frame. A full
@@ -489,6 +497,10 @@ bool RunTcpTest(bool cancel, bool timeout, bool drain = false,
               (delayed_ack || SendClient(client, socket.get()));
   }
   if (success && !cancel && !timeout) {
+    // Prove stream 3 can complete while stream 1 still awaits its application.
+    // Once both are ready, nghttp2 may interleave their DATA under small
+    // slices.
+    success = expired.Respond(Reply("first"));
     for (int i = 0; success && i != 4096 && !client.replies[first].complete;
          ++i) {
       std::ptrdiff_t count =
@@ -508,6 +520,7 @@ bool RunTcpTest(bool cancel, bool timeout, bool drain = false,
   success = success && client.replies[3].complete &&
             client.replies[3].body == "done" && replacement.sequence == 1 &&
             replacement.request_context.stream_id == 3;
+  success = success && client.ping_acks == static_cast<int>(ping_count);
   if (success && drain) {
     std::ptrdiff_t count =
         netlib::platform::Receive(socket.get(), bytes.data(), bytes.size());
@@ -533,14 +546,18 @@ bool RunTcpTest(bool cancel, bool timeout, bool drain = false,
   }
   if (!success) {
     std::lock_guard<std::mutex> lock(mutex);
-    std::fprintf(stderr,
-                 "TCP state: cancel=%d timeout=%d drain=%d chunk=%zu "
-                 "requests=%zu stopped=%d goaways=%d last_stream=%d "
-                 "first_complete=%d second_complete=%d cancelled=%d/%d\n",
-                 cancel, timeout, drain, read_chunk, requests.size(), stopped,
-                 client.goaways, client.last_goaway_stream,
-                 client.replies[first].complete, client.replies[3].complete,
-                 expired.IsCancelled(), replacement.IsCancelled());
+    std::fprintf(
+        stderr,
+        "TCP state: cancel=%d timeout=%d drain=%d chunk=%zu "
+        "requests=%zu stopped=%d goaways=%d last_stream=%d "
+        "first_complete=%d second_complete=%d cancelled=%d/%d "
+        "first_completed_stream=%d closed=%d\n",
+        cancel, timeout, drain, read_chunk, requests.size(), stopped,
+        client.goaways, client.last_goaway_stream,
+        client.replies[first].complete, client.replies[3].complete,
+        expired.IsCancelled(), replacement.IsCancelled(),
+        client.completion_order.empty() ? -1 : client.completion_order.front(),
+        closed);
   }
   socket.Reset();
   main->Stop();
@@ -556,6 +573,7 @@ bool TestTcpCancellation() { return RunTcpTest(true, false); }
 bool TestTcpTimeout() { return RunTcpTest(false, true); }
 bool TestTcpDrain() { return RunTcpTest(false, false, true); }
 bool TestTcpDrainDelayedAck() { return RunTcpTest(false, false, true, 1); }
+bool TestTcpControlFlood() { return RunTcpTest(false, false, false, 1, 200); }
 
 bool TestPhaseDeadlines() {
   std::unique_ptr<netlib::ProtocolSession> preface =
@@ -771,6 +789,173 @@ bool TestConnectionBudgetAndProtocolReset() {
   return h.Pump() && h.client.replies[next].body == "ok";
 }
 
+bool TestRetainedAllocationBudget() {
+  if (netlib::CreateHttp2Session({}, {.max_memory_bytes = 1})) return false;
+  Harness h;
+  h.server = netlib::CreateHttp2Session({}, {.max_memory_bytes = 256 * 1024});
+  if (!h.server || !h.client.Initialize() || !h.Pump()) return false;
+  std::shared_ptr<netlib::MemoryBudget> budget = h.server->memory_budget();
+  const std::int32_t first =
+      h.client.Request("/retained", std::string(20000, 'a'));
+  if (!h.Pump() || h.requests.size() != 1 || !h.requests[0].memory ||
+      h.requests[0].memory->size() < h.requests[0].payload.capacity())
+    return false;
+  const std::size_t request_charge = h.requests[0].memory->size();
+  if (nghttp2_submit_rst_stream(h.client.session, NGHTTP2_FLAG_NONE, first,
+                                NGHTTP2_CANCEL) != 0 ||
+      !h.Pump())
+    return false;
+  // Reset and even destruction of the Session must not return Worker-held data.
+  h.server.reset();
+  if (budget->used() != request_charge) return false;
+  h.requests.clear();
+  if (budget->used() != 0) return false;
+
+  Harness response;
+  response.server =
+      netlib::CreateHttp2Session({}, {.max_memory_bytes = 256 * 1024});
+  if (!response.client.Initialize() || !response.Pump()) return false;
+  const std::int32_t rejected = response.client.Request("/oversized-capacity");
+  const std::int32_t survivor = response.client.Request("/survivor");
+  if (!response.Pump() || response.requests.size() != 2) return false;
+  netlib::HttpResponse large = Reply("x");
+  large.body.reserve(256 * 1024);
+  response.server->OnResponse(response.requests[0].context, std::move(large),
+                              netlib::SessionResponseMode::kOrdered, false);
+  response.server->OnResponse(response.requests[1].context, Reply("ok"),
+                              netlib::SessionResponseMode::kOrdered, false);
+  return response.Pump() && response.client.replies[rejected].reset != 0 &&
+         response.client.replies[survivor].body == "ok" &&
+         !response.server->ShouldClose();
+}
+
+bool TestTcpQueueSaturation() {
+  std::mutex mutex;
+  std::condition_variable condition;
+  bool release = false;
+  int entered = 0;
+  std::atomic<bool> large_rejected{false};
+  std::unique_ptr<netlib::ThreadPool> workers =
+      netlib::ThreadPool::Create(1, 1, [&](netlib::FrameMessage message) {
+        {
+          std::unique_lock<std::mutex> lock(mutex);
+          ++entered;
+          condition.notify_all();
+          condition.wait(lock, [&] { return release; });
+        }
+        netlib::HttpResponse oversized = Reply("x");
+        oversized.body.reserve(4096);
+        large_rejected.store(!message.Respond(std::move(oversized)));
+        message.Respond(Reply("ok"));
+      });
+  if (!workers) return false;
+  netlib::SubReactorOptions options{.max_pending_responses = 8,
+                                    .max_queued_response_bytes = 1024,
+                                    .max_read_bytes_per_turn = 17,
+                                    .max_write_bytes_per_turn = 7,
+                                    .max_decode_calls_per_turn = 1,
+                                    .max_response_commands_per_turn = 1};
+  std::unique_ptr<netlib::SubReactor> sub =
+      netlib::SubReactor::CreateWithSession(
+          options, *workers, {}, [](netlib::ProtocolSessionOptions limits) {
+            return netlib::CreateHttp2Session(limits);
+          });
+  if (!sub) return false;
+  std::unique_ptr<netlib::MainReactor> main =
+      netlib::MainReactor::Create(0, {sub.get()});
+  if (!main) return false;
+  std::thread sub_thread([&] { sub->Run(); });
+  std::thread main_thread([&] { main->Run(); });
+  netlib::UniqueFd socket(netlib::platform::CreateTcpSocket(false));
+  Client client;
+  bool success =
+      socket && netlib::platform::SetReceiveTimeout(socket.get(), 2000) &&
+      netlib::platform::ConnectLoopback(socket.get(), main->port()) &&
+      client.Initialize() && client.Request("/active") == 1 &&
+      SendClient(client, socket.get());
+  if (success) {
+    std::unique_lock<std::mutex> lock(mutex);
+    success = condition.wait_for(lock, std::chrono::seconds(2),
+                                 [&] { return entered == 1; });
+  }
+  const std::array<std::uint8_t, 8> ping{};
+  success = success && client.Request("/queued") == 3 &&
+            client.Request("/refused") == 5 &&
+            nghttp2_submit_ping(client.session, NGHTTP2_FLAG_NONE,
+                                ping.data()) == 0 &&
+            SendClient(client, socket.get());
+  std::array<char, 4096> bytes{};
+  for (int i = 0; success && i < 1000 &&
+                  (client.replies[5].reset == 0 || client.ping_acks == 0);
+       ++i) {
+    std::ptrdiff_t count =
+        netlib::platform::Receive(socket.get(), bytes.data(), bytes.size());
+    success = count > 0 &&
+              client.Receive(std::span<const char>(bytes).first(
+                  static_cast<std::size_t>(count))) &&
+              SendClient(client, socket.get());
+  }
+  success = success && client.replies[5].reset == NGHTTP2_REFUSED_STREAM &&
+            client.ping_acks == 1 && !client.replies[1].complete &&
+            !client.replies[3].complete;
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    release = true;
+    condition.notify_all();
+  }
+  for (int i = 0; success && i < 1000 && !client.replies[3].complete; ++i) {
+    std::ptrdiff_t count =
+        netlib::platform::Receive(socket.get(), bytes.data(), bytes.size());
+    success = count > 0 &&
+              client.Receive(std::span<const char>(bytes).first(
+                  static_cast<std::size_t>(count))) &&
+              SendClient(client, socket.get());
+  }
+  success = success && client.replies[1].body == "ok" &&
+            client.replies[3].body == "ok" && large_rejected.load();
+  success = success && client.Request("/after-saturation") == 7 &&
+            SendClient(client, socket.get());
+  for (int i = 0; success && i < 1000 && !client.replies[7].complete; ++i) {
+    std::ptrdiff_t count =
+        netlib::platform::Receive(socket.get(), bytes.data(), bytes.size());
+    success = count > 0 &&
+              client.Receive(std::span<const char>(bytes).first(
+                  static_cast<std::size_t>(count))) &&
+              SendClient(client, socket.get());
+  }
+  success = success && client.replies[7].body == "ok";
+  socket.Reset();
+  main->Stop();
+  sub->Stop();
+  main_thread.join();
+  sub_thread.join();
+  workers->Stop();
+  return success;
+}
+
+bool TestWorkerHeldConnectionBudget() {
+  Harness h;
+  h.server = netlib::CreateHttp2Session({}, {.max_memory_bytes = 256 * 1024});
+  if (!h.server || !h.client.Initialize() || !h.Pump()) return false;
+  h.client.Request("/worker-held", std::string(60000, 'a'));
+  if (!h.Pump() || h.requests.size() != 1) return false;
+  const std::int32_t refused =
+      h.client.Request("/over-budget", std::string(60000, 'b'));
+  if (!h.Pump() || h.requests.size() != 1 ||
+      h.client.replies[refused].reset == 0 || h.server->ShouldClose())
+    return false;
+  // Logical Session body size is zero after dispatch, but its allocation is
+  // still owned by a Worker. Only releasing that request admits another body.
+  h.requests.clear();
+  const std::int32_t next =
+      h.client.Request("/after-release", std::string(60000, 'c'));
+  return h.Pump() && h.requests.size() == 1 &&
+         h.requests[0].context.stream_id == static_cast<std::uint32_t>(next) &&
+         h.requests[0].payload.size() == 60000 &&
+         h.server->memory_budget()->used() <=
+             h.server->memory_budget()->limit();
+}
+
 }  // namespace
 
 int main() {
@@ -785,6 +970,11 @@ int main() {
       {"invalid preface/response and HEAD", TestInvalidPrefaceAndResponse},
       {"connection budget/protocol reset",
        TestConnectionBudgetAndProtocolReset},
+      {"retained allocation budget", TestRetainedAllocationBudget},
+      {"TCP queue saturation and recovery", TestTcpQueueSaturation},
+      {"Worker-held connection budget and recovery",
+       TestWorkerHeldConnectionBudget},
+      {"TCP control flood with tiny scheduling slices", TestTcpControlFlood},
       {"TCP multiplexing", TestTcpRouting},
       {"TCP cancellation", TestTcpCancellation},
       {"TCP timeout", TestTcpTimeout},

@@ -15,6 +15,7 @@
 
 #include "blockingconcurrentqueue.h"
 #include "netlib/log/logging.h"
+#include "netlib/message_memory.h"
 
 namespace netlib {
 namespace {
@@ -34,7 +35,7 @@ constexpr std::size_t kAdmissionClosed =
 class ThreadPool::Impl {
  public:
   Impl(std::size_t worker_count, std::size_t max_pending_messages,
-       Handler handler);
+       Handler handler, std::size_t max_retained_bytes);
   ~Impl();
   Impl(const Impl&) = delete;
   Impl& operator=(const Impl&) = delete;
@@ -43,6 +44,7 @@ class ThreadPool::Impl {
   void Stop();
   std::size_t queued_count() const;
   std::size_t worker_count() const { return workers_.size(); }
+  std::size_t retained_bytes() const { return memory_->used(); }
   std::optional<std::size_t> CurrentWorkerIndex() const {
     return current_pool_ == this ? std::optional<std::size_t>(current_index_)
                                  : std::nullopt;
@@ -60,6 +62,7 @@ class ThreadPool::Impl {
 
   const std::size_t max_pending_messages_;
   Handler handler_;
+  const std::shared_ptr<MemoryBudget> memory_;
   moodycamel::BlockingConcurrentQueue<WorkItem> queue_;
   std::atomic<std::size_t> queued_count_{0};
   // The high bit closes admission; lower bits count submissions in progress.
@@ -78,9 +81,11 @@ thread_local const ThreadPool::Impl* ThreadPool::Impl::current_pool_ = nullptr;
 thread_local std::size_t ThreadPool::Impl::current_index_ = 0;
 
 ThreadPool::Impl::Impl(std::size_t worker_count,
-                       std::size_t max_pending_messages, Handler handler)
+                       std::size_t max_pending_messages, Handler handler,
+                       std::size_t max_retained_bytes)
     : max_pending_messages_(max_pending_messages),
       handler_(std::move(handler)),
+      memory_(std::make_shared<MemoryBudget>(max_retained_bytes)),
       queue_(max_pending_messages) {
   consumer_tokens_.reserve(worker_count);
   workers_.reserve(worker_count);
@@ -123,7 +128,10 @@ bool ThreadPool::Impl::Submit(FrameMessage message,
   if (!EnterSubmission()) {
     return false;
   }
-  if (!ReserveQueueSlot()) {
+  message.worker_memory = MemoryReservation::Acquire(
+      memory_, sizeof(FrameMessage) + message.payload.capacity() +
+                   RetainedBytes(message.metadata));
+  if (!message.worker_memory || !ReserveQueueSlot()) {
     LeaveSubmission();
     return false;
   }
@@ -245,13 +253,16 @@ bool ThreadPool::Submitter::Submit(FrameMessage message) {
 
 std::unique_ptr<ThreadPool> ThreadPool::Create(std::size_t worker_count,
                                                std::size_t max_pending_messages,
-                                               Handler handler) {
-  if (worker_count == 0 || max_pending_messages == 0 || !handler) {
+                                               Handler handler,
+                                               std::size_t max_retained_bytes) {
+  if (worker_count == 0 || max_pending_messages == 0 || !handler ||
+      max_retained_bytes == 0) {
     NETLIB_LOG_ERROR("invalid ThreadPool configuration");
     return nullptr;
   }
-  std::shared_ptr<Impl> impl = std::make_shared<Impl>(
-      worker_count, max_pending_messages, std::move(handler));
+  std::shared_ptr<Impl> impl =
+      std::make_shared<Impl>(worker_count, max_pending_messages,
+                             std::move(handler), max_retained_bytes);
   return std::unique_ptr<ThreadPool>(new ThreadPool(std::move(impl)));
 }
 
@@ -270,5 +281,8 @@ std::optional<std::size_t> ThreadPool::CurrentWorkerIndex(
 }
 void ThreadPool::Stop() { impl_->Stop(); }
 std::size_t ThreadPool::queued_count() const { return impl_->queued_count(); }
+std::size_t ThreadPool::retained_bytes() const {
+  return impl_->retained_bytes();
+}
 
 }  // namespace netlib

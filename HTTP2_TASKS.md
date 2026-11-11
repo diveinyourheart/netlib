@@ -2,8 +2,8 @@
 
 分支：`codex/http2-support`。
 基线：`main`，`16cc2f95b814ebb455abe5cac77820ae74a383c0`。
-执行到第五轮：T01–T07 已完成，本轮新增阶段期限、Worker 取消通知和有期限排空。
-下一轮入口为 T08 的全链路预算与背压，之后才进入 T09 自动选择。
+执行到第六轮：T01–T08 已完成，本轮加入跨队列容量预算、单流拒绝和公平调度。
+本轮验收见文末第六轮记录，下一轮入口为 T09 的明文自动选择。
 
 ## 目标和当前边界
 
@@ -16,8 +16,8 @@
 - 不将已弃用的 HTTP/1 `Upgrade: h2c` 作为首版接入路径。
 - 协议选定后，连接固定为对应协议族；HTTP/1 各请求的版本仍由 HTTP/1 parser 校验。
 
-设计与标准依据见 [HTTP/2 设计](docs/http2_design.md)。当前仍是基础准备阶段，
-还不能通过网络实际处理 HTTP/2 请求，也没有将识别器接入在线协议切换。
+设计与标准依据见 [HTTP/2 设计](docs/http2_design.md)。当前支持显式明文 HTTP/2，
+尚未将识别器接入在线协议切换，也没有 TLS/ALPN。
 
 ## 第一批：边界与输入基础
 
@@ -64,7 +64,7 @@
   - GOAWAY、最后接受的 stream ID、排空期限与强制结束分开建模。
   - 验收：超时/响应竞争、取消后回写、单流异常隔离、连接排空。
   - 第五轮已补齐阶段期限、stop_token、外部 Drain、截止期限与竞争验证，见第五轮记录。
-- [ ] **T08：内存预算和背压闭环**（依赖 T06、T07）
+- [x] **T08：内存预算和背压闭环**（依赖 T06、T07）
   - 限制并发 stream、解压后 Header、各流正文、待编码输出和连接累计字节数。
   - 接收窗口与缓冲预算关联，整包聚合不能因等 Worker 才归还窗口而卡死。
   - Worker 满时优先针对单流拒绝/背压，仍能处理必要的连接控制帧。
@@ -94,7 +94,7 @@
 ## 分批完成标准
 
 每批结束更新本清单的状态、改动文件、测试结果和下一批入口。没有通过验收的任务不勾选。
-每轮完成后总结并更新交接上下文，保留已完成轮次的记录；第五轮到 T07 为止，
+每轮完成后总结并更新交接上下文，保留已完成轮次的记录；第六轮到 T08 为止，
 不自动继续全部任务。依赖与 TLS 按对应任务阶段引入。
 
 ## 第一批执行记录
@@ -482,3 +482,80 @@ CI 的 Ubuntu Debug/Release HTTP2=ON 在全量测试后，还会对
 HTTP/2 和排空测试各重复 20 次，验证该关闭竞争；Linux 结果应查看对应修复提交的
 [Build and test](https://github.com/diveinyourheart/netlib/actions/workflows/build.yml)。
 文档链接、代码格式和 actionlint 已检查。下一轮仍从 T08 开始。
+
+## 第六轮执行记录：T08（2026-11-11）
+
+本轮从 d247b47 继续。其 [CI 运行](https://github.com/diveinyourheart/netlib/actions/runs/42854945838)
+十项全部通过，包含 Ubuntu Debug/Release ON/OFF、Windows MSVC 和 MinGW，且两个
+Ubuntu HTTP2=ON 任务的排空重复测试已通过。这是 T07 修复的证据，不覆盖本轮新代码。
+
+### 实现及接口决定
+
+- 新增 [memory_budget.h](include/netlib/memory_budget.h) 与
+  [message_memory.h](include/netlib/message_memory.h)：原子字节预算、共享生命周期凭证，
+  按 vector/string capacity 收费。SessionRequest → FrameMessage → 请求队列/Worker
+  move 同一连接凭证；请求取消、出队、Session 释放不提前释放仍被 Worker 持有的容量。
+- Http2SessionOptions.max_memory_bytes 默认 64 MiB。nghttp2 使用自定义 malloc/calloc/
+  realloc/free 计数分配器；C++ 固定状态按每允许并发流 1 KiB 预留，Header/Body、接收
+  缓冲和编码输出另按实际容量收费。Header 维护增量容量，避免每个 DATA 重新遍历头部。
+  nghttp2 真正耗尽额度时可关闭连接，不能声称任意内存耗尽都能单流隔离。
+- ThreadPool::Create 增加可选第四参数 max_retained_bytes，默认 64 MiB；retained_bytes
+  包含排队、执行和异步保留的数据，独立于 queued_count。SubReactor 新增默认 64 MiB
+  的 max_queued_response_bytes；队列出队归还队列额度，HTTP/2 响应继续持有连接凭证。
+- ProtocolSession 默认 OnDispatchRejected 关闭旧 Codec 连接，HTTP/2 则 REFUSED_STREAM。
+  Worker 队列/字节额度满或在途容量不足只拒绝对应流，撤销 timer/取消状态；必要控制帧
+  和其他流继续处理。初始 stream 接收窗口与正文/连接预算关联，存储或丢弃后及时归还
+  credit，不等 Worker 完成，保留超过初始窗口的完整 Body 接收能力。
+- 每连接每个 EventLoop turn 默认读/写各 64 KiB、最多 64 次解码，每个 SubReactor
+  最多处理 64 条响应/期限命令；同轮不同入口共享计数。HTTP/2 OnInput 一次最多处理
+  一个帧边界片段，防止空控制帧粘包突破解码次数限制。
+- EventLoop::Defer 仅 owner 使用；每轮先轮询真实 I/O 再处理有上限的延后任务。连接
+  读写续调度去重并按 ID 重查，显式继续用户缓冲和内核未读数据，避免 epoll ET 丢进度。
+  WouldBlock 后恢复等待就绪。SupportsOutputChunks 保留旧 Codec 整包编码兼容性，
+  socket 发送仍切片；HTTP/2 能直接按较小 slice 增量编码。
+- 文档 [http2_backpressure.md](docs/http2_backpressure.md) 明确容量与 RSS 的区别：应用
+  自行复制/扩容/移走后独立保留的数据由应用管理；原消息副本会保留原始凭证。请求与
+  新响应并存时保守收费，没有隐含的应用缓冲零拷贝额度转移。
+
+### 验收内容
+
+- 新增 [memory_budget_test.cc](tests/memory_budget_test.cc)：并发收费、失败扩容、已取消且
+  已出队的异步消息继续占用 Worker 容量、释放后恢复提交。
+- 新增 [scheduling_test.cc](tests/scheduling_test.cc)：不断续调度的热任务仍让真实 I/O
+  得到处理；延后任务不会在同一轮递归执行。
+- 扩展 [http2_session_test.cc](tests/http2_session_test.cc)：Session/RST 不提前归还消息
+  容量、两个 60000 字节请求跨 Worker 所有权累计预算、释放后恢复；超大 capacity 的小
+  响应被拒绝而其他流存活。真实 TCP 验证 Worker 队列满时单流拒绝和 PING 往返，handler
+  释放后新流恢复，响应队列按 capacity 拒绝。
+- TCP 用例采用 17 字节读、7 字节写、1 次解码、1 条响应命令，并加入 200 个 PING 的
+  洪流；既有零窗口/恢复、大正文、CONTINUATION、慢流、超时、取消、有限排空继续回归。
+  先收到 stream 3 完整回复再提交 stream 1，验证独立路由，不依赖 nghttp2 对两个已经
+  就绪响应的 DATA 完成顺序。
+- CI 的 Ubuntu HTTP2=ON 重复步骤扩展到 HTTP/2、排空、内存预算与调度四组测试，各 20 次。
+  Linux 验证需要本轮代码推送后的对应 CI。
+
+| 本机配置 | HTTP/2 OFF | HTTP/2 ON |
+| --- | --- | --- |
+| MinGW Debug | 26/26 | 28/28 |
+| MinGW Release | 26/26 | 28/28 |
+| MSVC Debug | 26/26 | 28/28 |
+
+四组内存/调度/HTTP/2/排空测试在 MinGW Debug 各重复 20 次全部通过。上述六组构建没有
+新增警告，Google 格式、文档链接/锚点与 actionlint 通过；clangd 编译数据库已刷新。
+按用户要求，本轮实现、测试与文档统一提交并推送到 codex/http2-support。
+Linux 结果以该提交的 CI 为准，不将上轮绿色结果当作本轮验证。
+
+### 下一轮明确入口：T09
+
+1. 从 codex/http2-support 的 T08 提交继续，先核对该提交的 CI，不能复用 d247b47 的绿色结果。
+2. 阅读本轮背压文档及 http_protocol.cc、ProtocolSession。实现显式 HTTP 入口的自动
+   Session factory：HTTP/1.0/1.1 请求行与完整 HTTP/2 preface，保留原始输入交给选中的
+   Session。选定一次，不在错误输入后回退别的协议。
+3. MaxInputBufferSize 在 Session 生命周期内保持固定；探测阶段也需有输入上限和期限。
+   memory_budget 在建立 ConnectionHandle 时被捕获，自动 Session 必须从建立时就提供
+   稳定预算对象，不能选中 HTTP/2 后换一份预算让响应准入绕过限制。
+4. 自动 Session 要转发拒绝、取消、期限、半关闭和增量输出能力；接入后仍验证 tiny
+   slice、部分 preface、粘包、多流、队列饱和及排空的续调度契约。
+5. 默认长度前缀与显式 RPC factory 继续独立。完成同端口混合 HTTP/1.0、HTTP/1.1、
+   prior-knowledge HTTP/2 的验收，再更新 README 能力声明。TLS/ALPN 仍为 T10，
+   不增加 h2c Upgrade、CONNECT、trailers 或流式业务。

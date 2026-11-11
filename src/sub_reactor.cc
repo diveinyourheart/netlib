@@ -25,6 +25,7 @@
 #include "netlib/event_loop.h"
 #include "netlib/frame_message.h"
 #include "netlib/log/logging.h"
+#include "netlib/message_memory.h"
 #include "netlib/protocol_codec.h"
 #include "netlib/thread_pool.h"
 #include "netlib/unique_fd.h"
@@ -56,13 +57,16 @@ struct ResponseMessage {
   std::uint64_t sequence = 0;
   ApplicationResponse response = BinaryResponse{};
   bool close_after_write = false;
+  std::shared_ptr<MemoryReservation> queued_memory{};
 };
 
 class SubReactor::ResponseQueue {
  public:
-  ResponseQueue(std::size_t capacity, std::shared_ptr<platform::Wakeup> wake_fd,
+  ResponseQueue(std::size_t capacity, std::size_t byte_capacity,
+                std::shared_ptr<platform::Wakeup> wake_fd,
                 ThreadPool& worker_pool)
       : capacity_(capacity),
+        memory_(std::make_shared<MemoryBudget>(byte_capacity)),
         wake_fd_(std::move(wake_fd)),
         worker_pool_(worker_pool.impl_),
         queue_(capacity),
@@ -122,6 +126,7 @@ class SubReactor::ResponseQueue {
       return false;
     }
     queued_count_.fetch_sub(1, std::memory_order_acq_rel);
+    message.queued_memory.reset();
     return true;
   }
 
@@ -133,6 +138,9 @@ class SubReactor::ResponseQueue {
       return false;
     }
     if (enforce_capacity) {
+      message.queued_memory =
+          MemoryReservation::Acquire(memory_, RetainedBytes(message.response));
+      if (!message.queued_memory) return false;
       if (!ReserveQueueSlot()) {
         return false;
       }
@@ -173,6 +181,7 @@ class SubReactor::ResponseQueue {
   bool Wake() { return wake_fd_ != nullptr && wake_fd_->Notify(); }
 
   const std::size_t capacity_;
+  const std::shared_ptr<MemoryBudget> memory_;
   const std::shared_ptr<platform::Wakeup> wake_fd_;
   // An in-flight external Respond may keep this queue alive after its reactor
   // closes. Retain pool identity state instead of borrowing a ThreadPool
@@ -197,6 +206,7 @@ class SubReactor::Connection {
         handle_(std::move(handle)),
         connection_id_(handle_.id()),
         alive_(std::move(alive)),
+        input_memory_(MemoryReservation::Acquire(session_->memory_budget(), 0)),
         max_read_buffer_size_(session_->MaxInputBufferSize()),
         max_pending_responses_(max_pending_responses) {}
 
@@ -204,6 +214,11 @@ class SubReactor::Connection {
   std::uint64_t connection_id() const { return connection_id_; }
   const ConnectionHandle& handle() const { return handle_; }
   ProtocolSession& session() { return *session_; }
+  void BeginTurn(std::uint64_t turn) {
+    if (turn_ == turn) return;
+    turn_ = turn;
+    read_bytes_ = decode_calls_ = written_bytes_ = 0;
+  }
   bool AcceptRequestId(std::uint64_t id) {
     if (id != next_request_id_ ||
         id == std::numeric_limits<std::uint64_t>::max()) {
@@ -291,7 +306,7 @@ class SubReactor::Connection {
     std::stop_source source;
     TimerScheduler::Clock::time_point deadline;
   };
-  void MakeWritable(std::size_t min_bytes);
+  bool MakeWritable(std::size_t min_bytes);
 
   UniqueFd socket_;
   std::unique_ptr<Channel> channel_;
@@ -299,6 +314,7 @@ class SubReactor::Connection {
   const ConnectionHandle handle_;
   const std::uint64_t connection_id_;
   const std::shared_ptr<std::atomic<bool>> alive_;
+  std::shared_ptr<MemoryReservation> input_memory_;
   std::vector<char> storage_;
   std::size_t read_offset_ = 0;
   std::size_t write_offset_ = 0;
@@ -315,6 +331,11 @@ class SubReactor::Connection {
   std::uint64_t alarm_generation_ = 0;
   bool read_interest_enabled_ = true;
   bool write_interest_enabled_ = false;
+  unsigned continuation_ = 0;
+  std::uint64_t turn_ = 0;
+  std::size_t read_bytes_ = 0;
+  std::size_t decode_calls_ = 0;
+  std::size_t written_bytes_ = 0;
 };
 
 std::span<char> SubReactor::Connection::WritableBytes() {
@@ -329,7 +350,7 @@ std::span<char> SubReactor::Connection::WritableBytes() {
         std::min(writable_size, decode_target_size_ - readable_size);
   }
   assert(writable_size != 0);
-  MakeWritable(writable_size);
+  if (!MakeWritable(writable_size)) return {};
   return std::span<char>(storage_.data() + write_offset_,
                          storage_.size() - write_offset_);
 }
@@ -353,9 +374,9 @@ void SubReactor::Connection::Consume(std::size_t size) {
   }
 }
 
-void SubReactor::Connection::MakeWritable(std::size_t min_bytes) {
+bool SubReactor::Connection::MakeWritable(std::size_t min_bytes) {
   if (storage_.size() - write_offset_ >= min_bytes) {
-    return;
+    return true;
   }
 
   std::size_t readable_size = write_offset_ - read_offset_;
@@ -368,7 +389,7 @@ void SubReactor::Connection::MakeWritable(std::size_t min_bytes) {
     write_offset_ = readable_size;
   }
   if (storage_.size() - write_offset_ >= min_bytes) {
-    return;
+    return true;
   }
 
   std::size_t required_size = write_offset_ + min_bytes;
@@ -376,7 +397,13 @@ void SubReactor::Connection::MakeWritable(std::size_t min_bytes) {
   std::size_t grown_size =
       std::min(max_read_buffer_size_,
                std::max(kInitialReadBufferSize, storage_.size() * 2));
-  storage_.resize(std::max(required_size, grown_size));
+  const std::size_t capacity = std::max(required_size, grown_size);
+  if (input_memory_ &&
+      !input_memory_->Resize(std::max(capacity, storage_.capacity())))
+    return false;
+  storage_.reserve(capacity);
+  storage_.resize(capacity);
+  return !input_memory_ || input_memory_->Resize(storage_.capacity());
 }
 
 std::unique_ptr<SubReactor> SubReactor::Create(
@@ -429,7 +456,12 @@ std::unique_ptr<SubReactor> SubReactor::CreateWithSession(
       options.write_timeout <= std::chrono::milliseconds::zero() ||
       options.write_timeout > std::chrono::hours(24) ||
       options.close_timeout <= std::chrono::milliseconds::zero() ||
-      options.close_timeout > std::chrono::hours(24)) {
+      options.close_timeout > std::chrono::hours(24) ||
+      options.max_queued_response_bytes == 0 ||
+      options.max_read_bytes_per_turn == 0 ||
+      options.max_write_bytes_per_turn == 0 ||
+      options.max_decode_calls_per_turn == 0 ||
+      options.max_response_commands_per_turn == 0) {
     NETLIB_LOG_ERROR("SubReactor option is outside its valid range");
     return nullptr;
   }
@@ -496,7 +528,8 @@ SubReactor::SubReactor(std::unique_ptr<EventLoop> event_loop,
       callbacks_(std::move(callbacks)),
       wake_fd_(std::move(wake_fd)),
       response_queue_(std::make_shared<ResponseQueue>(
-          options.max_pending_responses, wake_fd_, worker_pool)),
+          options.max_pending_responses, options.max_queued_response_bytes,
+          wake_fd_, worker_pool)),
       options_(options) {}
 
 SubReactor::~SubReactor() {
@@ -567,7 +600,15 @@ void SubReactor::HandleWake() {
   }
 
   ResponseMessage response;
-  while (!stopping_.load() && response_queue_->TryDequeue(response)) {
+  if (response_turn_ != event_loop_->turn()) {
+    response_turn_ = event_loop_->turn();
+    response_commands_ = 0;
+  }
+  std::size_t& commands = response_commands_;
+  while (!stopping_.load() &&
+         commands < options_.max_response_commands_per_turn &&
+         response_queue_->TryDequeue(response)) {
+    ++commands;
     if (response.kind == ResponseMessageKind::kSessionDeadline) {
       HandleSessionDeadline(response.connection_id, response.sequence);
       continue;
@@ -589,6 +630,14 @@ void SubReactor::HandleWake() {
     HandleApplicationResponse(response.connection_id, response.sequence,
                               std::move(response.response),
                               response.close_after_write);
+  }
+  if (commands == options_.max_response_commands_per_turn &&
+      !response_continuation_) {
+    response_continuation_ = true;
+    event_loop_->Defer([this] {
+      response_continuation_ = false;
+      HandleWake();
+    });
   }
 }
 
@@ -829,16 +878,24 @@ void SubReactor::RegisterConnection(UniqueFd connection) {
   std::shared_ptr<std::atomic<bool>> alive =
       std::make_shared<std::atomic<bool>>(true);
   std::weak_ptr<ResponseQueue> weak_response_queue = response_queue_;
+  std::shared_ptr<MemoryBudget> memory = session->memory_budget();
   ConnectionHandle handle(
       connection_id, alive,
-      [weak_response_queue](std::uint64_t id, std::uint64_t sequence,
-                            ApplicationResponse response,
-                            bool close_after_write,
-                            ConnectionHandle::ResponseMode mode) {
+      [weak_response_queue, memory](std::uint64_t id, std::uint64_t sequence,
+                                    ApplicationResponse response,
+                                    bool close_after_write,
+                                    ConnectionHandle::ResponseMode mode) {
         std::shared_ptr<ResponseQueue> response_queue =
             weak_response_queue.lock();
         if (!response_queue) {
           return false;
+        }
+        if (memory) {
+          if (HttpResponse* http = std::get_if<HttpResponse>(&response)) {
+            http->memory =
+                MemoryReservation::Acquire(memory, RetainedBytes(response));
+            if (!http->memory) return false;
+          }
         }
         if (mode == ConnectionHandle::ResponseMode::kUnordered) {
           return response_queue->EnqueueUnordered(
@@ -880,6 +937,7 @@ void SubReactor::RegisterConnection(UniqueFd connection) {
 }
 
 void SubReactor::HandleReadable(std::uint64_t connection_id) {
+  bool initial = true;
   while (true) {
     auto connection = connections_.find(connection_id);
     if (connection == connections_.end()) {
@@ -887,13 +945,31 @@ void SubReactor::HandleReadable(std::uint64_t connection_id) {
     }
 
     Connection& state = *connection->second;
+    state.BeginTurn(event_loop_->turn());
+    std::size_t& received = state.read_bytes_;
+    std::size_t& calls = state.decode_calls_;
     if (state.close_deadline_) {
       DrainConnectionInput(connection_id);
+      return;
+    }
+    if (received >= options_.max_read_bytes_per_turn ||
+        calls >= options_.max_decode_calls_per_turn) {
+      ContinueConnection(connection_id, true, false);
       return;
     }
     if (!state.session().WantsInput()) {
       return;
     }
+    if (initial && !state.ReadableBytes().empty()) {
+      initial = false;
+      if (!ProcessInput(state, calls)) {
+        CloseConnection(connection_id);
+        return;
+      }
+      FlushConnection(connection_id);
+      continue;
+    }
+    initial = false;
     SocketHandle fd = state.fd();
     std::span<char> writable = state.WritableBytes();
     if (writable.empty()) {
@@ -902,11 +978,13 @@ void SubReactor::HandleReadable(std::uint64_t connection_id) {
       CloseConnection(connection_id);
       return;
     }
-    std::ptrdiff_t result =
-        platform::Receive(fd, writable.data(), writable.size());
+    std::ptrdiff_t result = platform::Receive(
+        fd, writable.data(),
+        std::min(writable.size(), options_.max_read_bytes_per_turn - received));
     if (result > 0) {
+      received += static_cast<std::size_t>(result);
       state.CommitWrite(static_cast<std::size_t>(result));
-      if (!ProcessInput(state)) {
+      if (!ProcessInput(state, calls)) {
         CloseConnection(connection_id);
         return;
       }
@@ -932,9 +1010,14 @@ void SubReactor::HandleReadable(std::uint64_t connection_id) {
   }
 }
 
-bool SubReactor::ProcessInput(Connection& connection) {
+bool SubReactor::ProcessInput(Connection& connection, std::size_t& calls) {
   while (connection.session().WantsInput()) {
     std::span<const char> readable = connection.ReadableBytes();
+    if (calls >= options_.max_decode_calls_per_turn) {
+      ContinueConnection(connection.connection_id(), true, false);
+      return true;
+    }
+    ++calls;
     SessionInputResult result = connection.session().OnInput(readable);
     if (result.status == SessionInputStatus::kNeedMore) {
       if (result.consumed_bytes != 0 || !result.requests.empty() ||
@@ -963,11 +1046,14 @@ bool SubReactor::ProcessInput(Connection& connection) {
       }
     }
     for (SessionRequest& request : result.requests) {
-      if (!connection.HasRequestTimerCapacity() ||
-          !connection.AcceptRequestId(request.context.request_id)) {
-        return false;
-      }
+      if (!connection.AcceptRequestId(request.context.request_id)) return false;
       const RequestContext context = request.context;
+      if (!connection.HasRequestTimerCapacity()) {
+        if (connection.session().OnDispatchRejected(context) ==
+            SessionResponseStatus::kError)
+          return false;
+        continue;
+      }
       std::uint64_t connection_id = connection.connection_id();
       std::uint64_t sequence = context.request_id;
       std::stop_source source;
@@ -979,6 +1065,7 @@ bool SubReactor::ProcessInput(Connection& connection) {
           .payload = std::move(request.payload),
           .request_context = context,
           .stop_token = source.get_token(),
+          .memory = std::move(request.memory),
       };
       std::weak_ptr<ResponseQueue> weak_response_queue = response_queue_;
       TimerScheduler::Clock::time_point deadline =
@@ -1006,7 +1093,10 @@ bool SubReactor::ProcessInput(Connection& connection) {
       if (!request_submitter_.Submit(std::move(message))) {
         NETLIB_LOG_WARN("worker queue full for connection id={} sequence={}",
                         connection_id, sequence);
-        return false;
+        TimerScheduler::Cancel(connection.TakeRequestTimer(sequence, true));
+        if (connection.session().OnDispatchRejected(context) ==
+            SessionResponseStatus::kError)
+          return false;
       }
     }
   }
@@ -1025,15 +1115,24 @@ void SubReactor::FlushConnection(std::uint64_t connection_id) {
   Connection& state = *connection->second;
   if (state.close_deadline_) return;
   ProtocolSession& session = state.session();
+  state.BeginTurn(event_loop_->turn());
+  std::size_t& input_calls = state.decode_calls_;
   // A Session can pause with a partial/coalesced request still in our buffer.
   // Resuming socket readiness alone cannot deliver those already-read bytes.
   if (session.WantsInput() && !state.read_interest_enabled() &&
-      !state.ReadableBytes().empty() && !ProcessInput(state)) {
+      !state.ReadableBytes().empty() && !ProcessInput(state, input_calls)) {
     CloseConnection(connection_id);
     return;
   }
-  while (true) {
-    if (!session.ProduceOutput(options_.max_pending_output_bytes)) {
+  std::size_t& written = state.written_bytes_;
+  while (written < options_.max_write_bytes_per_turn) {
+    const std::size_t budget =
+        std::min(options_.max_pending_output_bytes,
+                 options_.max_write_bytes_per_turn - written);
+    if (session.PendingOutput().empty() &&
+        !session.ProduceOutput(session.SupportsOutputChunks()
+                                   ? budget
+                                   : options_.max_pending_output_bytes)) {
       CloseConnection(connection_id);
       return;
     }
@@ -1057,12 +1156,13 @@ void SubReactor::FlushConnection(std::uint64_t connection_id) {
     if (!state.write_deadline_)
       state.write_deadline_ =
           TimerScheduler::Clock::now() + options_.write_timeout;
-    std::ptrdiff_t result =
-        platform::Send(state.fd(), output.data(), output.size());
+    std::ptrdiff_t result = platform::Send(state.fd(), output.data(),
+                                           std::min(output.size(), budget));
     if (result > 0) {
       state.write_deadline_ =
           TimerScheduler::Clock::now() + options_.write_timeout;
       session.ConsumeOutput(static_cast<std::size_t>(result));
+      written += static_cast<std::size_t>(result);
       continue;
     }
     if (result < 0 && platform::Interrupted(platform::LastError())) {
@@ -1081,6 +1181,11 @@ void SubReactor::FlushConnection(std::uint64_t connection_id) {
     CloseConnection(connection_id);
     return;
   }
+  if (written == options_.max_write_bytes_per_turn) {
+    ContinueConnection(connection_id, false, true);
+    RefreshSessionTimer(connection_id);
+    return;
+  }
   if (session.ShouldClose()) {
     if (session.ShouldHalfClose()) {
       ShutdownConnection(connection_id);
@@ -1092,6 +1197,22 @@ void SubReactor::FlushConnection(std::uint64_t connection_id) {
   } else {
     RefreshSessionTimer(connection_id);
   }
+}
+
+void SubReactor::ContinueConnection(std::uint64_t id, bool read, bool write) {
+  auto connection = connections_.find(id);
+  if (connection == connections_.end()) return;
+  unsigned& pending = connection->second->continuation_;
+  const bool queued = pending != 0;
+  pending |= (read ? 1U : 0U) | (write ? 2U : 0U);
+  if (queued) return;
+  event_loop_->Defer([this, id] {
+    auto current = connections_.find(id);
+    if (current == connections_.end()) return;
+    const unsigned work = std::exchange(current->second->continuation_, 0U);
+    if (work & 1U) HandleReadable(id);
+    if (work & 2U) HandleWritable(id);
+  });
 }
 
 void SubReactor::ShutdownConnection(std::uint64_t connection_id) {

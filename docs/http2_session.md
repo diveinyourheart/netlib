@@ -92,10 +92,12 @@ Reactor 每次只 ConsumeOutput 已成功发送的字节，所有权不跨到 Wo
 | max_body_bytes | 16 MiB；每流请求与响应正文上限 |
 | max_buffered_body_bytes | 32 MiB；Session 尚持有的请求和响应正文 size 合计 |
 | max_input_chunk_bytes | 16 KiB；一次交给解析器的输入及传输输入缓冲上限 |
+| max_memory_bytes | 64 MiB；跨 Session/Worker/响应队列的保留容量、nghttp2 分配及固定状态额度 |
 
 已编码输出另受 Reactor 的 max_pending_output_bytes 限制，支持比一个网络帧更小的
-分批输出预算。正文预算统计有效字节数，不含 vector 容量、nghttp2 内部状态和已经移入
-Worker 的正文；后者仍由线程池排队容量约束。系统级完整字节预算与背压属于 T08。
+分批输出预算。max_buffered_body_bytes 统计有效字节数；外层 max_memory_bytes 则继续
+统计已移入 Worker 的数据容量和 nghttp2 分配。队列和线程池还有各自的字节上限，
+应用自行分配的内存不等于库预算，详见 [T08 背压说明](http2_backpressure.md)。
 Header/正文超过限制时重置对应 stream，不投递不完整请求。
 
 ## 超时、取消和当前边界
@@ -110,8 +112,8 @@ Header/正文超过限制时重置对应 stream，不投递不完整请求。
 同时提交 GOAWAY；正常排空后先 shutdown 写方向，限时接收尾部输入，peer EOF 后退出
 或到期强制关闭。详见 [http2_lifecycle.md](http2_lifecycle.md)。
 
-SubReactor::Stop 仍为立即停止接口，Drain 是有期限的优雅退出入口。T08 还需完善 Worker 饱和时的单流拒绝、
-跨队列字节预算和每轮处理公平性。T09 才接入 HTTP/1/2 在线自动选择。
+SubReactor::Stop 仍为立即停止接口，Drain 是有期限的优雅退出入口。T08 已接入 Worker
+饱和时的单流拒绝、跨队列字节预算和公平续调度；T09 才接入 HTTP/1/2 在线自动选择。
 当前不支持 CONNECT 隧道、请求 trailers、流式业务 Body、1xx 中间响应和 server push。
 
 ## 验证

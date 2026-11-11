@@ -137,5 +137,6 @@ TCP 排空增加 FIN 后才回写 SETTINGS ACK、按单字节接收的确定性�
 GOAWAY 和 EOF；通用排空测试验证半关闭后的 peer EOF、close_timeout、外部期限、Stop
 及尾部输入上限。这些用例不靠延长睡眠或忽略 socket 错误规避竞争。
 
-T08 仍需补齐全链路字节预算、Worker 满时的单流拒绝和每轮处理公平性；当前 Submit 失败
-仍关闭整连接。T09 才做 HTTP/1/2 自动选择，TLS/ALPN 和流式业务仍属后续阶段。
+T08 已加入跨队列容量预算、Worker 满时的单流拒绝和每轮公平续调度，见
+[http2_backpressure.md](http2_backpressure.md)。取消不会提前归还 Worker 仍持有的内存。
+T09 才做 HTTP/1/2 自动选择，TLS/ALPN 和流式业务仍属后续阶段。

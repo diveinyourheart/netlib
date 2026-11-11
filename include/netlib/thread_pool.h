@@ -41,9 +41,9 @@ class ThreadPool {
     std::unique_ptr<State> state_;
   };
 
-  static std::unique_ptr<ThreadPool> Create(std::size_t worker_count,
-                                            std::size_t max_pending_messages,
-                                            Handler handler);
+  static std::unique_ptr<ThreadPool> Create(
+      std::size_t worker_count, std::size_t max_pending_messages,
+      Handler handler, std::size_t max_retained_bytes = 64 * 1024 * 1024);
 
   ThreadPool(const ThreadPool&) = delete;
   ThreadPool& operator=(const ThreadPool&) = delete;
@@ -59,6 +59,9 @@ class ThreadPool {
   // messages and joins workers. Must not be called from a handler in this pool.
   void Stop();
   std::size_t queued_count() const;
+  // Includes accepted requests still owned by handlers, even after
+  // cancellation.
+  std::size_t retained_bytes() const;
 
  private:
   friend class SubReactor;

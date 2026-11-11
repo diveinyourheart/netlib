@@ -6,6 +6,7 @@
 #include <variant>
 #include <vector>
 
+#include "netlib/memory_budget.h"
 #include "netlib/rpc_message.h"
 
 namespace netlib {
@@ -42,6 +43,8 @@ struct HttpResponse {
   std::vector<HttpHeader> headers;
   std::vector<char> body;
   bool keep_alive = true;
+  // Library admission charge; preserve when moving this response.
+  std::shared_ptr<MemoryReservation> memory{};
 };
 
 using ApplicationResponse =

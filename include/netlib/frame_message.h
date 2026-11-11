@@ -26,6 +26,10 @@ struct FrameMessage {
   // Cooperative cancellation. Callbacks may run in Reactor, or immediately on
   // registration if already cancelled. Keep them short and nonblocking.
   std::stop_token stop_token{};
+  // Internal lifetime charges. Application copies retain the original charge;
+  // independently copied/expanded data is application-owned memory.
+  std::shared_ptr<MemoryReservation> memory{};
+  std::shared_ptr<MemoryReservation> worker_memory{};
 
   bool IsCancelled() const { return stop_token.stop_requested(); }
 

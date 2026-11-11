@@ -1,9 +1,10 @@
 # HTTP/2 设计与分批接入
 
 任务进度和每轮交接统一记录在根目录 [HTTP2_TASKS.md](../HTTP2_TASKS.md)。目前已实现
-T01–T07：协议识别、会话层、可选依赖、显式明文 HTTP/2，以及分阶段超时、取消和有期限排空。
-T05 的 Linux CI 已通过；会话接口见 [http2_session.md](http2_session.md)，生命周期见
-[http2_lifecycle.md](http2_lifecycle.md)。
+T01–T08：协议识别、会话层、可选依赖、显式明文 HTTP/2，以及超时、取消、有期限排空、
+容量预算和公平调度。T07 修复提交的 Linux CI 已通过；会话接口见
+[http2_session.md](http2_session.md)，生命周期见 [http2_lifecycle.md](http2_lifecycle.md)，
+预算与背压见 [http2_backpressure.md](http2_backpressure.md)。
 
 ## 如何自适应版本
 
@@ -137,7 +138,7 @@ ctest --test-dir build/debug -R "netlib_(http_protocol|reactor)_test" --output-o
 | WantsInput | 控制读事件；false 时可暂停注册；恢复时先解析 Reactor 已持有的未消费字节 |
 | ShouldClose | 协议请求关闭；Reactor 必须先发送完 PendingOutput |
 | BeginDrain | 进入会话排空状态；旧 Codec 停收新请求，等已接受请求完成，再发送完输出 |
-| MaxInputBufferSize | 限制传输层未消费输入；Session 内部的 stream/body/待编码输出仍需 T08 独立预算 |
+| MaxInputBufferSize | 限制传输层未消费输入；T08 另用共享预算约束内部状态与跨队列数据 |
 | NextDeadline / OnDeadline | T07 的 owner 期限钩子；Reactor 只为每个连接的最近期限挂闹钟 |
 
 kNeedMore.required_bytes 为总未消费字节目标，必须大于当前输入，或用 0 表示未知。
@@ -197,7 +198,7 @@ HTTP/1 超时仍是排序后的 504 并关闭，长度前缀与 RPC 仍在无安
 
 BeginDrain 在 T04 起是会话钩子；T07 已接入 MainReactor/SubReactor::Drain(timeout)、
 GOAWAY 和排空期限，并向在途 Worker 发布 stop_token 取消。Stop 保留立即停止语义。
-Worker 拒绝的流级处理仍属于 T08，目前 Submit 失败仍关闭整个连接。
+T08 的 OnDispatchRejected 在 HTTP/2 中只拒绝对应流；默认 Codec 保留提交失败关闭连接策略。
 原生 Session 的资源预算和 HTTP/2 正确性不能由 Codec 适配器测试代替。
 
 T04 的验证入口：

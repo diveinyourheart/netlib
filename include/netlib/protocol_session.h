@@ -19,6 +19,7 @@ struct SessionRequest {
   RequestContext context;
   FrameMetadata metadata;
   std::vector<char> payload;
+  std::shared_ptr<MemoryReservation> memory{};
 };
 
 enum class SessionInputStatus : std::uint8_t {
@@ -80,11 +81,24 @@ class ProtocolSession {
   // Stop accepting new work; finish accepted requests and protocol shutdown.
   // This hook does not change the immediate SubReactor::Stop() API.
   virtual void BeginDrain() = 0;
+  // Called on owner when dispatch is rejected. Legacy protocols close; a
+  // multiplexed Session can refuse just this stream and keep control input
+  // live.
+  virtual SessionResponseStatus OnDispatchRejected(const RequestContext&) {
+    return SessionResponseStatus::kError;
+  }
+  // Optional stable budget, captured by response handles during construction.
+  virtual std::shared_ptr<MemoryBudget> memory_budget() const {
+    return nullptr;
+  }
 
   // May generate control output without a business response. byte_budget bounds
   // the total PendingOutput, including bytes already buffered. False is fatal.
   // True with empty output may mean waiting for peer input (e.g. a window).
   virtual bool ProduceOutput(std::size_t byte_budget) = 0;
+  // Legacy Codecs encode whole messages; incremental protocols can also honor
+  // smaller scheduling slices with a frame partially serialized.
+  virtual bool SupportsOutputChunks() const { return false; }
   // Protocol output can also close/reset streams. Drain these owner-thread
   // events after ProduceOutput so their timers do not wait for more peer input.
   virtual std::vector<RequestContext> TakeCancelledRequests() { return {}; }

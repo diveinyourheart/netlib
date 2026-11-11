@@ -3,6 +3,8 @@
 
 #include <atomic>
 #include <cstdint>
+#include <deque>
+#include <functional>
 #include <memory>
 #include <unordered_map>
 
@@ -26,6 +28,10 @@ class EventLoop {
 
   void Run();
   void Stop();
+  // Owner-thread only, after readiness dispatch. Work posted by a deferred
+  // callback waits for a later poll turn. Not a cross-thread queue.
+  void Defer(std::function<void()> callback);
+  std::uint64_t turn() const { return turn_; }
 
  private:
   friend class Channel;
@@ -46,6 +52,8 @@ class EventLoop {
   std::unordered_map<std::uint64_t, Channel*> channels_;
   std::uint64_t next_token_ = 1;
   std::atomic<bool> stopping_{false};
+  std::deque<std::function<void()>> deferred_;
+  std::uint64_t turn_ = 0;
 };
 
 }  // namespace netlib

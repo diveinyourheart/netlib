@@ -1,5 +1,6 @@
 #include "netlib/event_loop.h"
 
+#include <algorithm>
 #include <array>
 #include <utility>
 
@@ -37,18 +38,29 @@ void EventLoop::Run() {
   NETLIB_LOG_DEBUG("event loop started");
   std::array<platform::ReadyEvent, 64> events{};
   while (!stopping_.load()) {
-    int count = poller_->Wait(events);
+    ++turn_;
+    int count = poller_->Wait(events, deferred_.empty() ? -1 : 0);
     if (count < 0) {
       if (platform::Interrupted(platform::LastError())) continue;
       NETLIB_LOG_ERROR("event wait failed: {}", platform::ErrorMessage());
       break;
     }
-    for (int i = 0; i < count; ++i) Dispatch(events[i].token, events[i].events);
+    for (int i = 0; i < count && !stopping_.load(); ++i)
+      Dispatch(events[i].token, events[i].events);
+    const std::size_t callbacks = std::min(deferred_.size(), std::size_t{64});
+    for (std::size_t i = 0; i < callbacks && !stopping_.load(); ++i) {
+      std::function<void()> callback = std::move(deferred_.front());
+      deferred_.pop_front();
+      callback();
+    }
   }
   NETLIB_LOG_DEBUG("event loop stopped");
 }
 void EventLoop::Stop() {
   if (!stopping_.exchange(true)) WakeForStop();
+}
+void EventLoop::Defer(std::function<void()> callback) {
+  deferred_.push_back(std::move(callback));
 }
 bool EventLoop::AddChannel(Channel& channel) {
   channel.token_ = next_token_++;

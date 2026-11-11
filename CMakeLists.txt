@@ -50,6 +50,8 @@ add_library(
     src/http_protocol.cc
     src/length_prefixed_codec.cc
     src/main_reactor.cc
+    src/memory_budget.cc
+    src/message_memory.cc
     src/protocol_session.cc
     src/rpc_codec.cc
     src/sub_reactor.cc
@@ -125,6 +127,16 @@ add_executable(netlib_log_example examples/log_example.cc)
 target_link_libraries(netlib_log_example PRIVATE netlib::log)
 
 if(BUILD_TESTING)
+  add_executable(netlib_scheduling_test tests/scheduling_test.cc)
+  target_link_libraries(netlib_scheduling_test PRIVATE netlib::netlib)
+  netlib_warnings(netlib_scheduling_test)
+  add_test(NAME netlib_scheduling_test COMMAND netlib_scheduling_test)
+  set_tests_properties(netlib_scheduling_test PROPERTIES TIMEOUT 30)
+  add_executable(netlib_memory_budget_test tests/memory_budget_test.cc)
+  target_link_libraries(netlib_memory_budget_test PRIVATE netlib::netlib)
+  netlib_warnings(netlib_memory_budget_test)
+  add_test(NAME netlib_memory_budget_test COMMAND netlib_memory_budget_test)
+  set_tests_properties(netlib_memory_budget_test PROPERTIES TIMEOUT 30)
   add_executable(netlib_drain_test tests/drain_test.cc)
   target_link_libraries(netlib_drain_test PRIVATE netlib::netlib)
   netlib_warnings(netlib_drain_test)
